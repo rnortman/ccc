@@ -2093,24 +2093,32 @@ mod tests {
             None,
             &AbsentProcessProbe,
         );
+        // Rendered times are in the system zone.
+        let hms = |sec: u8| {
+            time(
+                format!("2026-01-01T00:00:0{sec}Z").parse().unwrap(),
+                "%H:%M:%S",
+            )
+        };
+        let (t1, t2, t3, t4) = (hms(1), hms(2), hms(3), hms(4));
         assert_eq!(
             tree.lines().collect::<Vec<_>>(),
             vec![
-                "trace aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa (unindexed)",
-                "├─ aaaaaaaa run worker 19:00:01 lost <1s  session=- ›first prompt line",
-                "│  └─ cccccccc run worker 19:00:03 lost <1s  session=- ›first prompt line",
-                "└─ bbbbbbbb run worker 19:00:02 lost <1s  session=- ›first prompt line",
-                "   └─ dddddddd run worker 19:00:04 lost <1s  session=- ›first prompt line",
+                "trace aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa (unindexed)".to_string(),
+                format!("├─ aaaaaaaa run worker {t1} lost <1s  session=- ›first prompt line"),
+                format!("│  └─ cccccccc run worker {t3} lost <1s  session=- ›first prompt line"),
+                format!("└─ bbbbbbbb run worker {t2} lost <1s  session=- ›first prompt line"),
+                format!("   └─ dddddddd run worker {t4} lost <1s  session=- ›first prompt line"),
             ]
         );
         let (flat, _) = render_flat(&rs, false, 200);
         assert_eq!(
             flat.lines().collect::<Vec<_>>(),
             vec![
-                "19:00:01 aaaaaaaa start run first prompt line",
-                "19:00:02 bbbbbbbb start run first prompt line",
-                "19:00:03   cccccccc start run first prompt line",
-                "19:00:04   dddddddd start run first prompt line",
+                format!("{t1} aaaaaaaa start run first prompt line"),
+                format!("{t2} bbbbbbbb start run first prompt line"),
+                format!("{t3}   cccccccc start run first prompt line"),
+                format!("{t4}   dddddddd start run first prompt line"),
             ]
         );
     }

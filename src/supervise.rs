@@ -1580,7 +1580,9 @@ mod tests {
     fn launch_mode_escalates_ignored_term_without_signalling_group_inner() {
         run_launch_inner(
             "supervise::tests::launch_mode_escalates_ignored_term_without_signalling_group_inner",
-            "trap '' TERM; sleep 10",
+            // `exec` keeps the child a single process under every `/bin/sh`;
+            // dash forks `sleep`, which the sweep would then also signal.
+            "trap '' TERM; exec sleep 10",
             Duration::from_millis(200),
             ignored_launch_result,
         );
@@ -1812,10 +1814,12 @@ mod tests {
             .unwrap();
         procs::signal(pid, libc::SIGKILL).unwrap();
 
+        // dash points an async list's stdin at /dev/null before applying its
+        // redirections, so the holder takes the prompt pipe from fd 3.
         let holder = dir.path().join("prompt-pid");
         let ready = dir.path().join("prompt-ready");
         let script = format!(
-            "sh -c 'echo ready > \"$1\"; exec sleep 10' sh {} </dev/stdin & pid=$!; n=0; while [ ! -f {} ] && [ $n -lt 500 ]; do sleep .01; n=$((n+1)); done; echo $pid > {}; exit 0",
+            "exec 3<&0; sh -c 'echo ready > \"$1\"; exec sleep 10' sh {} <&3 3<&- & pid=$!; n=0; while [ ! -f {} ] && [ $n -lt 500 ]; do sleep .01; n=$((n+1)); done; echo $pid > {}; exit 0",
             ready.display(),
             ready.display(),
             holder.display()
