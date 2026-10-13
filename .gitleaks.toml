@@ -1,0 +1,27 @@
+title = "brenn scrub rules"
+
+[extend]
+useDefault = true
+
+# Section-symbol references to design/ADR docs. Those docs are ephemeral
+# point-in-time artifacts, so a comment citing one rots as soon as it moves.
+# Enforced on diffs only: the existing backlog is grandfathered and burns down
+# as lines are touched.
+[[rules]]
+id = "ephemeral-reference"
+description = "Section-symbol reference to an ephemeral doc"
+regex = '''§''' # gitleaks:allow -- this is the rule's own definition
+keywords = ["§"] # gitleaks:allow -- this is the rule's own definition
+
+  # Markdown is where legitimate section references live. Excluding by
+  # extension rather than enumerating source extensions, which is a
+  # never-finished list.
+  [[rules.allowlists]]
+  paths = ['''\.md$''']
+
+  # Stable published specs are good references.
+  # Line-targeted because RE2 has no lookbehind, so
+  # the rule regex cannot express "not preceded by RFC n" on its own.
+  [[rules.allowlists]]
+  regexTarget = "line"
+  regexes = ['''RFC ?\d+ ?§'''] # gitleaks:allow -- carve-out for spec citations

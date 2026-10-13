@@ -1,0 +1,28 @@
+[package]
+name = "ccc-harness"
+version = "0.1.0"
+edition = "2021"
+description = "Dispatches agent types to Claude Code or Codex subprocesses"
+license = "Apache-2.0"
+repository = "https://github.com/rnortman/ccc"
+readme = "README.md"
+
+[[bin]]
+name = "ccc"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+claude-usage-mqtt-client = { git = "https://github.com/rnortman/claude-usage-mqtt", rev = "d5b596f72f85bfccfd31e942f6caa9c0730d8ed3" }
+claude-usage-mqtt-core = { git = "https://github.com/rnortman/claude-usage-mqtt", rev = "d5b596f72f85bfccfd31e942f6caa9c0730d8ed3" }
+clap = { version = "4", features = ["derive"] }
+jiff = { version = "0.2", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["rt", "time"] }
+toml = "0.8"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

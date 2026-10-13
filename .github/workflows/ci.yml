@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      # rust-toolchain.toml pins the toolchain and its rustfmt/clippy.
+      - name: Install Rust
+        run: rustup toolchain install
+
+      - run: make rust-check
+
+  scrub:
+    name: scrub
+    uses: rnortman/brenn-scrub/.github/workflows/tree-scan.yml@v0.1.0

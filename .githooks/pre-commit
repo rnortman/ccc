@@ -1,0 +1,20 @@
+#!/bin/bash
+# Scrub first: it fails in seconds, the project's own checks take minutes.
+set -e
+
+# Scrub needs the hook environment: GIT_INDEX_FILE names the index actually
+# being committed (e.g. `git commit --only`).
+brenn-scrub staged
+
+# The project's checks must not inherit it. From a linked worktree, git exports
+# GIT_DIR and GIT_INDEX_FILE into this hook, and those override current_dir
+# targeting in every child git process — including test fixtures, which would
+# then mutate this repository instead of their tempdirs. Enumerate by *name*
+# (compgen yields valid identifiers only); parsing `env` output line-by-line
+# breaks on multi-line values, whose continuation lines could feed `unset`
+# garbage and abort the commit under `set -e`.
+for var in $(compgen -v GIT_ || true); do unset "$var"; done
+
+if [ -f Makefile ] && grep -q '^check:' Makefile; then
+    make check
+fi
