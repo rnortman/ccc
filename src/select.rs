@@ -17,6 +17,7 @@ use anyhow::{bail, Result};
 use claude_usage_mqtt_core::{AuthState, FIVE_HOUR};
 use jiff::{SignedDuration, Timestamp};
 
+use crate::audit_view::sanitize;
 use crate::config::{ClaudeConfig, EnvSource, SelectionConfig};
 use crate::glob::any_match;
 use crate::harness::claude::Account;
@@ -415,8 +416,13 @@ fn eligible(
     if usage.auth != AuthState::Ok {
         return Err(format!("auth is {}", usage.auth.as_str()));
     }
-    if !usage.fresh {
-        return Err("the reading is carried forward, not fresh".to_string());
+    if let Some(why) = &usage.stale_reason {
+        // The daemon's text, which can quote an upstream error body, reaches
+        // the terminal through `ccc which` and the fallback diagnostic.
+        return Err(format!(
+            "the reading is carried forward ({})",
+            sanitize(why)
+        ));
     }
     let age = now.duration_since(usage.updated_at).as_secs_f64();
     if age > sel.stale_grace_s as f64 {
@@ -577,7 +583,7 @@ mod tests {
         ProfileUsage {
             profile: name.to_string(),
             auth: AuthState::Ok,
-            fresh: true,
+            stale_reason: None,
             updated_at: now(),
             windows,
         }
@@ -661,7 +667,7 @@ mod tests {
         let usage = ProfileUsage {
             profile: "team03".into(),
             auth: AuthState::Ok,
-            fresh: true,
+            stale_reason: None,
             updated_at: now(),
             windows: vec![
                 window(FIVE_HOUR, 0.0, 3),
@@ -681,7 +687,7 @@ mod tests {
         let usage = ProfileUsage {
             profile: "team03".into(),
             auth: AuthState::Ok,
-            fresh: true,
+            stale_reason: None,
             updated_at: now(),
             windows: vec![
                 window(FIVE_HOUR, 10.0, 3),
@@ -705,7 +711,7 @@ mod tests {
         let usage = ProfileUsage {
             profile: "personal".into(),
             auth: AuthState::Ok,
-            fresh: true,
+            stale_reason: None,
             updated_at: now(),
             windows: vec![window(FIVE_HOUR, 0.0, 3), window("seven_day", 7.0, 24)],
         };
@@ -730,7 +736,7 @@ mod tests {
         let usage = ProfileUsage {
             profile: "team03".into(),
             auth: AuthState::Ok,
-            fresh: true,
+            stale_reason: None,
             updated_at: now(),
             windows: vec![
                 window(FIVE_HOUR, 0.0, 3),
@@ -755,7 +761,7 @@ mod tests {
         let usage = ProfileUsage {
             profile: "team03".into(),
             auth: AuthState::Ok,
-            fresh: true,
+            stale_reason: None,
             updated_at: now(),
             windows: vec![
                 window(FIVE_HOUR, 0.0, 3),
@@ -781,7 +787,7 @@ mod tests {
         let usage = ProfileUsage {
             profile: "team03".into(),
             auth: AuthState::Ok,
-            fresh: true,
+            stale_reason: None,
             updated_at: now(),
             windows: vec![window("seven_day", 40.0, 100)],
         };
@@ -809,7 +815,7 @@ mod tests {
         let usage = ProfileUsage {
             profile: "team03".into(),
             auth: AuthState::Ok,
-            fresh: true,
+            stale_reason: None,
             updated_at: now(),
             windows: vec![window(FIVE_HOUR, 0.0, 3), window("7-day_fable", 10.0, 100)],
         };
@@ -870,10 +876,10 @@ mod tests {
             ),
             (
                 ProfileUsage {
-                    fresh: false,
+                    stale_reason: Some("rate limited by the API".to_string()),
                     ..profile("a", 0.0, 0.0, None)
                 },
-                "not fresh",
+                "the reading is carried forward (rate limited by the API)",
             ),
             (
                 ProfileUsage {
@@ -904,6 +910,16 @@ mod tests {
                 "{reason} does not mention {expected}"
             );
         }
+
+        let usage = ProfileUsage {
+            stale_reason: Some("rate\nlimited\r\x1b[2J".to_string()),
+            ..profile("a", 0.0, 0.0, None)
+        };
+        let reason = score_one(&sel, &usage, false, now(), true).reason.unwrap();
+        assert_eq!(
+            reason,
+            "the reading is carried forward (rate\\nlimited\\r\\x1b[2J)"
+        );
 
         // The Fable bucket only excludes a profile from Fable work.
         let s = score_one(&sel, &profile("a", 0.0, 0.0, None), true, now(), true);

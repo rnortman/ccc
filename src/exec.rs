@@ -2256,7 +2256,7 @@ mod tests {
         ProfileUsage {
             profile: profile.to_string(),
             auth: AuthState::Ok,
-            fresh: true,
+            stale_reason: None,
             updated_at: now,
             windows: vec![
                 UsageWindow {
@@ -6594,7 +6594,7 @@ mod tests {
         f.token("team03");
         f.token("team04");
         let stale = |profile: &str| ProfileUsage {
-            fresh: false,
+            stale_reason: Some("rate limited by the API".to_string()),
             ..snapshot(Timestamp::now(), profile, 0.0, 0.0)
         };
         let sources = [

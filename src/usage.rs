@@ -29,8 +29,13 @@ pub struct ProfileUsage {
     pub profile: String,
     /// The published auth state; only [`AuthState::Ok`] is usable.
     pub auth: AuthState,
-    /// False when the numbers are last-known-good values carried forward.
-    pub fresh: bool,
+    /// Present exactly when the windows are last-known-good values carried
+    /// forward rather than a reading taken for this publish: the daemon's own
+    /// reason, or with no windows, why nothing has ever been read. Absent on a
+    /// fresh reading.
+    pub stale_reason: Option<String>,
+    /// When the daemon took the reading, carried forward or not, or observed
+    /// the error state the snapshot reports.
     pub updated_at: Timestamp,
     pub windows: Vec<UsageWindow>,
 }
@@ -150,7 +155,7 @@ fn report_from(events: Vec<Event>) -> UsageReport {
                 let usage = ProfileUsage {
                     profile: s.profile,
                     auth: s.auth,
-                    fresh: s.fresh,
+                    stale_reason: s.stale_reason,
                     updated_at: s.updated_at,
                     windows: s
                         .windows
@@ -184,21 +189,29 @@ mod tests {
     use super::*;
     use claude_usage_mqtt_core::{Snapshot, OFFLINE};
 
-    /// The shape published on 2026-09-18, trimmed to the fields read here.
-    fn snapshot(profile: &str, auth: &str, fresh: bool, windows: &str) -> Event {
-        let text = format!(
+    /// The shape the daemon publishes, trimmed to the fields read here.
+    /// `stale_reason` is omitted entirely on a fresh reading, as the daemon
+    /// does.
+    fn snapshot(profile: &str, auth: &str, stale_reason: Option<&str>, windows: &str) -> Event {
+        let stale_reason = stale_reason
+            .map(|why| format!(r#""stale_reason": {},"#, serde_json::json!(why)))
+            .unwrap_or_default();
+        decode(&format!(
             r#"{{
               "profile": "{profile}",
               "auth": "{auth}",
               "updated_at": "2026-09-18T12:00:00Z",
               "next_poll_at": "2026-09-18T12:05:00Z",
               "poll_interval_s": 300,
-              "fresh": {fresh},
+              {stale_reason}
               "subscription_type": "max",
               "windows": [{windows}]
             }}"#
-        );
-        Event::Snapshot(serde_json::from_str::<Snapshot>(&text).unwrap())
+        ))
+    }
+
+    fn decode(text: &str) -> Event {
+        Event::Snapshot(serde_json::from_str::<Snapshot>(text).unwrap())
     }
 
     const LIVE_WINDOWS: &str = r#"
@@ -213,32 +226,58 @@ mod tests {
     fn snapshots_and_daemon_status_are_flattened() {
         let report = report_from(vec![
             Event::DaemonStatus(ONLINE.to_string()),
-            snapshot("team03", "ok", true, LIVE_WINDOWS),
+            snapshot("team03", "ok", None, LIVE_WINDOWS),
             snapshot(
                 "personal",
                 "stale",
-                false,
+                Some("credentials expired"),
                 r#"{"key":"five_hour","label":"5-hour","utilization":0.0}"#,
+            ),
+            // The older shape, still accepted: `fresh` and `stale_since`
+            // beside the `stale_reason` that alone marks the reading carried
+            // forward.
+            decode(
+                r#"{
+                  "profile": "team04",
+                  "auth": "ok",
+                  "updated_at": "2026-09-18T11:40:00Z",
+                  "next_poll_at": "2026-09-18T12:05:00Z",
+                  "poll_interval_s": 300,
+                  "fresh": false,
+                  "stale_since": "2026-09-18T11:40:00Z",
+                  "stale_reason": "rate limited by the API",
+                  "windows": [{"key":"five_hour","label":"5-hour","utilization":12.0}]
+                }"#,
             ),
         ]);
 
         assert!(report.daemon_online());
-        assert_eq!(report.profiles.len(), 2);
+        assert_eq!(report.profiles.len(), 3);
 
         let team03 = report.profile("team03").unwrap();
         assert_eq!(team03.auth, AuthState::Ok);
-        assert!(team03.fresh);
+        assert_eq!(team03.stale_reason, None);
         assert_eq!(team03.window("five_hour").unwrap().utilization, 31.0);
         assert_eq!(team03.window("7-day_fable").unwrap().utilization, 77.0);
         assert!(team03.window("seven_day").unwrap().resets_at.is_some());
 
         let personal = report.profile("personal").unwrap();
         assert_eq!(personal.auth, AuthState::Stale);
-        assert!(!personal.fresh);
+        assert_eq!(
+            personal.stale_reason.as_deref(),
+            Some("credentials expired")
+        );
         assert!(personal.window("7-day_fable").is_none());
         // A window with no `resets_at` is representable; the scorer supplies a
         // default rather than dropping the window.
         assert_eq!(personal.window("five_hour").unwrap().resets_at, None);
+
+        let team04 = report.profile("team04").unwrap();
+        assert_eq!(
+            team04.stale_reason.as_deref(),
+            Some("rate limited by the API")
+        );
+        assert_eq!(team04.window("five_hour").unwrap().utilization, 12.0);
     }
 
     #[test]
@@ -261,13 +300,13 @@ mod tests {
             snapshot(
                 "team04",
                 "ok",
-                true,
+                None,
                 r#"{"key":"five_hour","label":"5-hour","utilization":5.0}"#,
             ),
             snapshot(
                 "team04",
                 "rejected",
-                true,
+                None,
                 r#"{"key":"five_hour","label":"5-hour","utilization":9.0}"#,
             ),
         ]);

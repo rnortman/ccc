@@ -1284,7 +1284,7 @@ mod tests {
                 profiles: vec![ProfileUsage {
                     profile: "team03".into(),
                     auth: AuthState::Ok,
-                    fresh: true,
+                    stale_reason: None,
                     updated_at: Timestamp::now(),
                     windows: vec![UsageWindow {
                         key: FIVE_HOUR.to_string(),

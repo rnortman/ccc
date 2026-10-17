@@ -183,8 +183,8 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "claude-usage-mqtt-client"
-version = "0.1.0"
-source = "git+https://github.com/rnortman/claude-usage-mqtt?rev=d5b596f72f85bfccfd31e942f6caa9c0730d8ed3#d5b596f72f85bfccfd31e942f6caa9c0730d8ed3"
+version = "0.2.0"
+source = "git+https://github.com/rnortman/claude-usage-mqtt?rev=feb43606d5f0fce7f1a9ad8fd027d2c141f2ee2b#feb43606d5f0fce7f1a9ad8fd027d2c141f2ee2b"
 dependencies = [
  "anyhow",
  "clap",
@@ -200,8 +200,8 @@ dependencies = [
 
 [[package]]
 name = "claude-usage-mqtt-core"
-version = "0.1.0"
-source = "git+https://github.com/rnortman/claude-usage-mqtt?rev=d5b596f72f85bfccfd31e942f6caa9c0730d8ed3#d5b596f72f85bfccfd31e942f6caa9c0730d8ed3"
+version = "0.2.0"
+source = "git+https://github.com/rnortman/claude-usage-mqtt?rev=feb43606d5f0fce7f1a9ad8fd027d2c141f2ee2b#feb43606d5f0fce7f1a9ad8fd027d2c141f2ee2b"
 dependencies = [
  "anyhow",
  "jiff",

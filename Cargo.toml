@@ -13,8 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-claude-usage-mqtt-client = { git = "https://github.com/rnortman/claude-usage-mqtt", rev = "d5b596f72f85bfccfd31e942f6caa9c0730d8ed3" }
-claude-usage-mqtt-core = { git = "https://github.com/rnortman/claude-usage-mqtt", rev = "d5b596f72f85bfccfd31e942f6caa9c0730d8ed3" }
+claude-usage-mqtt-client = { git = "https://github.com/rnortman/claude-usage-mqtt", rev = "feb43606d5f0fce7f1a9ad8fd027d2c141f2ee2b" }
+claude-usage-mqtt-core = { git = "https://github.com/rnortman/claude-usage-mqtt", rev = "feb43606d5f0fce7f1a9ad8fd027d2c141f2ee2b" }
 clap = { version = "4", features = ["derive"] }
 jiff = { version = "0.2", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
