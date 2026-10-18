@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.0 — 2026-10-18
+
 - **Upgrade before the usage daemon.** `ccc` now reads usage data from
   `claude-usage-mqtt` 0.2.0, the daemon that publishes each account's quota
   usage. Deploy this `ccc` first: an older `ccc` cannot read 0.2.0's reports
