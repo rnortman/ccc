@@ -112,6 +112,18 @@ them elsewhere, point `agents_dir` in `~/.config/ccc/agents.toml` at the copy:
 agents_dir = "~/src/my-agents"
 ```
 
+## Development
+
+```sh
+make setup-hooks   # point git at .githooks; prints what to install if a hook's tool is missing
+make check         # fmt, clippy, test, brenn-scrub init --check — what pre-commit runs
+```
+
+`make check` and the hooks need
+[`brenn-scrub`](https://crates.io/crates/brenn-scrub) and the `gitleaks`
+release it pins on `PATH` (`cargo install --locked brenn-scrub`).
+`make rust-check` runs the Rust checks alone, as CI does.
+
 ## Using it from a parent agent
 
 The prompt is an inline `PROMPT` argument, `--prompt-file F`, or stdin — via

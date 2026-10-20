@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `make setup-hooks` points git at the repo's `.githooks` and reports any
+  missing hook tools; the README's new Development section documents it.
+
 ## 0.2.0 — 2026-10-18
 
 - **Upgrade before the usage daemon.** `ccc` now reads usage data from
