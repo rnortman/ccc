@@ -2,8 +2,27 @@
 
 ## Unreleased
 
+## 0.2.1 — 2026-10-22
+
+- `ccc` is installable from crates.io: `cargo install --locked ccc-harness`
+  (the crate is `ccc-harness`; the binary is still `ccc`). The usage-data
+  libraries it depends on, `claude-usage-mqtt-core` and
+  `claude-usage-mqtt-client`, now come from crates.io at 0.2.1 instead of a git
+  revision; they are the same code as 0.2.0.
+- The README now opens with installation: requirements (Linux, a Rust
+  toolchain, a C compiler for the TLS stack, a logged-in `claude`), the install
+  lines, and a quick start from nothing to a first `ccc run` — including the
+  two things to know before it: subagents run with
+  `--permission-mode bypassPermissions` by default, and every Claude run marks
+  its `--cwd` trusted for that account. The reference sections follow, with the
+  audit log moved after the features that produce it.
+- The published crate leaves out the repository's git hooks, Claude Code
+  settings, CI workflow and agent instructions; the binary is unchanged.
+- `make publish-check` dry-runs `cargo publish`.
 - `make setup-hooks` points git at the repo's `.githooks` and reports any
-  missing hook tools; the README's new Development section documents it.
+  missing hook tools; the README's Development section documents it.
+- Known gaps in `ccc` that were noted only in code comments are now listed in
+  `TODO.md`.
 
 ## 0.2.0 — 2026-10-18
 

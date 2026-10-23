@@ -1,4 +1,4 @@
-.PHONY: check rust-check fmt clippy test init-check setup-hooks scrub-tree
+.PHONY: check rust-check fmt clippy test init-check setup-hooks scrub-tree publish-check
 
 check: fmt clippy test init-check
 
@@ -26,3 +26,8 @@ setup-hooks:
 
 scrub-tree:
 	brenn-scrub tree
+
+# Pre-publish gate: `cargo publish` dry-run against crates.io. Cargo refuses a
+# working tree with uncommitted changes, so run it on a committed tree.
+publish-check:
+	cargo publish --dry-run --locked

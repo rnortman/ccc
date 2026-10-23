@@ -2,7 +2,14 @@
 
 `ccc` runs an *agent type* as a one-shot subprocess on Claude Code or Codex. The
 caller names the type; `ccc` decides the harness, the model, the reasoning
-effort and — for Claude — which account to spend, from live usage data.
+effort and — for Claude — which account to spend, from live usage data, if you
+have more than one account.
+
+This allows both Claude Code and Codex to invoke one another as subagents,
+without even knowing which they're invoking. And for those who are juggling
+multiple Claude subscription accounts, it allows one long-running workflow to
+balance subagents between different accounts on the fly, based on current quota
+levels and window reset deadlines in each account.
 
 ```
 ccc run    <agent-type> [--cwd DIR] [--prompt-file F] [--profile NAME] [--harness claude|codex] [--json] [PROMPT | -]
@@ -16,113 +23,100 @@ ccc launch [--cwd DIR] [--profile NAME] [--model M] [--effort E] [-- harness arg
 ccc log    [TRACE-PREFIX | --latest] [--flat] [--verbose] [--json]
 ```
 
-## Audit log
-
-`ccc log` reads the append-only records under
-`~/.local/state/ccc/audit/<trace-id>.jsonl` and the chronological index in
-`traces.jsonl`. Records describe `start`, `spawn`, `turn`, and `end` events;
-prompts, results, callback payload details, and native diagnostics are retained
-in the trace file. The trace file is authoritative. A start is written before
-the index, so a process dying in that window is shown as unindexed; an indexed
-trace whose file is missing is reported as a dangling entry. Missing,
-unreadable, or malformed indexes do not hide trace files.
-
-With no selector, `ccc log` lists roots. A unique trace-id prefix or `--latest`
-selects a trace and renders its invocation tree. `--flat` renders strict
-timestamp order, including interleaved sibling events, and `--verbose` prints
-full ids and retained multiline details. `--json` is available only with a
-selector and emits one object containing `trace`, optional `index`, and joined
-`invocations`; the `t` tags and all known record fields are preserved, but JSON
-byte-for-byte identity with the JSONL input is not promised. `--flat` and
-`--json` require a selector; `--json` cannot be combined with `--verbose`.
-
-### Resuming what `ccc log` lists
-
-The TRACE column of the plain listing is also a resume argument. Both resume
-commands accept a unique trace-id prefix and continue that trace's root
-session:
-
-```
-ccc log 12345678
-ccc launch --resume 12345678
-ccc resume 12345678 "Continue the work"
-```
-
-`--fork` works with either form, and a `note:` on stderr names the full trace
-id and the session it resolved to. The root is the invocation the index names for
-the trace, or, for an unindexed trace, its single invocation without a parent;
-its session is the one `ccc log` shows for it. A trace whose root is missing,
-ambiguous or never recorded a session is refused rather than continued through
-a child or another root. An ambiguous prefix is refused with the full candidate
-ids; copy a full id from `ccc log --verbose`. To continue a particular
-subagent, find its row in `ccc log <trace-prefix>` and pass its full
-`session=`/`thread=` value (or its `ccc run` trailer session id); exact session
-ids get no prefix matching.
-
-An argument that names an existing session record is always that session, even
-if it also matches a trace; trace lookup happens only when no record exists
-under that name. An older trace resumes the same native session even if it has
-continued since: the continuation, or fork, starts from that session's current
-transcript, not a snapshot at the listed trace. The session's record must still
-exist and pass the usual checks — an unknown session, one in use, or one whose
-recorded owner is still running is refused as for an exact id.
-
-The index records both config paths (site and agents, each marked
-`(missing)` when the file did not exist; the listing's `CONFIG` and `AGENTS`
-columns, the trace header's `config …` and `agents …`) and the recognized
-`CCC_*` variables by value: `CCC_CONFIG`, `CCC_AGENTS_CONFIG`,
-`CCC_CLAUDE_BIN`, `CCC_CODEX_BIN` and the overrides. Name-only unknown
-variables are rendered as `<unrecognized>`. `CCC_TRACE_ID` and
-`CCC_PARENT_INVOCATION_ID` are managed by `ccc`; users and agents should not
-set them. Stripping the inherited environment breaks lineage. Claude session
-ids may be pre-minted and are shown when available. `ccc` remains resident for
-interactive launch, returns the harness exit status, injects Codex `notify` or
-Claude `Stop` callbacks, and records the session so `ccc resume`/`ccc launch
---resume` can find it. A row that continues a recorded session is suffixed
-`(resumes <inv>)` — `(forks <inv>)` for a fork — naming the invocation that
-created it, or `(session created outside this trace)` when none in the trace
-did. A user Codex notify is replaced; a later
-passthrough Claude `--settings` replaces the injected hook. The hidden
-`ccc hook` command is internal. No transcript file is parsed.
-
-Audit writers hold the per-file lock through the end seek, tail check, complete
-write, and flush, so concurrent appends do not interleave; a short write can
-still lose that record, and the next append inserts a newline before its own
-record when needed. Readers diagnose and skip damaged or non-UTF-8 lines
-locally, so one damaged record does not hide its neighbors. An unterminated
-damaged tail is treated as truncated (and may be the one record lost), while
-turn counts include only readable turn records.
+For ready-made multi-agent workflows on top of `ccc` — a review chain that
+designs, implements and reviews a change, and a TODO triage/burndown pair — see
+[ccc-agentgen](https://github.com/rnortman/ccc-agentgen).
 
 ## Install
 
-```
-cargo install --locked --git https://github.com/rnortman/ccc
-```
+Requirements:
 
-or, from a clone, `cargo install --locked --path .`. `claude` and `codex` are
-found on `PATH`; `CCC_CLAUDE_BIN` and `CCC_CODEX_BIN` override them.
+- **Linux.** Process management reads `/proc`; `ccc` builds on other Unix
+  systems, but there process liveness can remain unknown (see [Process
+  management](#process-management)).
+- **A Rust toolchain** ([rustup](https://rustup.rs)). The project builds and
+  tests with the toolchain `rust-toolchain.toml` pins (1.97.1); no minimum
+  supported version is declared.
+- **A C compiler, and `cmake`** where the TLS stack's `aws-lc-sys` build falls
+  back to it (it arrives through the usage client's MQTT dependency).
+  Debian/Ubuntu: `build-essential cmake`; Fedora: `gcc make cmake`.
+- **The Claude Code CLI, `claude`, logged in and on `PATH`.** Claude is the
+  default harness. `codex` is needed only for agents routed to Codex.
+  `CCC_CLAUDE_BIN` and `CCC_CODEX_BIN` override the `PATH` lookup.
+- Optional: [claude-usage-mqtt](https://github.com/rnortman/claude-usage-mqtt)
+  and an MQTT broker, only to choose between several Claude accounts by live
+  usage (`[claude] profiles`, see [Account selection](#account-selection)). A
+  single-account user needs neither.
 
-The `agents/` directory in this repo holds example agent definitions. They run
-once copied to `~/.config/ccc/agents` (`$XDG_CONFIG_HOME/ccc/agents` when that
-is set), the default agents directory:
-`mkdir -p ~/.config/ccc && cp -r agents ~/.config/ccc/` from a clone. To keep
-them elsewhere, point `agents_dir` in `~/.config/ccc/agents.toml` at the copy:
-
-```toml
-agents_dir = "~/src/my-agents"
-```
-
-## Development
+Then one of:
 
 ```sh
-make setup-hooks   # point git at .githooks; prints what to install if a hook's tool is missing
-make check         # fmt, clippy, test, brenn-scrub init --check — what pre-commit runs
+cargo install --locked ccc-harness                                  # from crates.io
+cargo install --locked --git https://github.com/rnortman/ccc        # latest main
+cargo install --locked --path .                                     # from a clone
 ```
 
-`make check` and the hooks need
-[`brenn-scrub`](https://crates.io/crates/brenn-scrub) and the `gitleaks`
-release it pins on `PATH` (`cargo install --locked brenn-scrub`).
-`make rust-check` runs the Rust checks alone, as CI does.
+The crate is `ccc-harness`; it installs one binary, `ccc`. No route installs
+agent definitions — the [Quick start](#quick-start) puts one in place.
+
+## Quick start
+
+1. **Put an agent definition where `ccc` looks for it**, `~/.config/ccc/agents/`
+   (`$XDG_CONFIG_HOME/ccc/agents` when that is set). From a clone, copy the
+   three example stubs in `agents/`:
+
+   ```sh
+   mkdir -p ~/.config/ccc && cp -r agents ~/.config/ccc/
+   ```
+
+   After a crates.io or `--git` install, fetch
+   [`agents/explorer.md`](agents/explorer.md) from this repository into
+   `~/.config/ccc/agents/`, or write your own: the file stem must equal its
+   `name`, and it needs a `description`, one of `model` / `codex_model`, and a
+   non-empty body (see [Agent definitions](#agent-definitions)). ccc-agentgen
+   installs its own definitions under `~/.config/ccc/agents/<variant>/`.
+
+   To keep definitions elsewhere, point `agents_dir` in
+   `~/.config/ccc/agents.toml` at them:
+
+   ```toml
+   agents_dir = "~/src/my-agents"
+   ```
+
+2. **No config file is needed.** A missing `config.toml` or `agents.toml` at
+   the default path means every default. Check what `ccc` will do:
+
+   ```sh
+   ccc which explorer
+   ```
+
+   It prints both config paths marked `(missing, defaults)`, the harness and
+   model the agent resolves to, and `ambient login ([claude] profiles is
+   empty)`: Claude runs on your own `claude` login.
+
+3. **Run it.** Two things to know first. Subagents run with
+   `--permission-mode bypassPermissions` unless `[claude] permission_mode`
+   says otherwise (see [Configuration](#configuration)). And every Claude spawn
+   marks its working directory trusted in the account's `.claude.json` (see
+   [Account selection](#account-selection)), so `--cwd` is a statement that you
+   trust that checkout's hooks and MCP servers.
+
+   ```sh
+   ccc run explorer "What does this repository do?" --cwd ~/src/some-repo
+   ```
+
+   The answer goes to stdout, followed by a `[ccc] session=…` trailer;
+   diagnostics go to stderr.
+
+4. **Look at what happened.** `ccc log` lists runs from the audit log under
+   `~/.local/state/ccc/audit/`; session records live beside it in
+   `~/.local/state/ccc/sessions/`. `ccc resume <session-id> "follow-up"`
+   continues a run.
+
+5. **Next:** [ccc-agentgen](https://github.com/rnortman/ccc-agentgen) for
+   complete workflows; [Configuration](#configuration) for routing agents
+   between Claude and Codex, and [Account selection](#account-selection) for
+   several Claude accounts.
 
 ## Using it from a parent agent
 
@@ -162,56 +156,6 @@ Exit codes:
 A subagent can easily outlive a parent's foreground shell-tool timeout (Claude
 Code's Bash tool caps at 10 minutes), so run `ccc run` in the background and
 collect its output when it finishes.
-
-## Process management
-
-`ccc status` reports process state in text or, with `--json`, as structured
-records. A spawned agent sees only the subtree below its own invocation (not
-itself), including running and finished subagents and their session ids.
-Ancestry is matched against every recorded harness first; the nearest recorded
-ancestor wins. Inherited `CCC_TRACE_ID` and `CCC_PARENT_INVOCATION_ID` are only
-fallbacks, so removing or spoofing them does not widen a live managed agent's
-scope, and agents cannot use `--trace`.
-
-A human shell without an anchor sees unfinished invocations across the catalog,
-including their ancestors. `--trace` selects one complete trace, and a
-trace-only inherited environment also selects that trace. A harness that `ccc`
-did not spawn is necessarily treated as a human shell because no record can
-match it. Stripping lineage for a detached or new `run` breaks the audit tree,
-although foreground `status` and `kill` authority is recovered through
-ancestry.
-
-The trust boundary is exact: the anchor comes from `/proc`, matched to `child`
-records in the caller's own `~/.local/state/ccc`. Commands do not escape an
-agent subtree, but this is not a sandbox against an agent that rewrites
-user-owned state and already has `kill(2)`; audit trust is the trust in that
-directory.
-
-`idle` is a best-effort transcript-mtime signal, so a long tool call can appear
-idle. Ended invocations are `done`, `failed`, or `killed`; unfinished
-combinations are `running`, `stopping`, `orphaned`, `lost`, or `unknown`.
-Matching zombies and dead tasks count as dead and are never presented as able
-to do work.
-
-`ccc kill` resolves invocation prefixes or full session ids and signals leaves
-first. For an agent, `--all` means all targets in its local subtree; a human
-shell must also provide `--trace` when using `--all`. Normal supervisor
-signalling forwards to the harness and then its descendants as needed; an
-orphan is signalled directly. `--now` skips the normal grace, `--grace SECS`
-overrides it, `--no-wait` returns without waiting for confirmation, and
-`--json` selects structured output. Targets are identity-checked before any
-signal. Exit status 0 means all targets are dead or were signalled, 1 means a
-target survived, and 2 means usage or scope was refused.
-
-Session sidecars are persisted early and protected by
-`sessions/<id>.lock`, and an orphan must pass the admission check before it can
-be controlled. `--no-session-persistence` and `--ephemeral` are passthrough
-options that intentionally make a harness session unrecoverable.
-
-Shutdown uses the configured `[process].kill_grace_s` (10 seconds by default),
-plus a fixed one-second capture drain. A held-open-stream warning means that a
-process left behind by the harness still owns an output pipe. Signalling is
-Linux-first; on non-Linux systems liveness can remain unknown.
 
 ## Agent definitions
 
@@ -506,6 +450,56 @@ continuation that ran but whose result could not be written fails as that
 write failure, not as exit 4. Codex limits are not recognised and stay
 exit 1.
 
+## Process management
+
+`ccc status` reports process state in text or, with `--json`, as structured
+records. A spawned agent sees only the subtree below its own invocation (not
+itself), including running and finished subagents and their session ids.
+Ancestry is matched against every recorded harness first; the nearest recorded
+ancestor wins. Inherited `CCC_TRACE_ID` and `CCC_PARENT_INVOCATION_ID` are only
+fallbacks, so removing or spoofing them does not widen a live managed agent's
+scope, and agents cannot use `--trace`.
+
+A human shell without an anchor sees unfinished invocations across the catalog,
+including their ancestors. `--trace` selects one complete trace, and a
+trace-only inherited environment also selects that trace. A harness that `ccc`
+did not spawn is necessarily treated as a human shell because no record can
+match it. Stripping lineage for a detached or new `run` breaks the audit tree,
+although foreground `status` and `kill` authority is recovered through
+ancestry.
+
+The trust boundary is exact: the anchor comes from `/proc`, matched to `child`
+records in the caller's own `~/.local/state/ccc`. Commands do not escape an
+agent subtree, but this is not a sandbox against an agent that rewrites
+user-owned state and already has `kill(2)`; audit trust is the trust in that
+directory.
+
+`idle` is a best-effort transcript-mtime signal, so a long tool call can appear
+idle. Ended invocations are `done`, `failed`, or `killed`; unfinished
+combinations are `running`, `stopping`, `orphaned`, `lost`, or `unknown`.
+Matching zombies and dead tasks count as dead and are never presented as able
+to do work.
+
+`ccc kill` resolves invocation prefixes or full session ids and signals leaves
+first. For an agent, `--all` means all targets in its local subtree; a human
+shell must also provide `--trace` when using `--all`. Normal supervisor
+signalling forwards to the harness and then its descendants as needed; an
+orphan is signalled directly. `--now` skips the normal grace, `--grace SECS`
+overrides it, `--no-wait` returns without waiting for confirmation, and
+`--json` selects structured output. Targets are identity-checked before any
+signal. Exit status 0 means all targets are dead or were signalled, 1 means a
+target survived, and 2 means usage or scope was refused.
+
+Session sidecars are persisted early and protected by
+`sessions/<id>.lock`, and an orphan must pass the admission check before it can
+be controlled. `--no-session-persistence` and `--ephemeral` are passthrough
+options that intentionally make a harness session unrecoverable.
+
+Shutdown uses the configured `[process].kill_grace_s` (10 seconds by default),
+plus a fixed one-second capture drain. A held-open-stream warning means that a
+process left behind by the harness still owns an output pipe. Signalling is
+Linux-first; on non-Linux systems liveness can remain unknown.
+
 ## Roleless launch
 
 `ccc launch` with neither an agent type nor `--resume` opens a plain
@@ -563,3 +557,94 @@ transcript.
 The session's recorded harness remains pinned even if a later definition
 policy disallows it. The matching body-only overlay is re-read on every resume,
 so edited or newly added prompt content takes effect for that recorded harness.
+
+## Audit log
+
+`ccc log` reads the append-only records under
+`~/.local/state/ccc/audit/<trace-id>.jsonl` and the chronological index in
+`traces.jsonl`. Records describe `start`, `spawn`, `turn`, and `end` events;
+prompts, results, callback payload details, and native diagnostics are retained
+in the trace file. The trace file is authoritative. A start is written before
+the index, so a process dying in that window is shown as unindexed; an indexed
+trace whose file is missing is reported as a dangling entry. Missing,
+unreadable, or malformed indexes do not hide trace files.
+
+With no selector, `ccc log` lists roots. A unique trace-id prefix or `--latest`
+selects a trace and renders its invocation tree. `--flat` renders strict
+timestamp order, including interleaved sibling events, and `--verbose` prints
+full ids and retained multiline details. `--json` is available only with a
+selector and emits one object containing `trace`, optional `index`, and joined
+`invocations`; the `t` tags and all known record fields are preserved, but JSON
+byte-for-byte identity with the JSONL input is not promised. `--flat` and
+`--json` require a selector; `--json` cannot be combined with `--verbose`.
+
+### Resuming what `ccc log` lists
+
+The TRACE column of the plain listing is also a resume argument. Both resume
+commands accept a unique trace-id prefix and continue that trace's root
+session:
+
+```
+ccc log 12345678
+ccc launch --resume 12345678
+ccc resume 12345678 "Continue the work"
+```
+
+`--fork` works with either form, and a `note:` on stderr names the full trace
+id and the session it resolved to. The root is the invocation the index names for
+the trace, or, for an unindexed trace, its single invocation without a parent;
+its session is the one `ccc log` shows for it. A trace whose root is missing,
+ambiguous or never recorded a session is refused rather than continued through
+a child or another root. An ambiguous prefix is refused with the full candidate
+ids; copy a full id from `ccc log --verbose`. To continue a particular
+subagent, find its row in `ccc log <trace-prefix>` and pass its full
+`session=`/`thread=` value (or its `ccc run` trailer session id); exact session
+ids get no prefix matching.
+
+An argument that names an existing session record is always that session, even
+if it also matches a trace; trace lookup happens only when no record exists
+under that name. An older trace resumes the same native session even if it has
+continued since: the continuation, or fork, starts from that session's current
+transcript, not a snapshot at the listed trace. The session's record must still
+exist and pass the usual checks — an unknown session, one in use, or one whose
+recorded owner is still running is refused as for an exact id.
+
+The index records both config paths (site and agents, each marked
+`(missing)` when the file did not exist; the listing's `CONFIG` and `AGENTS`
+columns, the trace header's `config …` and `agents …`) and the recognized
+`CCC_*` variables by value: `CCC_CONFIG`, `CCC_AGENTS_CONFIG`,
+`CCC_CLAUDE_BIN`, `CCC_CODEX_BIN` and the overrides. Name-only unknown
+variables are rendered as `<unrecognized>`. `CCC_TRACE_ID` and
+`CCC_PARENT_INVOCATION_ID` are managed by `ccc`; users and agents should not
+set them. Stripping the inherited environment breaks lineage. Claude session
+ids may be pre-minted and are shown when available. `ccc` remains resident for
+interactive launch, returns the harness exit status, injects Codex `notify` or
+Claude `Stop` callbacks, and records the session so `ccc resume`/`ccc launch
+--resume` can find it. A row that continues a recorded session is suffixed
+`(resumes <inv>)` — `(forks <inv>)` for a fork — naming the invocation that
+created it, or `(session created outside this trace)` when none in the trace
+did. A user Codex notify is replaced; a later
+passthrough Claude `--settings` replaces the injected hook. The hidden
+`ccc hook` command is internal. No transcript file is parsed.
+
+Audit writers hold the per-file lock through the end seek, tail check, complete
+write, and flush, so concurrent appends do not interleave; a short write can
+still lose that record, and the next append inserts a newline before its own
+record when needed. Readers diagnose and skip damaged or non-UTF-8 lines
+locally, so one damaged record does not hide its neighbors. An unterminated
+damaged tail is treated as truncated (and may be the one record lost), while
+turn counts include only readable turn records.
+
+## Development
+
+```sh
+make setup-hooks   # point git at .githooks; prints what to install if a hook's tool is missing
+make check         # fmt, clippy, test, brenn-scrub init --check — what pre-commit runs
+```
+
+`make check` and the hooks need
+[`brenn-scrub`](https://crates.io/crates/brenn-scrub) and the `gitleaks`
+release it pins on `PATH` (`cargo install --locked brenn-scrub`).
+`make rust-check` runs the Rust checks alone, as CI does.
+`make publish-check` dry-runs `cargo publish` against crates.io; run it on a
+committed tree.

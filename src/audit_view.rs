@@ -239,6 +239,7 @@ pub(crate) fn load_catalog(dir: &Path, err: &mut dyn Write) -> Result<Vec<Entry>
     let index_path = dir.join("traces.jsonl");
     let indexes = match audit::read_index_with_diag(dir, Some(err)) {
         Ok(v) => v,
+        // TODO(log-missing-index-is-reported-as-an-error): a NotFound here is the empty log before the first run and should be silent; see TODO.md.
         Err(e) => {
             diag(err, format_args!("{}: {e:#}", index_path.display()))?;
             Vec::new()

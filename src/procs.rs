@@ -127,7 +127,7 @@ impl ProcId {
         let (_, start, state) = match read_stat(self.pid) {
             Ok(stat) => stat,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Liveness::Dead,
-            // TODO(procs-alive-esrch-read-is-unknown): a /proc/<pid>/stat read that fails with ESRCH (task released between the directory lookup and the read) is reported as Unknown, though the process is gone and the kill path treats ESRCH as "already gone"; mapping it to Dead is a liveness-rule change that needs a design delta (delta 8 forbids production changes this round).
+            // TODO(procs-alive-esrch-read-is-unknown): a /proc/<pid>/stat read that fails with ESRCH (task released between the directory lookup and the read) is reported as Unknown, though the process is gone and the kill path treats ESRCH as "already gone"; mapping it to Dead is a liveness-rule change.
             Err(e) => return Liveness::Unknown(e.to_string()),
         };
         if self.boot_id != current_boot || self.start != start || matches!(state, 'Z' | 'X') {
