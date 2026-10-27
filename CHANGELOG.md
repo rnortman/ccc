@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **Upgrade note: subagents no longer bypass permissions by default.** The
+  default `[claude] permission_mode` is now `auto` instead of
+  `bypassPermissions`, so Claude subagents fail closed: an action Claude's
+  classifier denies fails as a tool call, and where Claude Code reports auto
+  mode unavailable no subagent can do its work, instead of every
+  permission check being off. The mode is read on every spawn, resumes
+  included, so a session started before the upgrade resumes in `auto`. A site
+  that relied on the old default keeps it with `permission_mode =
+  "bypassPermissions"` under `[claude]`.
+
 ## 0.2.1 — 2026-10-22
 
 - `ccc` is installable from crates.io: `cargo install --locked ccc-harness`

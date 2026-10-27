@@ -95,9 +95,13 @@ agent definitions — the [Quick start](#quick-start) puts one in place.
    empty)`: Claude runs on your own `claude` login.
 
 3. **Run it.** Two things to know first. Subagents run with
-   `--permission-mode bypassPermissions` unless `[claude] permission_mode`
-   says otherwise (see [Configuration](#configuration)). And every Claude spawn
-   marks its working directory trusted in the account's `.claude.json` (see
+   `--permission-mode auto` unless `[claude] permission_mode` says otherwise
+   (see [Configuration](#configuration)): Claude's classifier decides each
+   action, and a denial comes back to the agent as a failed tool call. Where
+   Claude Code reports auto mode unavailable, subagents cannot do their work
+   under this default and need that line set: `bypassPermissions` spawns
+   every subagent with Claude's permission checks bypassed. And every Claude
+   spawn marks its working directory trusted in the account's `.claude.json` (see
    [Account selection](#account-selection)), so `--cwd` is a statement that you
    trust that checkout's hooks and MCP servers.
 
@@ -252,7 +256,7 @@ fable = "claude-fable-5-1[1M]"
 auth = "config-dir"        # config-dir: CLAUDE_CONFIG_DIR=<profiles_dir>/<profile>
                            # token: CLAUDE_CODE_OAUTH_TOKEN from <token_dir>/<profile>.token
 profiles = ["personal", "work"]   # preference order; default empty: the ambient login
-permission_mode = "bypassPermissions"
+permission_mode = "auto"   # acceptEdits | auto | bypassPermissions | manual | dontAsk | plan
 token_dir = "~/.claude-tokens"
 profiles_dir = "~/.claude-profiles"
 extra_args = []            # appended to the claude argv verbatim

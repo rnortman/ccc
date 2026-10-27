@@ -541,7 +541,7 @@ mod tests {
 
     fn driver<'a>(env: &'a BTreeMap<String, String>) -> ClaudeDriver<'a> {
         ClaudeDriver {
-            permission_mode: PermissionMode::BypassPermissions,
+            permission_mode: PermissionMode::DontAsk,
             account: None,
             env,
         }
@@ -556,7 +556,7 @@ mod tests {
         assert_eq!(i.value_of("--model"), Some("claude-haiku-4-5[1m]"));
         assert_eq!(i.value_of("--effort"), Some("low"));
         assert_eq!(i.value_of("--agent"), Some("explorer"));
-        assert_eq!(i.value_of("--permission-mode"), Some("bypassPermissions"));
+        assert_eq!(i.value_of("--permission-mode"), Some("dontAsk"));
         assert!(!i.has_arg("--bare"));
         assert!(!i.has_arg("--resume"));
         assert_eq!(i.cwd, PathBuf::from("/srv/work"));
@@ -626,10 +626,7 @@ mod tests {
             .build(&r, &common(one_shot(resumed("9f22dd1b", false))))
             .unwrap();
         assert_eq!(&resume.args[0..3], &["-p", "--output-format", "json"]);
-        assert_eq!(
-            resume.value_of("--permission-mode"),
-            Some("bypassPermissions")
-        );
+        assert_eq!(resume.value_of("--permission-mode"), Some("dontAsk"));
         assert_eq!(resume.value_of("--resume"), Some("9f22dd1b"));
         assert!(!resume.has_arg("--agent"), "{:?}", resume.args);
         assert!(!resume.has_arg("--agents"), "{:?}", resume.args);
@@ -680,7 +677,11 @@ mod tests {
 
                 assert_eq!(i.has_arg("-p"), is_one_shot, "{mode:?}");
                 assert_eq!(i.has_arg("--output-format"), is_one_shot, "{mode:?}");
-                assert_eq!(i.has_arg("--permission-mode"), is_one_shot, "{mode:?}");
+                assert_eq!(
+                    i.value_of("--permission-mode"),
+                    is_one_shot.then_some("dontAsk"),
+                    "{mode:?}"
+                );
                 assert_eq!(
                     i.value_of("--session-id"),
                     is_fresh.then_some("preset"),

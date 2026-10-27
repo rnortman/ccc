@@ -68,7 +68,9 @@ impl std::fmt::Display for ClaudeAuth {
     }
 }
 
-/// How much a Claude `-p` run may do without asking.
+/// How much a Claude `-p` run may do without asking. The default is `auto`:
+/// Claude's classifier approves or denies each action, and under `-p` a
+/// denial reaches the agent as a failed tool call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PermissionMode {
@@ -333,7 +335,7 @@ impl Default for ClaudeConfig {
         ClaudeConfig {
             auth: ClaudeAuth::ConfigDir,
             profiles: Vec::new(),
-            permission_mode: PermissionMode::BypassPermissions,
+            permission_mode: PermissionMode::Auto,
             token_dir: "~/.claude-tokens".to_string(),
             profiles_dir: "~/.claude-profiles".to_string(),
             extra_args: Vec::new(),
@@ -987,7 +989,7 @@ mod tests {
         let c = site_cfg("").unwrap();
         assert_eq!(c.default_harness, Harness::Claude);
         assert_eq!(c.claude.auth, ClaudeAuth::ConfigDir);
-        assert_eq!(c.claude.permission_mode, PermissionMode::BypassPermissions);
+        assert_eq!(c.claude.permission_mode, PermissionMode::Auto);
         assert!(c.claude.profiles.is_empty());
         assert!(c.claude.ambient());
         assert_eq!(c.claude.profiles_dir, "~/.claude-profiles");
@@ -1080,13 +1082,22 @@ effort = "low"
     fn closed_value_sets_reject_typos_at_parse_time() {
         assert!(site_cfg("[claude]\npermission_mode = \"bypassPermission\"").is_err());
         assert!(site_cfg("[codex]\napproval = \"nver\"").is_err());
-        assert_eq!(
-            site_cfg("[claude]\npermission_mode = \"dontAsk\"")
-                .unwrap()
-                .claude
-                .permission_mode,
-            PermissionMode::DontAsk
-        );
+        for m in [
+            PermissionMode::AcceptEdits,
+            PermissionMode::Auto,
+            PermissionMode::BypassPermissions,
+            PermissionMode::Manual,
+            PermissionMode::DontAsk,
+            PermissionMode::Plan,
+        ] {
+            assert_eq!(
+                site_cfg(&format!("[claude]\npermission_mode = \"{}\"", m.as_str()))
+                    .unwrap()
+                    .claude
+                    .permission_mode,
+                m
+            );
+        }
         assert!(Effort::parse("lo").is_err());
         assert_eq!(Effort::parse(" XHigh ").unwrap(), Effort::XHigh);
         assert_eq!(Effort::Max.as_str(), "max");

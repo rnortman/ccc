@@ -2210,7 +2210,7 @@ mod tests {
     use super::*;
     use crate::agents::Sandbox;
     use crate::audit;
-    use crate::config::{ClaudeAuth, Effort};
+    use crate::config::{ClaudeAuth, Effort, PermissionMode};
     use crate::harness::modes::run_mode;
     use crate::procs::ProcId;
     #[cfg(target_os = "linux")]
@@ -3434,6 +3434,39 @@ mod tests {
             stdin: None,
         };
         assert_eq!(run_launch_test(&inv).unwrap().code(), Some(0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_claude_run_passes_a_configured_permission_mode_to_the_child() {
+        let mut f = Fixture::new("run-permission-mode");
+        f.token("team03");
+        f.cfg.claude.profiles = vec!["team03".into()];
+        f.cfg.claude.permission_mode = PermissionMode::DontAsk;
+        f.claude_script(OK_RESULT);
+        start_run(&f, Some(PromptSource::Arg), None, Some("go"));
+        let usage = || UsageSource::Unavailable("not consulted".into());
+        let mut out = Vec::new();
+        let completion = run_with(
+            &f.ctx(&usage),
+            "explorer",
+            Some(&f.work()),
+            "go".into(),
+            None,
+            None,
+            false,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(completion, 0);
+        record_completion(&f, completion);
+
+        let argv = argv_of(&f);
+        let i = argv
+            .iter()
+            .position(|a| a == "--permission-mode")
+            .unwrap_or_else(|| panic!("--permission-mode: {argv:?}"));
+        assert_eq!(argv[i + 1], "dontAsk", "{argv:?}");
     }
 
     #[cfg(unix)]
@@ -6829,6 +6862,11 @@ mod tests {
         assert_eq!(argv[0], "-p");
         assert!(argv.contains(&"--agent".to_string()), "{argv:?}");
         assert!(!argv.contains(&"--resume".to_string()), "{argv:?}");
+        let i = argv
+            .iter()
+            .position(|a| a == "--permission-mode")
+            .unwrap_or_else(|| panic!("--permission-mode: {argv:?}"));
+        assert_eq!(argv[i + 1], "auto", "{argv:?}");
         assert_eq!(f.call("prompt"), "go and look");
         assert_eq!(
             std::fs::canonicalize(f.call("cwd").trim()).unwrap(),
