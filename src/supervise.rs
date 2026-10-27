@@ -1628,7 +1628,10 @@ mod tests {
         let _lock = TEST_IO_TEST_LOCK
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let inv = invocation("trap '' TERM; sleep 10", None);
+        // `exec` keeps the child a single process under every `/bin/sh`; a
+        // forked `sleep` can still be dying from the group SIGKILL when the
+        // sweep runs, adding a third audit record.
+        let inv = invocation("trap '' TERM; exec sleep 10", None);
         let on_spawned = |_: ProcId, _: u32| {};
         let mut on_line = |_line: &str| {};
         let audit = std::sync::Mutex::new(Vec::new());
