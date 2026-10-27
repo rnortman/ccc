@@ -1,6 +1,6 @@
 [package]
 name = "ccc-harness"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "Dispatches agent types to Claude Code or Codex subprocesses"
 license = "Apache-2.0"

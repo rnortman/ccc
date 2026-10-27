@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 — 2026-10-27
 
 - **Upgrade note: subagents no longer bypass permissions by default.** The
   default `[claude] permission_mode` is now `auto` instead of
