@@ -1,10 +1,11 @@
-//! Argv/env construction and output parsing for the two harnesses.
+//! Argv/env construction and output parsing for the harnesses.
 //!
 //! Nothing here spawns a process: `build` returns an [`Invocation`] describing
 //! one, and `parse` turns captured output into an [`Outcome`].
 
 pub mod claude;
 pub mod codex;
+pub mod goose;
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -159,7 +160,7 @@ pub struct Captured {
     pub exit_code: Option<i32>,
 }
 
-/// Abstraction over a single harness (Claude or Codex).
+/// Abstraction over a single harness.
 pub trait Driver: Sync {
     fn build(&self, r: &Resolved, c: &Common) -> Result<Invocation>;
 
@@ -269,6 +270,7 @@ impl std::fmt::Debug for Invocation {
 
 impl Invocation {
     /// A `Command` ready to spawn. Stdin is piped when a prompt is present.
+    /// `env_remove` applies after `env_set`, so a key in both is removed.
     pub fn command(&self) -> Command {
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args).current_dir(&self.cwd);
@@ -510,6 +512,7 @@ mod tests {
             tools: None,
             sandbox: Sandbox::ReadOnly,
             body: "b".into(),
+            goose: None,
         };
         let ctx = RunContext::new(&r, Some("team03"), &inv());
         let annotated = HarnessError::unusable("boom").annotate(&ctx);
@@ -548,6 +551,7 @@ mod tests {
                 tools: None,
                 sandbox: crate::agents::Sandbox::ReadOnly,
                 body: "b".into(),
+                goose: None,
             },
             None,
             &i,

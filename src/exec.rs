@@ -18,6 +18,7 @@ use crate::audit::{
 use crate::config::{Config, Effort, EnvSource, Harness, ProcessEnv};
 use crate::harness::claude::{Account, ClaudeDriver};
 use crate::harness::codex::{self, CodexDriver};
+use crate::harness::goose::GooseDriver;
 use crate::harness::{
     diag, report_warnings, Common, Driver, HarnessError, Invocation, Io, Mode, Origin, Outcome,
     RunContext,
@@ -101,6 +102,12 @@ pub enum LaunchTarget<'a> {
         agent: &'a str,
         cwd: Option<&'a str>,
         cli_harness: Option<Harness>,
+        /// Goose only: `--allow-read`.
+        allow_read: &'a [PathBuf],
+        /// Goose only: `--allow-write`.
+        allow_write: &'a [PathBuf],
+        /// Goose only: `--allow-exec`.
+        allow_exec: &'a [PathBuf],
     },
     Roleless {
         cwd: Option<&'a str>,
@@ -172,10 +179,35 @@ impl Completion {
     }
 }
 
+/// The Goose confinement flags of `ccc run`: directories granted beyond the
+/// run's cwd, and `--goose-nested`, which takes write and exec roots from the
+/// flags only.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GooseFlags {
+    pub allow_read: Vec<PathBuf>,
+    pub allow_write: Vec<PathBuf>,
+    pub allow_exec: Vec<PathBuf>,
+    pub nested: bool,
+}
+
+impl GooseFlags {
+    /// The first `--allow-*` flag given, spelled as on the command line.
+    fn first_allow(&self) -> Option<String> {
+        [
+            ("--allow-read", &self.allow_read),
+            ("--allow-write", &self.allow_write),
+            ("--allow-exec", &self.allow_exec),
+        ]
+        .into_iter()
+        .find_map(|(flag, dirs)| dirs.first().map(|d| format!("{flag} {}", d.display())))
+    }
+}
+
 /// A one-shot turn for `agent`.
 // TODO(ccc-detach): a parent whose shell tool times out before a long
 // subagent finishes needs a `--detach` / `ccc wait` pair writing the
 // output to a file; background execution covers it for now.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     agent: &str,
     cwd: Option<&str>,
@@ -183,25 +215,29 @@ pub fn run(
     prompt_file: Option<&str>,
     profile: Option<&str>,
     cli_harness: Option<Harness>,
+    goose: &GooseFlags,
     as_json: bool,
 ) -> Result<i32> {
     let mut input = std::io::stdin();
     let mut output = std::io::stdout();
-    run_from(
+    run_from_report(
         agent,
         cwd,
         positional,
         prompt_file,
         profile,
         cli_harness,
+        goose,
         as_json,
         &ProcessEnv,
         Config::load,
         &mut input,
         &mut output,
+        &|message| diag(message),
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn run_from<L>(
     agent: &str,
@@ -226,6 +262,7 @@ where
         prompt_file,
         profile,
         cli_harness,
+        &GooseFlags::default(),
         as_json,
         env,
         load_config,
@@ -243,6 +280,7 @@ fn run_from_report<L>(
     prompt_file: Option<&str>,
     profile: Option<&str>,
     cli_harness: Option<Harness>,
+    goose: &GooseFlags,
     as_json: bool,
     env: &dyn EnvSource,
     load_config: L,
@@ -284,6 +322,7 @@ where
                     prompt,
                     profile,
                     cli_harness,
+                    goose,
                     as_json,
                     output,
                     report,
@@ -313,6 +352,7 @@ fn run_with(
         prompt,
         profile,
         cli_harness,
+        &GooseFlags::default(),
         as_json,
         out,
         &|message| diag(message),
@@ -327,11 +367,12 @@ fn run_with_report(
     prompt: String,
     profile: Option<&str>,
     cli_harness: Option<Harness>,
+    goose: &GooseFlags,
     as_json: bool,
     out: &mut dyn Write,
     report: &(dyn Fn(String) + Send + Sync),
 ) -> std::result::Result<Completion, OperationError> {
-    let prepared = prepare(ctx, agent, cwd, profile, cli_harness)?;
+    let prepared = prepare(ctx, agent, cwd, profile, cli_harness, goose)?;
     let Prepared {
         r,
         cwd,
@@ -346,7 +387,7 @@ fn run_with_report(
             io: Io::OneShot { prompt },
             origin: Origin::Fresh,
         },
-        preset_session_id: (r.harness == Harness::Claude).then(|| Uuid::new_v4().to_string()),
+        preset_session_id: presets_session(r.harness).then(|| Uuid::new_v4().to_string()),
     };
     let mut record = record_of(&r, &common.cwd, account.as_ref(), ctx.now);
     fill_lineage(ctx, &mut record);
@@ -830,6 +871,16 @@ struct ResumePrepared {
 /// sidecar and lock alone.
 fn resume_prologue(ctx: &Ctx, id: &str, fork: bool, pick: AccountPick) -> Result<ResumePrepared> {
     let parent = session::load_from(&session::sessions_dir_in(ctx.env), id)?;
+    if parent.harness == Harness::Goose {
+        if fork {
+            bail!(
+                "goose session {id} cannot be forked: Goose has no headless fork, and its interactive fork copies the parent's name, which is ccc's session id"
+            );
+        }
+        if parent.goose_policy.is_none() {
+            bail!("goose session {id} has no recorded confinement policy, so it cannot be resumed");
+        }
+    }
     if fork {
         // A fork never writes the parent's transcript, so a live owner does
         // not stop it. The check is read-only: taking the parent's lock, even
@@ -1103,6 +1154,7 @@ fn launch_start(
             agent,
             cwd,
             cli_harness,
+            ..
         } => (
             Some(agent.to_string()),
             None,
@@ -1148,9 +1200,24 @@ fn launch_with_ctx(
             agent,
             cwd,
             cli_harness,
+            allow_read,
+            allow_write,
+            allow_exec,
         } => launch_invocation(
             ctx,
-            prepare(ctx, agent, cwd, profile, cli_harness)?,
+            prepare(
+                ctx,
+                agent,
+                cwd,
+                profile,
+                cli_harness,
+                &GooseFlags {
+                    allow_read: allow_read.to_vec(),
+                    allow_write: allow_write.to_vec(),
+                    allow_exec: allow_exec.to_vec(),
+                    nested: false,
+                },
+            )?,
             passthrough,
         )?,
         LaunchTarget::Roleless { cwd, model, effort } => launch_invocation(
@@ -1178,8 +1245,18 @@ fn launch_with_ctx(
         &record,
         &|message| diag(message),
     )?;
+    if r.harness == Harness::Goose {
+        // A resumed Goose session is marked as opened at a terminal only once
+        // nothing but the spawn is left to fail; a fresh one was saved marked.
+        if let Some(id) = common.mode.continues() {
+            save_session_required(ctx, id, &record)?;
+        }
+        eprintln!(
+            "note: tools added in this session with /extension or /builtin stay with it on resume"
+        );
+    }
     // The id this invocation is known to be before the harness says so: the
-    // preset (fresh Claude) or the resumed id (non-fork resume).
+    // preset (fresh Claude or Goose) or the resumed id (non-fork resume).
     let expected = common
         .preset_session_id
         .clone()
@@ -1230,6 +1307,25 @@ fn launch_with_ctx(
     };
     report_warnings(&supervised.warnings);
     let mut warnings = supervised.warnings;
+    if r.harness == Harness::Goose {
+        let (end, note) = goose_launch_end(expected, &turns);
+        if let Some(note) = note {
+            eprintln!("{note}");
+        }
+        return Ok(Completion::new(
+            code,
+            EndPayload {
+                exit: Some(code),
+                signal,
+                error: supervised
+                    .termination
+                    .as_ref()
+                    .map(|term| termination_message(term, &status)),
+                warnings,
+                ..end
+            },
+        ));
+    }
     if let Some(warning) =
         session_mismatch_warning(expected.as_deref(), last.map(|t| t.session.as_str()))
     {
@@ -1265,6 +1361,39 @@ fn launch_with_ctx(
         turns: Some(turns.len()),
     };
     Ok(Completion::new(code, end))
+}
+
+/// The session, result and turn count of a Goose launch's end record, and the
+/// note for the human. Only the launch's own session is recorded: a last turn
+/// in another session, one the human opened with `/new`, gets the note and
+/// nothing saved, and the result is the last answer the launch's session gave.
+fn goose_launch_end(
+    expected: Option<String>,
+    turns: &[audit::Turn],
+) -> (EndPayload, Option<String>) {
+    let note = match (expected.as_deref(), turns.last()) {
+        (Some(own), Some(last)) if last.session != own => Some(format!(
+            "note: the launch ended in a Goose session started with /new ({}); ccc does not record it; ccc launch --resume {own} reopens the session this launch started",
+            last.session
+        )),
+        _ => None,
+    };
+    let result = turns
+        .iter()
+        .rev()
+        .find(|t| Some(t.session.as_str()) == expected.as_deref())
+        .and_then(|t| t.result.clone());
+    let end = EndPayload {
+        exit: None,
+        signal: None,
+        session: expected,
+        result,
+        error: None,
+        warnings: Vec::new(),
+        native: None,
+        turns: Some(turns.len()),
+    };
+    (end, note)
 }
 
 /// Marks `cwd` trusted for `account`. Best-effort: a failure is a diag, not an
@@ -1316,10 +1445,13 @@ fn launch_invocation(
             },
             origin: Origin::Fresh,
         },
-        preset_session_id: (r.harness == Harness::Claude).then(|| Uuid::new_v4().to_string()),
+        preset_session_id: presets_session(r.harness).then(|| Uuid::new_v4().to_string()),
     };
-    let inv = driver_for(ctx, r.harness, account.clone(), None).build(&r, &common)?;
+    let inv = driver_for(ctx, &r, &common, account.clone(), None)?.build(&r, &common)?;
     let mut record = record_of(&r, &common.cwd, account.as_ref(), ctx.now);
+    // Tools the human adds at the terminal are saved with a Goose session, so
+    // its policy no longer bounds it for a confined agent's `ccc_resume`.
+    record.opened_at_terminal = r.harness == Harness::Goose;
     fill_lineage(ctx, &mut record);
     Ok(LaunchPrepared {
         inv,
@@ -1344,8 +1476,10 @@ fn launch_resume_invocation(
         r,
         account,
         notes,
-        record,
+        mut record,
     } = resume_prologue(ctx, id, fork, AccountPick::Requested(profile))?;
+    // Saved with the mark only once the spawn prologue has passed.
+    record.opened_at_terminal |= record.harness == Harness::Goose;
     let mut extra = extra_args(ctx.cfg, r.harness);
     extra.extend(passthrough);
     let common = Common {
@@ -1362,7 +1496,7 @@ fn launch_resume_invocation(
         },
         preset_session_id: None,
     };
-    let inv = driver_for(ctx, r.harness, account.clone(), None).build(&r, &common)?;
+    let inv = driver_for(ctx, &r, &common, account.clone(), None)?.build(&r, &common)?;
     Ok(LaunchPrepared {
         inv,
         r,
@@ -1381,13 +1515,91 @@ fn prepare(
     cwd: Option<&str>,
     profile: Option<&str>,
     cli_harness: Option<Harness>,
+    goose: &GooseFlags,
 ) -> Result<Prepared> {
     let def = AgentDef::load(&ctx.cfg.agents_dir_in(ctx.env), agent)?;
     let (r, notes) = resolve::resolve(ctx.cfg, ctx.env, &def, cli_harness)?;
     for note in &notes {
         eprintln!("note: {note}");
     }
-    prepare_resolved(ctx, r, notes, cwd, profile)
+    if r.harness != Harness::Goose {
+        if let Some(flag) = goose.first_allow() {
+            bail!(
+                "{flag} applies only to the goose harness; agent type {agent:?} resolved to {}, which would not honour it",
+                r.harness
+            );
+        }
+    }
+    let mut prepared = prepare_resolved(ctx, r, notes, cwd, profile)?;
+    if prepared.r.harness == Harness::Goose {
+        // The policy sees `--cwd` as given: a nested run refuses a path that
+        // is not already canonical rather than following a symlink on it.
+        let given = match cwd {
+            Some(c) => crate::config::expand_tilde_in(ctx.env, c),
+            None => prepared.cwd.clone(),
+        };
+        prepared.r.goose = Some(goose_policy(ctx.cfg, ctx.env, &def, &given, goose)?);
+    }
+    Ok(prepared)
+}
+
+/// The confinement policy of a fresh Goose run of `def` in `cwd`.
+pub fn goose_policy(
+    cfg: &Config,
+    env: &dyn EnvSource,
+    def: &AgentDef,
+    cwd: &Path,
+    flags: &GooseFlags,
+) -> Result<crate::goose_policy::GoosePolicy> {
+    let self_exe = std::env::current_exe().context("locating the ccc binary")?;
+    let protected =
+        crate::goose_policy::ProtectedDirs::gather_in(env, cfg, &cfg.goose.root_in(env), &self_exe);
+    crate::goose_policy::compute(
+        &crate::goose_policy::PolicyRequest {
+            tools: &def.goose_tools,
+            agents: &def.goose_agents,
+            cwd,
+            allow_read: &flags.allow_read,
+            allow_write: &flags.allow_write,
+            allow_exec: &flags.allow_exec,
+            nested: flags.nested,
+        },
+        &protected,
+    )
+}
+
+/// Builds the Goose box for `policy` and starts it once with `/bin/true`, so a
+/// missing bwrap, disabled user namespaces, or a root deleted or replaced by a
+/// symlink fails here with exit 2 instead of at Goose's extension start.
+fn box_preflight(ctx: &Ctx, policy: &crate::goose_policy::GoosePolicy) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use crate::goose_tools::boxed;
+        if !policy.needs_box() {
+            return Ok(());
+        }
+        let settings = boxed::BoxSettings::from_config(ctx.cfg, ctx.env)?;
+        let self_exe = std::env::current_exe().context("locating the ccc binary")?;
+        boxed::preflight(
+            policy,
+            &settings,
+            &self_exe,
+            std::time::Duration::from_secs_f64(ctx.cfg.process.kill_grace_s),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if policy.needs_box() {
+            bail!("a Goose run with read, write or shell tools needs the bubblewrap box, which needs Linux");
+        }
+        let _ = ctx;
+        Ok(())
+    }
+}
+
+/// Whether a fresh session of `harness` gets its id from ccc before the spawn.
+fn presets_session(harness: Harness) -> bool {
+    matches!(harness, Harness::Claude | Harness::Goose)
 }
 
 /// The startup after resolution: pick a working directory, mint a Claude
@@ -1457,9 +1669,9 @@ fn drive_with_meta_report(
     let profile = account.as_ref().map(|a| a.profile.clone());
     let output_file = match r.harness {
         Harness::Codex => Some(codex::new_output_file(ctx.env)?),
-        Harness::Claude => None,
+        Harness::Claude | Harness::Goose => None,
     };
-    let driver = driver_for(ctx, r.harness, account.clone(), output_file.clone());
+    let driver = driver_for(ctx, r, common, account.clone(), output_file.clone())?;
     let mut inv = driver.build(r, common)?;
     inv.env_set.extend(ctx.audit.lineage().child_env());
     if let Err(e) = spawn_prologue(
@@ -1626,7 +1838,13 @@ fn spawn_prologue(
     record: &SessionRecord,
     report: &(dyn Fn(String) + Send + Sync),
 ) -> Result<()> {
-    let preset = (r.harness == Harness::Claude && common.mode.starts_from().is_none())
+    if r.harness == Harness::Goose {
+        crate::harness::goose::prepare_root(&ctx.cfg.goose.root_in(ctx.env))?;
+        if let Some(policy) = &r.goose {
+            box_preflight(ctx, policy)?;
+        }
+    }
+    let preset = (presets_session(r.harness) && common.mode.starts_from().is_none())
         .then_some(common.preset_session_id.as_deref())
         .flatten();
     if let Some(id) = preset {
@@ -1635,7 +1853,8 @@ fn spawn_prologue(
             SessionLockResult::Acquired(None) => {}
             SessionLockResult::Contended { message } => return Err(anyhow::anyhow!(message)),
             SessionLockResult::Io(e) => report(format!(
-                "warning: could not reserve fresh Claude session {id}: {e:#}"
+                "warning: could not reserve fresh {} session {id}: {e:#}",
+                r.harness
             )),
         }
     }
@@ -1754,17 +1973,19 @@ fn spawn_payload(
         cwd: cwd.display().to_string(),
         session,
         selection_notes,
+        goose_policy: r.goose.clone(),
     }
 }
 
 /// The driver for one harness, ready to build an invocation.
 fn driver_for<'a>(
     ctx: &'a Ctx,
-    harness: Harness,
+    r: &'a Resolved,
+    common: &Common,
     account: Option<Account>,
     output_file: Option<PathBuf>,
-) -> Box<dyn Driver + 'a> {
-    match harness {
+) -> Result<Box<dyn Driver + 'a>> {
+    Ok(match r.harness {
         Harness::Claude => Box::new(ClaudeDriver {
             permission_mode: ctx.cfg.claude.permission_mode,
             account,
@@ -1775,7 +1996,17 @@ fn driver_for<'a>(
             output_file,
             env: ctx.env,
         }),
-    }
+        Harness::Goose => Box::new(GooseDriver {
+            cfg: &ctx.cfg.goose,
+            policy: r
+                .goose
+                .as_ref()
+                .context("a goose run has no confinement policy")?,
+            self_exe: std::env::current_exe().context("locating the ccc binary")?,
+            session: crate::harness::goose::session_id(common)?,
+            env: ctx.env,
+        }),
+    })
 }
 
 /// The session id a reported failure came with, if the harness got that far.
@@ -1787,6 +2018,7 @@ fn extra_args(cfg: &Config, harness: Harness) -> Vec<String> {
     match harness {
         Harness::Claude => cfg.claude.extra_args.clone(),
         Harness::Codex => cfg.codex.extra_args.clone(),
+        Harness::Goose => cfg.goose.extra_args.clone(),
     }
 }
 
@@ -2073,6 +2305,8 @@ pub fn record_of(
         trace: None,
         inv: None,
         forked_from: None,
+        goose_policy: r.goose.clone(),
+        opened_at_terminal: false,
     }
 }
 
@@ -2091,13 +2325,14 @@ pub fn resolved_from(record: &SessionRecord, def: Option<&AgentDef>) -> Resolved
         body: def
             .map(|d| d.body_for(record.harness).to_string())
             .unwrap_or_default(),
+        goose: record.goose_policy.clone(),
     }
 }
 
 /// The account and selection notes for a turn of any harness: Claude turns
 /// get the account `pick` names, or none — the ambient login — when no
-/// profile is requested and none is configured; Codex turns get none and
-/// ignore `pick`.
+/// profile is requested and none is configured; Codex and Goose turns get
+/// none and ignore `pick`.
 fn turn_account(
     ctx: &Ctx,
     r: &Resolved,
@@ -2114,7 +2349,7 @@ fn turn_account(
             };
             Ok((Some(s.account), s.notes))
         }
-        Harness::Codex => Ok((None, Vec::new())),
+        Harness::Codex | Harness::Goose => Ok((None, Vec::new())),
     }
 }
 
@@ -2235,6 +2470,7 @@ mod tests {
             tools: Some(vec!["Read".into()]),
             sandbox: Sandbox::ReadOnly,
             body: "the system prompt".into(),
+            goose: None,
         }
     }
 
@@ -2456,7 +2692,7 @@ mod tests {
             command
                 .args(["-k", "1"])
                 .arg(seconds.to_string())
-                .arg(Self::ccc_binary())
+                .arg(crate::testutil::ccc_binary())
                 .args(args)
                 .env_clear()
                 .env("PATH", path)
@@ -2469,26 +2705,6 @@ mod tests {
                 stdout,
                 stderr,
             }
-        }
-
-        #[cfg(target_os = "linux")]
-        /// The `ccc` binary beside this test executable. `cargo test` builds
-        /// it because `tests/cli_binary.rs` is an integration-test target;
-        /// `cargo test --bin ccc` selects no integration test and does not.
-        fn ccc_binary() -> PathBuf {
-            let binary = std::env::current_exe()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .join("ccc");
-            assert!(
-                binary.is_file(),
-                "{} is missing: run `cargo test` without `--bin ccc`",
-                binary.display()
-            );
-            binary
         }
 
         #[cfg(target_os = "linux")]
@@ -2587,6 +2803,7 @@ mod tests {
                 r.model = "gpt-5.6-luna".into();
                 None
             }
+            Harness::Goose => None,
         };
         let record = record_of(
             &r,
@@ -2981,7 +3198,7 @@ mod tests {
         assert!(f.path("calls/argv").exists());
         let diagnostics = diagnostics.lock().unwrap();
         assert_eq!(diagnostics.len(), 1);
-        assert!(diagnostics[0].starts_with("warning: could not reserve fresh Claude session p: "));
+        assert!(diagnostics[0].starts_with("warning: could not reserve fresh claude session p: "));
         assert!(diagnostics[0].len() > "warning: could not reserve fresh Claude session p: ".len());
         let records = audit::read_trace(
             &Recorder::dir_in(&f.env),
@@ -3396,6 +3613,9 @@ mod tests {
                 agent: "explorer",
                 cwd: Some(&f.work()),
                 cli_harness: None,
+                allow_read: &[],
+                allow_write: &[],
+                allow_exec: &[],
             },
             None,
             vec![],
@@ -3754,6 +3974,9 @@ mod tests {
                 agent: "explorer",
                 cwd: Some(&exit.work()),
                 cli_harness: None,
+                allow_read: &[],
+                allow_write: &[],
+                allow_exec: &[],
             },
             None,
             vec![],
@@ -3789,6 +4012,9 @@ mod tests {
                 agent: "explorer",
                 cwd: Some(&turn.work()),
                 cli_harness: None,
+                allow_read: &[],
+                allow_write: &[],
+                allow_exec: &[],
             },
             None,
             vec![],
@@ -3826,6 +4052,9 @@ mod tests {
                 agent: "explorer",
                 cwd: Some(&claude.work()),
                 cli_harness: None,
+                allow_read: &[],
+                allow_write: &[],
+                allow_exec: &[],
             },
             None,
             vec![],
@@ -3858,6 +4087,9 @@ mod tests {
                 agent: "explorer",
                 cwd: Some(&codex.work()),
                 cli_harness: Some(Harness::Codex),
+                allow_read: &[],
+                allow_write: &[],
+                allow_exec: &[],
             },
             None,
             vec![],
@@ -3893,6 +4125,9 @@ mod tests {
                 agent: "explorer",
                 cwd: Some(&signal.work()),
                 cli_harness: None,
+                allow_read: &[],
+                allow_write: &[],
+                allow_exec: &[],
             },
             None,
             vec![],
@@ -3920,6 +4155,9 @@ mod tests {
                 agent: "explorer",
                 cwd: Some(&parent.work()),
                 cli_harness: None,
+                allow_read: &[],
+                allow_write: &[],
+                allow_exec: &[],
             },
             None,
             vec![],
@@ -4228,7 +4466,15 @@ mod tests {
         f.env.insert("CCC_HARNESS_ALL".into(), "codex".into());
         let usage = || UsageSource::Unavailable("offline".into());
         let ctx = f.ctx(&usage);
-        let prepared = prepare(&ctx, "explorer", Some(&f.work()), None, None).unwrap();
+        let prepared = prepare(
+            &ctx,
+            "explorer",
+            Some(&f.work()),
+            None,
+            None,
+            &GooseFlags::default(),
+        )
+        .unwrap();
         let account_notes = select_account(&ctx, &prepared.r, &(ctx.usage)())
             .unwrap()
             .notes;
@@ -4830,7 +5076,7 @@ mod tests {
             let code = path_value(&f.path(&format!("results/{name}.code")));
             format!(
                 "{prefix} {} {args} >{stdout} 2>{stderr}; code=$?; printf '%s' \"$code\" >{code};",
-                path_value(&Fixture::ccc_binary()),
+                path_value(&crate::testutil::ccc_binary()),
             )
         };
         let spoof = format!(
@@ -4960,7 +5206,7 @@ mod tests {
         f.install_cli_config();
         let aggregate_deadline = boot_seconds() + 8;
         let path_value = |path: &Path| shell_literal(&path.display().to_string());
-        let binary = path_value(&Fixture::ccc_binary());
+        let binary = path_value(&crate::testutil::ccc_binary());
         let common_env = format!(
             "PATH={} HOME={} XDG_STATE_HOME={} {}",
             shell_literal(&std::env::var("PATH").unwrap()),
@@ -5897,7 +6143,15 @@ mod tests {
         f.cfg.claude.profiles = Vec::new();
         let ctx = f.ctx(&usage_never_read);
 
-        let prepared = prepare(&ctx, "explorer", Some(&f.work()), None, None).unwrap();
+        let prepared = prepare(
+            &ctx,
+            "explorer",
+            Some(&f.work()),
+            None,
+            None,
+            &GooseFlags::default(),
+        )
+        .unwrap();
         assert!(prepared.notes.is_empty(), "{:?}", prepared.notes);
         let LaunchPrepared { inv, account, .. } =
             launch_invocation(&ctx, prepared, vec![]).unwrap();
@@ -5973,11 +6227,26 @@ mod tests {
         f.token("team03");
         let ctx = f.ctx(&usage_never_read);
 
-        let prepared = prepare(&ctx, "explorer", Some(&f.work()), Some("team03"), None).unwrap();
+        let prepared = prepare(
+            &ctx,
+            "explorer",
+            Some(&f.work()),
+            Some("team03"),
+            None,
+            &GooseFlags::default(),
+        )
+        .unwrap();
         assert_eq!(prepared.account.unwrap().profile, "team03");
-        let err = prepare(&ctx, "explorer", Some(&f.work()), Some("team04"), None)
-            .unwrap_err()
-            .to_string();
+        let err = prepare(
+            &ctx,
+            "explorer",
+            Some(&f.work()),
+            Some("team04"),
+            None,
+            &GooseFlags::default(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("profile team04 has no credential"), "{err}");
     }
 
@@ -6493,8 +6762,10 @@ mod tests {
         let mut cfg = Config::default();
         cfg.claude.extra_args = vec!["--add-dir".into(), "/srv".into()];
         cfg.codex.extra_args = vec!["--all".into()];
+        cfg.goose.extra_args = vec!["--debug".into()];
         assert_eq!(extra_args(&cfg, Harness::Claude), vec!["--add-dir", "/srv"]);
         assert_eq!(extra_args(&cfg, Harness::Codex), vec!["--all"]);
+        assert_eq!(extra_args(&cfg, Harness::Goose), vec!["--debug"]);
     }
 
     #[test]
@@ -7788,6 +8059,9 @@ mod tests {
                 agent: "explorer",
                 cwd: Some(&f.work()),
                 cli_harness: None,
+                allow_read: &[],
+                allow_write: &[],
+                allow_exec: &[],
             },
             None,
             vec![],
@@ -7946,6 +8220,9 @@ mod tests {
                 agent: "explorer",
                 cwd: Some("/srv"),
                 cli_harness: Some(Harness::Codex),
+                allow_read: &[],
+                allow_write: &[],
+                allow_exec: &[],
             }),
             (
                 Some("explorer".to_string()),
@@ -7986,6 +8263,9 @@ mod tests {
                 agent: "explorer",
                 cwd: Some(&f.work()),
                 cli_harness: Some(Harness::Codex),
+                allow_read: &[],
+                allow_write: &[],
+                allow_exec: &[],
             },
             None,
             vec![],
@@ -8032,6 +8312,9 @@ mod tests {
                 agent: "explorer",
                 cwd: Some(&f.work()),
                 cli_harness: Some(Harness::Codex),
+                allow_read: &[],
+                allow_write: &[],
+                allow_exec: &[],
             },
             None,
             vec![],
@@ -8983,7 +9266,15 @@ mod tests {
 
         let LaunchPrepared { inv, account, .. } = launch_invocation(
             &ctx,
-            prepare(&ctx, "explorer", Some(&f.work()), None, None).unwrap(),
+            prepare(
+                &ctx,
+                "explorer",
+                Some(&f.work()),
+                None,
+                None,
+                &GooseFlags::default(),
+            )
+            .unwrap(),
             vec!["--foo".into()],
         )
         .unwrap();
@@ -9383,6 +9674,7 @@ mod tests {
                 None,
                 None,
                 None,
+                &GooseFlags::default(),
                 false,
                 &short.env,
                 || Ok(short.cfg.clone()),
@@ -10350,6 +10642,9 @@ mod tests {
                 agent: "explorer",
                 cwd: Some(&f.work()),
                 cli_harness: None,
+                allow_read: &[],
+                allow_write: &[],
+                allow_exec: &[],
             },
             None,
             vec![],
@@ -10394,6 +10689,9 @@ mod tests {
                 agent: "explorer",
                 cwd: Some(&f.work()),
                 cli_harness: None,
+                allow_read: &[],
+                allow_write: &[],
+                allow_exec: &[],
             },
             None,
             vec![],
@@ -10433,6 +10731,9 @@ mod tests {
                 agent: "explorer",
                 cwd: Some(&f.work()),
                 cli_harness: None,
+                allow_read: &[],
+                allow_write: &[],
+                allow_exec: &[],
             },
             None,
             vec![],
@@ -10631,6 +10932,7 @@ mod tests {
             ts: test_ts(ts),
             inv: inv.into(),
             session: session.into(),
+            native: None,
         })
     }
 
@@ -11360,5 +11662,1359 @@ mod tests {
             "{e:#}"
         );
         assert!(!f.sessions_dir().exists());
+    }
+
+    const GOOSE_EXPLORER: &str =
+        "---\nname: gexplorer\ndescription: Reads\nharness: goose\ngoose_model: qwen3\n---\nexplore the tree\n";
+    const GOOSE_WRITER: &str = "---\nname: gwriter\ndescription: Writes\nharness: goose\ngoose_model: qwen3\ngoose_tools: write\n---\nwrite things\n";
+
+    /// A Goose JSON result: the last line that is exactly `{` opens it.
+    const GOOSE_RESULT: &str = "{\n  \"messages\": [{\"role\": \"assistant\", \"content\": [{\"type\": \"text\", \"text\": \"goose answer\"}]}],\n  \"metadata\": {\"total_tokens\": 7, \"status\": \"completed\"}\n}";
+
+    impl Fixture {
+        /// Adds the Goose agent definitions and a stand-in `goose` that records
+        /// its argv, cwd, environment and stdin, then prints [`GOOSE_RESULT`].
+        fn goose(&mut self) {
+            std::fs::write(self.path("agents/gexplorer.md"), GOOSE_EXPLORER).unwrap();
+            std::fs::write(self.path("agents/gwriter.md"), GOOSE_WRITER).unwrap();
+            let out = self.path("calls");
+            std::fs::create_dir_all(&out).unwrap();
+            let script = format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {out}/argv\npwd > {out}/cwd\nenv > {out}/env\ncat > {out}/prompt\ncat <<'EOF'\n{GOOSE_RESULT}\nEOF\n",
+                out = out.display()
+            );
+            // In its own directory: a write root may not overlap the
+            // directory of CCC_GOOSE_BIN.
+            std::fs::create_dir_all(self.path("bin")).unwrap();
+            let path = self.path("bin/fake-goose");
+            self.write_executable(&path, &script);
+            self.env
+                .insert("CCC_GOOSE_BIN".to_string(), path.display().to_string());
+            self.env
+                .insert("PATH".to_string(), "/usr/bin:/bin".to_string());
+        }
+
+        fn canonical(&self, rel: &str) -> PathBuf {
+            std::fs::canonicalize(self.path(rel)).unwrap()
+        }
+
+        fn run_goose(&self, agent: &str, cwd: &str, flags: &GooseFlags) -> (Result<i32>, String) {
+            let mut input = "go".as_bytes();
+            let mut output = Vec::new();
+            let code = run_from_report(
+                agent,
+                Some(cwd),
+                Some("hello goose"),
+                None,
+                None,
+                None,
+                flags,
+                false,
+                &self.env,
+                || Ok(self.cfg.clone()),
+                &mut input,
+                &mut output,
+                &|message| diag(message),
+            );
+            (code, String::from_utf8(output).unwrap())
+        }
+
+        fn resume_goose(&self, id: &str, fork: bool) -> (Result<i32>, String) {
+            let mut input = "again".as_bytes();
+            let mut output = Vec::new();
+            let code = resume_from(
+                id,
+                fork,
+                None,
+                Some("again"),
+                None,
+                false,
+                &self.env,
+                || Ok(self.cfg.clone()),
+                &mut input,
+                &mut output,
+                &mut Vec::new(),
+            );
+            (code, String::from_utf8(output).unwrap())
+        }
+
+        fn goose_argv(&self) -> Vec<String> {
+            self.call("argv").lines().map(str::to_string).collect()
+        }
+    }
+
+    fn spawn_record(env: &BTreeMap<String, String>) -> SpawnPayload {
+        latest_records(env)
+            .into_iter()
+            .find_map(|r| match r {
+                audit::Record::Spawn(s) => Some(s.payload),
+                _ => None,
+            })
+            .expect("a spawn record")
+    }
+
+    fn flag_value<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
+        let i = argv.iter().position(|a| a == flag)?;
+        argv.get(i + 1).map(String::as_str)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_goose_run_presets_its_session_and_records_its_policy() {
+        let mut f = Fixture::new("goose-run");
+        f.goose();
+        let (code, out) = f.run_goose("gexplorer", &f.work(), &GooseFlags::default());
+        assert_eq!(code.unwrap(), 0, "{out}");
+        assert!(out.starts_with("goose answer"), "{out}");
+        assert!(out.contains("harness=goose"), "{out}");
+        assert!(out.contains("effort=-"), "{out}");
+
+        let argv = f.goose_argv();
+        assert_eq!(&argv[..4], ["run", "-q", "--output-format", "json"]);
+        assert!(argv.iter().any(|a| a == "--no-profile"), "{argv:?}");
+        let id = flag_value(&argv, "-n").unwrap().to_string();
+        Uuid::parse_str(&id).expect("the preset id is a UUID");
+        assert!(out.contains(&format!("session={id}")), "{out}");
+        assert_eq!(flag_value(&argv, "--model"), Some("qwen3"));
+        let ext = flag_value(&argv, "--with-extension").unwrap();
+        assert!(ext.starts_with("box:"), "{ext}");
+        assert!(ext.contains(" goose-tools --role box --policy "), "{ext}");
+        assert!(argv.iter().all(|a| !a.starts_with("ccc:")), "{argv:?}");
+        assert_eq!(f.call("prompt"), "hello goose");
+
+        let root = f.cfg.goose.root_in(&f.env);
+        let work = std::fs::canonicalize(crate::harness::goose::work_dir(&root)).unwrap();
+        assert_eq!(f.call("cwd").trim(), work.display().to_string());
+        assert!(crate::harness::goose::plugin_file(&root).is_file());
+        let system = flag_value(&argv, "--system").unwrap();
+        assert!(
+            system.contains(&format!(
+                "Your working directory is {}.",
+                f.canonical("work").display()
+            )),
+            "{system}"
+        );
+
+        let record = session::load_from(&f.sessions_dir(), &id).unwrap();
+        assert_eq!(record.harness, Harness::Goose);
+        let policy = record.goose_policy.expect("the sidecar carries the policy");
+        assert_eq!(policy.read_roots, vec![f.canonical("work")]);
+        assert!(policy.write_roots.is_empty() && policy.exec_roots.is_empty());
+        let hex = ext.rsplit(' ').next().unwrap();
+        assert_eq!(
+            crate::goose_policy::GoosePolicy::from_hex(hex).unwrap(),
+            policy
+        );
+
+        let spawn = spawn_record(&f.env);
+        assert_eq!(spawn.session.as_deref(), Some(id.as_str()));
+        assert_eq!(spawn.goose_policy, Some(policy));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_goose_resume_reuses_the_recorded_policy_without_extensions() {
+        let mut f = Fixture::new("goose-resume");
+        f.goose();
+        std::fs::create_dir_all(f.path("extra")).unwrap();
+        let flags = GooseFlags {
+            allow_read: vec![f.path("extra")],
+            ..GooseFlags::default()
+        };
+        let (code, out) = f.run_goose("gexplorer", &f.work(), &flags);
+        assert_eq!(code.unwrap(), 0, "{out}");
+        let id = flag_value(&f.goose_argv(), "-n").unwrap().to_string();
+        let recorded = session::load_from(&f.sessions_dir(), &id)
+            .unwrap()
+            .goose_policy
+            .unwrap();
+        assert_eq!(
+            recorded.read_roots,
+            vec![f.canonical("work"), f.canonical("extra")]
+        );
+
+        // A changed definition does not change a recorded session's policy.
+        std::fs::write(
+            f.path("agents/gexplorer.md"),
+            GOOSE_WRITER.replace("gwriter", "gexplorer"),
+        )
+        .unwrap();
+        let (code, out) = f.resume_goose(&id, false);
+        assert_eq!(code.unwrap(), 0, "{out}");
+        assert!(out.contains(&format!("session={id}")), "{out}");
+        let argv = f.goose_argv();
+        assert!(argv.iter().any(|a| a == "--resume"), "{argv:?}");
+        assert_eq!(flag_value(&argv, "-n"), Some(id.as_str()));
+        assert!(!argv
+            .iter()
+            .any(|a| a == "--with-extension" || a == "--no-profile"));
+        assert_eq!(f.call("prompt"), "again");
+        let record = session::load_from(&f.sessions_dir(), &id).unwrap();
+        assert_eq!(record.goose_policy, Some(recorded.clone()));
+        assert_eq!(spawn_record(&f.env).goose_policy, Some(recorded));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_goose_fork_is_refused_and_the_parent_left_alone() {
+        let mut f = Fixture::new("goose-fork");
+        f.goose();
+        let (code, _) = f.run_goose("gexplorer", &f.work(), &GooseFlags::default());
+        assert_eq!(code.unwrap(), 0);
+        let id = flag_value(&f.goose_argv(), "-n").unwrap().to_string();
+        let path = session::path_in(&f.sessions_dir(), &id).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        std::fs::remove_file(f.path("calls/argv")).unwrap();
+
+        let err = f.resume_goose(&id, true).0.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Goose has no headless fork"),
+            "{err:#}"
+        );
+        assert!(!f.path("calls/argv").exists(), "goose was spawned");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_goose_record_without_a_policy_is_not_resumed() {
+        let mut f = Fixture::new("goose-no-policy");
+        f.goose();
+        let (code, _) = f.run_goose("gexplorer", &f.work(), &GooseFlags::default());
+        assert_eq!(code.unwrap(), 0);
+        let id = flag_value(&f.goose_argv(), "-n").unwrap().to_string();
+        let dir = f.sessions_dir();
+        let mut record = session::load_from(&dir, &id).unwrap();
+        record.goose_policy = None;
+        session::save_in(&dir, &id, &record).unwrap();
+        std::fs::remove_file(f.path("calls/argv")).unwrap();
+
+        let err = f.resume_goose(&id, false).0.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no recorded confinement policy"),
+            "{err:#}"
+        );
+        assert!(!f.path("calls/argv").exists());
+    }
+
+    #[test]
+    fn allow_flags_are_refused_on_a_non_goose_resolution() {
+        let mut f = Fixture::new("goose-allow-claude");
+        f.goose();
+        f.claude_script(OK_RESULT);
+        let flags = GooseFlags {
+            allow_read: vec![f.path("work")],
+            ..GooseFlags::default()
+        };
+        let err = f.run_goose("explorer", &f.work(), &flags).0.unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("--allow-read"), "{text}");
+        assert!(text.contains("applies only to the goose harness"), "{text}");
+        assert!(!f.path("calls/argv").exists(), "the harness was spawned");
+    }
+
+    /// A stand-in `claude` that answers after `sleep` seconds under the session
+    /// id ccc passed it, fresh or resumed.
+    #[cfg(target_os = "linux")]
+    fn claude_echoing_its_session(f: &mut Fixture, sleep: u32) {
+        f.claude_custom_script(&format!(
+            "cat >/dev/null\nid=; prev=\nfor a in \"$@\"; do case \"$prev\" in --session-id|--resume) id=$a;; esac; prev=$a; done\nsleep {sleep}\nprintf '{{\"session_id\":\"%s\",\"result\":\"the answer\",\"is_error\":false,\"num_turns\":1,\"total_cost_usd\":0.01}}' \"$id\""
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn goose_host_tools_run_a_real_nested_ccc_in_slices_and_stop_it_resumably() {
+        use crate::goose_policy::{GoosePolicy, GooseTool};
+        use crate::goose_tools::host::HostTools;
+        use crate::goose_tools::Toolset;
+        let mut f = Fixture::new("goose-host-nested");
+        f.token("team03");
+        f.install_cli_config();
+        // Its own git top, so a host /tmp/.git does not widen the surface.
+        std::fs::create_dir_all(f.path("work/.git")).unwrap();
+        claude_echoing_its_session(&mut f, 3);
+        let work = std::fs::canonicalize(f.path("work")).unwrap();
+        let policy = GoosePolicy {
+            tools: [GooseTool::Ccc].into(),
+            agents: vec!["explorer".into()],
+            read_roots: vec![work.clone()],
+            write_roots: vec![],
+            exec_roots: vec![work.clone()],
+        };
+        let mut env = f.env.clone();
+        env.insert("PATH".into(), "/usr/bin:/bin".into());
+        let tools = HostTools::new(
+            policy,
+            crate::testutil::ccc_binary(),
+            f.sessions_dir(),
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        )
+        .with_child_env(env);
+
+        let first = tools.call(
+            "ccc_run",
+            &serde_json::json!({"agent": "explorer", "prompt": "go"}),
+        );
+        assert!(!first.is_error, "{first:?}");
+        let v: serde_json::Value = serde_json::from_str(&first.text).unwrap();
+        assert_eq!(v["status"], "running", "{v}");
+        let run = v["run"].as_str().unwrap().to_string();
+        let mut done = serde_json::Value::Null;
+        for _ in 0..8 {
+            let r = tools.call("ccc_wait", &serde_json::json!({"run": run}));
+            assert!(!r.is_error, "{r:?}");
+            done = serde_json::from_str(&r.text).unwrap();
+            if done["status"] == "done" {
+                break;
+            }
+        }
+        assert_eq!(done["result"], "the answer", "{done}");
+        assert_eq!(done["harness"], "claude");
+        let first_id = done["session"].as_str().unwrap().to_string();
+        let record = session::load_from(&f.sessions_dir(), &first_id).unwrap();
+        assert_eq!(record.cwd, work);
+
+        // A turn still running when the server shuts down is terminated, and
+        // its session stays recorded and resumable. Left alone, the child would
+        // run about 4 s more, so a prompt SIGTERM end shows it was terminated.
+        claude_echoing_its_session(&mut f, 5);
+        let second = tools.call(
+            "ccc_run",
+            &serde_json::json!({"agent": "explorer", "prompt": "go"}),
+        );
+        let v: serde_json::Value = serde_json::from_str(&second.text).unwrap();
+        assert_eq!(v["status"], "running", "{v}");
+        let stopping = Instant::now();
+        tools.shutdown();
+        let took = stopping.elapsed();
+        assert!(took < Duration::from_millis(2500), "shutdown took {took:?}");
+        let end = trace_records_for(&f.env)
+            .into_iter()
+            .find_map(|r| match r {
+                audit::Record::End(end) => Some(end),
+                _ => None,
+            })
+            .expect("the nested run's end record");
+        assert_eq!(end.payload.signal, Some(libc::SIGTERM), "{:?}", end.payload);
+        assert_ne!(end.payload.exit, Some(0), "{:?}", end.payload);
+        let ids: Vec<String> = std::fs::read_dir(f.sessions_dir())
+            .unwrap()
+            .filter_map(|e| {
+                let name = e.unwrap().file_name().into_string().unwrap();
+                name.strip_suffix(".json").map(str::to_string)
+            })
+            .filter(|id| *id != first_id)
+            .collect();
+        assert_eq!(ids.len(), 1, "{ids:?}");
+        assert_eq!(end.payload.session.as_deref(), Some(ids[0].as_str()));
+        claude_echoing_its_session(&mut f, 0);
+        let resumed = f.cli(&["resume", &ids[0], "--json", "again"]);
+        assert!(resumed.status.success(), "{resumed:?}");
+        let out: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
+        assert_eq!(out["session"], ids[0].as_str());
+    }
+
+    /// A host server for `policy` whose children are the real `ccc` under the
+    /// fixture's environment.
+    #[cfg(target_os = "linux")]
+    fn host_tools_for(
+        f: &Fixture,
+        policy: crate::goose_policy::GoosePolicy,
+    ) -> crate::goose_tools::host::HostTools {
+        crate::goose_tools::host::HostTools::new(
+            policy,
+            crate::testutil::ccc_binary(),
+            f.sessions_dir(),
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        )
+        .with_child_env(f.env.clone())
+    }
+
+    /// Follows a `running` reply with `ccc_wait` until the run is done, and
+    /// returns the final reply.
+    #[cfg(target_os = "linux")]
+    fn host_call_until_done(
+        tools: &crate::goose_tools::host::HostTools,
+        name: &str,
+        args: serde_json::Value,
+    ) -> crate::goose_tools::ToolReply {
+        use crate::goose_tools::Toolset;
+        let mut reply = tools.call(name, &args);
+        for _ in 0..10 {
+            if reply.is_error {
+                return reply;
+            }
+            let v: serde_json::Value = serde_json::from_str(&reply.text).unwrap();
+            if v["status"] != "running" {
+                return reply;
+            }
+            reply = tools.call("ccc_wait", &serde_json::json!({"run": v["run"]}));
+        }
+        panic!("the run did not finish: {reply:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_goose_writer_child_through_ccc_run_writes_only_where_allow_write_says() {
+        use crate::goose_policy::{GoosePolicy, GooseTool};
+        let mut f = Fixture::new("goose-host-writer-child");
+        f.goose();
+        f.install_cli_config();
+        // The config directory is protected: keep it off the write root's path.
+        std::fs::create_dir_all(f.path("conf")).unwrap();
+        for (var, file) in [
+            ("CCC_CONFIG", "config.toml"),
+            ("CCC_AGENTS_CONFIG", "agents.toml"),
+        ] {
+            let moved = f.path("conf").join(file);
+            std::fs::rename(f.path(file), &moved).unwrap();
+            f.env.insert(var.into(), moved.display().to_string());
+        }
+        // Its own git top, so a host /tmp/.git does not widen the surface.
+        std::fs::create_dir_all(f.path("work/.git")).unwrap();
+        std::fs::create_dir_all(f.path("out/sub")).unwrap();
+        let work = f.canonical("work");
+        let out = f.canonical("out");
+        let sub = f.canonical("out/sub");
+        let tools = host_tools_for(
+            &f,
+            GoosePolicy {
+                tools: [GooseTool::Write, GooseTool::Ccc].into(),
+                agents: vec!["gwriter".into()],
+                read_roots: vec![out.clone()],
+                write_roots: vec![out.clone()],
+                exec_roots: vec![work.clone()],
+            },
+        );
+
+        let refused = host_call_until_done(
+            &tools,
+            "ccc_run",
+            serde_json::json!({"agent": "gwriter", "prompt": "write"}),
+        );
+        assert!(refused.is_error, "{refused:?}");
+        assert!(refused.text.contains("allow_write"), "{}", refused.text);
+        assert!(!f.path("calls/argv").exists(), "goose was spawned");
+
+        let done = host_call_until_done(
+            &tools,
+            "ccc_run",
+            serde_json::json!({"agent": "gwriter", "prompt": "write", "allow_write": [sub]}),
+        );
+        assert!(!done.is_error, "{done:?}");
+        let v: serde_json::Value = serde_json::from_str(&done.text).unwrap();
+        assert_eq!(v["result"], "goose answer", "{v}");
+        let id = v["session"].as_str().unwrap();
+        let record = session::load_from(&f.sessions_dir(), id).unwrap();
+        assert_eq!(record.cwd, work);
+        let policy = record.goose_policy.unwrap();
+        assert_eq!(policy.write_roots, vec![sub.clone()]);
+        assert_eq!(policy.read_roots, vec![work, sub]);
+        assert!(policy.exec_roots.is_empty());
+        let argv = f.goose_argv();
+        let ext = flag_value(&argv, "--with-extension").unwrap();
+        assert_eq!(
+            GoosePolicy::from_hex(ext.rsplit(' ').next().unwrap()).unwrap(),
+            policy
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_host_role_started_by_goose_checks_write_roots_against_the_host_home() {
+        use crate::goose_policy::{GoosePolicy, GooseTool};
+        use std::io::{BufRead, Write};
+        let mut f = Fixture::new("goose-host-restored-home");
+        f.goose();
+        f.install_cli_config();
+        std::fs::create_dir_all(f.path("conf")).unwrap();
+        for (var, file) in [
+            ("CCC_CONFIG", "config.toml"),
+            ("CCC_AGENTS_CONFIG", "agents.toml"),
+        ] {
+            let moved = f.path("conf").join(file);
+            std::fs::rename(f.path(file), &moved).unwrap();
+            f.env.insert(var.into(), moved.display().to_string());
+        }
+        let mut config = std::fs::OpenOptions::new()
+            .append(true)
+            .open(f.path("conf/config.toml"))
+            .unwrap();
+        config.write_all(b"[goose]\ntool_wait_s = 30\n").unwrap();
+        std::fs::create_dir_all(f.path("work/.git")).unwrap();
+        std::fs::create_dir_all(f.path("out/realhome/proj")).unwrap();
+        std::fs::create_dir_all(f.path("emptyhome")).unwrap();
+        let work = f.canonical("work");
+        let out = f.canonical("out");
+        let real_home = f.canonical("out/realhome");
+        let proj = f.canonical("out/realhome/proj");
+        let policy = GoosePolicy {
+            tools: [GooseTool::Write, GooseTool::Ccc].into(),
+            agents: vec!["gwriter".into()],
+            read_roots: vec![out.clone()],
+            write_roots: vec![out],
+            exec_roots: vec![work],
+        };
+        let carried = crate::goose_policy::hex_encode(
+            serde_json::json!({"HOME": real_home})
+                .to_string()
+                .as_bytes(),
+        );
+
+        let mut server = std::process::Command::new(crate::testutil::ccc_binary())
+            .args([
+                "goose-tools",
+                "--role",
+                "host",
+                "--policy",
+                &policy.to_hex(),
+            ])
+            .env_clear()
+            .envs(&f.env)
+            .env("HOME", f.path("emptyhome"))
+            .env(crate::harness::goose::HOST_ENV_VAR, &carried)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdin = server.stdin.take().unwrap();
+        let mut replies = std::io::BufReader::new(server.stdout.take().unwrap()).lines();
+        let mut call = |id: u32, write_root: &Path| -> serde_json::Value {
+            let request = serde_json::json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": {"name": "ccc_run", "arguments":
+                    {"agent": "gwriter", "prompt": "write", "allow_write": [write_root]}}});
+            writeln!(stdin, "{request}").unwrap();
+            let reply: serde_json::Value =
+                serde_json::from_str(&replies.next().unwrap().unwrap()).unwrap();
+            reply["result"].clone()
+        };
+
+        let refused = call(1, &real_home);
+        assert_eq!(refused["isError"], true, "{refused}");
+        let text = refused["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("is $HOME"), "{text}");
+        assert!(!f.path("calls/argv").exists(), "goose was spawned");
+
+        let done = call(2, &proj);
+        assert_eq!(done["isError"], false, "{done}");
+        let v: serde_json::Value =
+            serde_json::from_str(done["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(v["status"], "done", "{v}");
+        assert_eq!(v["result"], "goose answer", "{v}");
+
+        drop(stdin);
+        assert!(server.wait().unwrap().success());
+        assert_eq!(std::fs::read_dir(f.path("emptyhome")).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_host_role_stops_on_sigterm_or_sighup_and_terminates_its_running_children() {
+        use crate::goose_policy::{GoosePolicy, GooseTool};
+        use std::io::{BufRead, Write};
+        for (sig, code) in [(libc::SIGTERM, 143), (libc::SIGHUP, 129)] {
+            let mut f = Fixture::new("goose-host-signal");
+            f.token("team03");
+            f.install_cli_config();
+            let mut config = std::fs::OpenOptions::new()
+                .append(true)
+                .open(f.path("config.toml"))
+                .unwrap();
+            config.write_all(b"[goose]\ntool_wait_s = 1\n").unwrap();
+            // Its own git top, so a host /tmp/.git does not widen the surface.
+            std::fs::create_dir_all(f.path("work/.git")).unwrap();
+            claude_echoing_its_session(&mut f, 5);
+            let work = f.canonical("work");
+            let policy = GoosePolicy {
+                tools: [GooseTool::Ccc].into(),
+                agents: vec!["explorer".into()],
+                read_roots: vec![work.clone()],
+                write_roots: vec![],
+                exec_roots: vec![work],
+            };
+            let mut server = std::process::Command::new(crate::testutil::ccc_binary())
+                .args([
+                    "goose-tools",
+                    "--role",
+                    "host",
+                    "--policy",
+                    &policy.to_hex(),
+                ])
+                .env_clear()
+                .envs(&f.env)
+                .env("PATH", "/usr/bin:/bin")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            // Kept open until the server has exited: the signal, not EOF, stops it.
+            let mut stdin = server.stdin.take().unwrap();
+            let mut replies = std::io::BufReader::new(server.stdout.take().unwrap()).lines();
+            let request = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "ccc_run", "arguments": {"agent": "explorer", "prompt": "go"}}});
+            writeln!(stdin, "{request}").unwrap();
+            let reply: serde_json::Value =
+                serde_json::from_str(&replies.next().unwrap().unwrap()).unwrap();
+            let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+            let v: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(v["status"], "running", "{v}");
+
+            let stopping = Instant::now();
+            crate::procs::signal(server.id(), sig).unwrap();
+            let status = server.wait().unwrap();
+            let took = stopping.elapsed();
+            drop(stdin);
+            assert_eq!(status.code(), Some(code), "signal {sig}: {status:?}");
+            assert!(
+                took < Duration::from_millis(2500),
+                "signal {sig}: took {took:?}"
+            );
+            let end = trace_records_for(&f.env)
+                .into_iter()
+                .find_map(|r| match r {
+                    audit::Record::End(end) => Some(end),
+                    _ => None,
+                })
+                .expect("the nested run's end record");
+            assert_eq!(end.payload.signal, Some(libc::SIGTERM), "{:?}", end.payload);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_depth_two_goose_chain_cannot_start_a_child_in_a_worktree_its_parent_can_write() {
+        use crate::goose_policy::{check_separation, GoosePolicy, GooseTool};
+        use crate::goose_tools::Toolset;
+        let mut f = Fixture::new("goose-depth-two");
+        f.goose();
+        f.install_cli_config();
+        std::fs::write(
+            f.path("agents/gcoord.md"),
+            "---\nname: gcoord\ndescription: Delegates\nharness: goose\ngoose_model: qwen3\ngoose_tools: ccc\ngoose_agents: explorer\n---\ndelegate\n",
+        )
+        .unwrap();
+        // W holds a main checkout; E is a plain tree (its own top) holding a
+        // worktree of that checkout, whose git directory lies under W.
+        let gitdir = f.path("w/main/.git/worktrees/wt");
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+        std::fs::create_dir_all(f.path("e/.git")).unwrap();
+        std::fs::create_dir_all(f.path("e/wt")).unwrap();
+        std::fs::write(
+            f.path("e/wt/.git"),
+            format!(
+                "gitdir: {}\n",
+                std::fs::canonicalize(&gitdir).unwrap().display()
+            ),
+        )
+        .unwrap();
+        let w = f.canonical("w");
+        let e = f.canonical("e");
+        let wt = f.canonical("e/wt");
+        check_separation(std::slice::from_ref(&w), std::slice::from_ref(&e))
+            .expect("the top-level separation check accepts W and E");
+
+        let parent = host_tools_for(
+            &f,
+            GoosePolicy {
+                tools: [GooseTool::Write, GooseTool::Ccc].into(),
+                agents: vec!["gcoord".into()],
+                read_roots: vec![w.clone()],
+                write_roots: vec![w.clone()],
+                exec_roots: vec![e.clone()],
+            },
+        );
+        let done = host_call_until_done(
+            &parent,
+            "ccc_run",
+            serde_json::json!({"agent": "gcoord", "prompt": "go", "allow_exec": [e]}),
+        );
+        assert!(!done.is_error, "{done:?}");
+
+        let argv = f.goose_argv();
+        let ext = flag_value(&argv, "--with-extension").unwrap();
+        assert!(ext.contains(" goose-tools --role host --policy "), "{ext}");
+        let child = GoosePolicy::from_hex(ext.rsplit(' ').next().unwrap()).unwrap();
+        assert!(child.write_roots.is_empty(), "{child:?}");
+        assert_eq!(child.exec_roots, vec![e.clone()]);
+        let sessions_before = std::fs::read_dir(f.sessions_dir()).unwrap().count();
+        let server = host_tools_for(&f, child);
+        let refused = server.call(
+            "ccc_run",
+            &serde_json::json!({"agent": "explorer", "prompt": "review", "cwd": wt}),
+        );
+        assert!(refused.is_error, "{refused:?}");
+        assert!(refused.text.contains("--allow-exec"), "{}", refused.text);
+        assert_eq!(
+            std::fs::read_dir(f.sessions_dir()).unwrap().count(),
+            sessions_before,
+            "a child was started"
+        );
+        server.shutdown();
+        parent.shutdown();
+    }
+
+    #[test]
+    fn goose_nested_is_inert_on_a_non_goose_resolution() {
+        let mut f = Fixture::new("goose-nested-claude");
+        f.claude_script(OK_RESULT);
+        f.token("team03");
+        f.token("team04");
+        let usage = || report(vec![snapshot(f.now, "team03", 10.0, 10.0)]);
+        let ctx = f.ctx(&usage);
+        let flags = GooseFlags {
+            nested: true,
+            ..GooseFlags::default()
+        };
+        let prepared = prepare(&ctx, "explorer", Some(&f.work()), None, None, &flags).unwrap();
+        assert_eq!(prepared.r.harness, Harness::Claude);
+        assert_eq!(prepared.r.goose, None);
+    }
+
+    #[test]
+    fn an_allow_flag_the_definition_cannot_use_is_refused_before_spawning() {
+        let mut f = Fixture::new("goose-allow-unusable");
+        f.goose();
+        std::fs::create_dir_all(f.path("out")).unwrap();
+        let flags = GooseFlags {
+            allow_write: vec![f.path("out")],
+            ..GooseFlags::default()
+        };
+        let err = f.run_goose("gexplorer", &f.work(), &flags).0.unwrap_err();
+        assert!(format!("{err:#}").contains("lacks \"write\""), "{err:#}");
+        assert!(!f.path("calls/argv").exists());
+        assert!(
+            !f.sessions_dir().exists()
+                || std::fs::read_dir(f.sessions_dir())
+                    .unwrap()
+                    .next()
+                    .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_nested_goose_writer_takes_its_write_roots_from_the_flags_only() {
+        let mut f = Fixture::new("goose-nested-writer");
+        f.goose();
+        std::fs::create_dir_all(f.path("out")).unwrap();
+        let work = f.canonical("work").display().to_string();
+
+        let bare = GooseFlags {
+            nested: true,
+            ..GooseFlags::default()
+        };
+        let err = f.run_goose("gwriter", &work, &bare).0.unwrap_err();
+        assert!(format!("{err:#}").contains("allow_write"), "{err:#}");
+        assert!(!f.path("calls/argv").exists());
+
+        let flags = GooseFlags {
+            allow_write: vec![f.canonical("out")],
+            nested: true,
+            ..GooseFlags::default()
+        };
+        let (code, out) = f.run_goose("gwriter", &work, &flags);
+        assert_eq!(code.unwrap(), 0, "{out}");
+        let id = flag_value(&f.goose_argv(), "-n").unwrap().to_string();
+        let policy = session::load_from(&f.sessions_dir(), &id)
+            .unwrap()
+            .goose_policy
+            .unwrap();
+        assert_eq!(policy.write_roots, vec![f.canonical("out")]);
+        assert_eq!(
+            policy.read_roots,
+            vec![f.canonical("work"), f.canonical("out")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_top_level_goose_writer_gets_its_cwd_as_a_write_root() {
+        let mut f = Fixture::new("goose-writer");
+        f.goose();
+        let (code, out) = f.run_goose("gwriter", &f.work(), &GooseFlags::default());
+        assert_eq!(code.unwrap(), 0, "{out}");
+        let id = flag_value(&f.goose_argv(), "-n").unwrap().to_string();
+        let policy = session::load_from(&f.sessions_dir(), &id)
+            .unwrap()
+            .goose_policy
+            .unwrap();
+        assert_eq!(policy.write_roots, vec![f.canonical("work")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_nested_goose_run_refuses_a_cwd_that_is_not_canonical() {
+        let mut f = Fixture::new("goose-nested-cwd");
+        f.goose();
+        std::fs::create_dir_all(f.path("real")).unwrap();
+        std::os::unix::fs::symlink(f.canonical("real"), f.path("link")).unwrap();
+        let link = f.canonical("work").parent().unwrap().join("link");
+        let nested = GooseFlags {
+            nested: true,
+            ..GooseFlags::default()
+        };
+        let err = f
+            .run_goose("gexplorer", &link.display().to_string(), &nested)
+            .0
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("not canonical"), "{err:#}");
+        assert!(!f.path("calls/argv").exists());
+
+        // Without --goose-nested the operator's symlink is resolved and the
+        // target recorded.
+        let (code, out) = f.run_goose(
+            "gexplorer",
+            &link.display().to_string(),
+            &GooseFlags::default(),
+        );
+        assert_eq!(code.unwrap(), 0, "{out}");
+        let id = flag_value(&f.goose_argv(), "-n").unwrap().to_string();
+        let policy = session::load_from(&f.sessions_dir(), &id)
+            .unwrap()
+            .goose_policy
+            .unwrap();
+        assert_eq!(policy.read_roots, vec![f.canonical("real")]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failing_box_preflight_refuses_a_fresh_goose_run_before_any_spawn() {
+        let mut f = Fixture::new("goose-preflight");
+        f.goose();
+        let missing = f.path("missing");
+        type Edit = fn(&mut Config, &Path);
+        let edits: [(&str, Edit); 2] = [
+            ("bwrap", |c: &mut Config, m: &Path| {
+                c.goose.bwrap = m.join("bwrap").display().to_string()
+            }),
+            ("box_ro", |c: &mut Config, m: &Path| {
+                c.goose.box_ro = vec![m.display().to_string()]
+            }),
+        ];
+        for (label, edit) in edits {
+            let mut cfg = f.cfg.clone();
+            edit(&mut cfg, &missing);
+            let saved = std::mem::replace(&mut f.cfg, cfg);
+            let err = f
+                .run_goose("gexplorer", &f.work(), &GooseFlags::default())
+                .0
+                .unwrap_err();
+            f.cfg = saved;
+            let text = format!("{err:#}");
+            assert!(
+                text.contains(&missing.display().to_string()),
+                "{label}: {text}"
+            );
+            if label == "bwrap" {
+                assert!(text.contains("bubblewrap"), "{text}");
+            }
+            assert!(!f.path("calls/argv").exists(), "{label}: goose was spawned");
+            let sessions = f.sessions_dir();
+            assert!(
+                !sessions.exists() || std::fs::read_dir(&sessions).unwrap().next().is_none(),
+                "{label}: a session was saved"
+            );
+        }
+
+        // An agent with only the ccc tools runs no box, so needs no bwrap.
+        std::fs::write(
+            f.path("agents/gcoord.md"),
+            "---\nname: gcoord\ndescription: Delegates\nharness: goose\ngoose_model: qwen3\ngoose_tools: ccc\ngoose_agents: explorer\n---\ndelegate\n",
+        )
+        .unwrap();
+        f.cfg.goose.bwrap = missing.join("bwrap").display().to_string();
+        let (code, out) = f.run_goose("gcoord", &f.work(), &GooseFlags::default());
+        assert_eq!(code.unwrap(), 0, "{out}");
+        let argv = f.goose_argv();
+        let extensions: Vec<&String> = argv
+            .iter()
+            .zip(argv.iter().skip(1))
+            .filter(|(flag, _)| *flag == "--with-extension")
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(extensions.len(), 1, "{argv:?}");
+        assert!(extensions[0].starts_with("ccc:"), "{argv:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_resume_whose_recorded_root_is_gone_or_a_symlink_fails_the_preflight() {
+        let mut f = Fixture::new("goose-preflight-resume");
+        f.goose();
+        std::fs::create_dir_all(f.path("extra")).unwrap();
+        std::fs::create_dir_all(f.path("elsewhere")).unwrap();
+        let flags = GooseFlags {
+            allow_read: vec![f.path("extra")],
+            ..GooseFlags::default()
+        };
+        let (code, out) = f.run_goose("gexplorer", &f.work(), &flags);
+        assert_eq!(code.unwrap(), 0, "{out}");
+        let id = flag_value(&f.goose_argv(), "-n").unwrap().to_string();
+        std::fs::remove_file(f.path("calls/argv")).unwrap();
+        let extra = f.canonical("extra");
+
+        std::fs::remove_dir(&extra).unwrap();
+        let err = f.resume_goose(&id, false).0.unwrap_err();
+        assert!(
+            format!("{err:#}").contains(&extra.display().to_string()),
+            "{err:#}"
+        );
+        assert!(!f.path("calls/argv").exists(), "goose was spawned");
+
+        std::os::unix::fs::symlink(f.path("elsewhere"), &extra).unwrap();
+        let err = f.resume_goose(&id, false).0.unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains(&extra.display().to_string()) && text.contains("is a symlink"),
+            "{text}"
+        );
+        assert!(!f.path("calls/argv").exists(), "goose was spawned");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_uncreatable_goose_root_fails_before_any_session_or_spawn() {
+        let mut f = Fixture::new("goose-bad-root");
+        f.goose();
+        std::fs::write(f.path("file"), "").unwrap();
+        let root = f.path("file/goose");
+        f.cfg.goose.root = Some(root.display().to_string());
+        let err = f
+            .run_goose("gexplorer", &f.work(), &GooseFlags::default())
+            .0
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains(&root.display().to_string()),
+            "{err:#}"
+        );
+        assert!(!f.path("calls/argv").exists(), "goose was spawned");
+        let sessions = f.sessions_dir();
+        assert!(
+            !sessions.exists() || std::fs::read_dir(&sessions).unwrap().next().is_none(),
+            "a session was saved"
+        );
+        assert!(
+            !latest_records(&f.env)
+                .iter()
+                .any(|r| matches!(r, audit::Record::Spawn(_))),
+            "a spawn record was written"
+        );
+    }
+
+    const GOOSE_DELEGATOR: &str = "---\nname: gdelegator\ndescription: Writes and delegates\nharness: goose\ngoose_model: qwen3\ngoose_tools: write, ccc\ngoose_agents: explorer\n---\ndelegate\n";
+
+    /// A Goose hook payload the fake hands one plugin command.
+    enum GooseHook<'a> {
+        Start(&'a str),
+        Stop(&'a str, Option<&'a str>),
+    }
+
+    impl Fixture {
+        /// A stand-in `goose session`: records its argv, cwd, environment and
+        /// the session files present when it starts, then runs the plugin's
+        /// command for each hook under `sh -c`, with the payload on stdin and
+        /// the real `ccc` as the hook binary.
+        #[cfg(target_os = "linux")]
+        fn goose_session(&mut self, hooks: &[GooseHook]) {
+            self.goose();
+            std::fs::write(self.path("agents/gdelegator.md"), GOOSE_DELEGATOR).unwrap();
+            let out = self.path("calls");
+            let mut script = format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {out}/argv\npwd > {out}/cwd\nenv > {out}/env\nls {sessions} > {out}/sessions 2>/dev/null\nexport XDG_STATE_HOME={state}\nexport {hook}={ccc}\n",
+                out = out.display(),
+                sessions = shell_literal(&self.sessions_dir().display().to_string()),
+                state = shell_literal(&self.env["XDG_STATE_HOME"]),
+                hook = crate::harness::goose::HOOK_VAR,
+                ccc = shell_literal(&crate::testutil::ccc_binary().display().to_string()),
+            );
+            for hook in hooks {
+                let (kind, payload) = match hook {
+                    GooseHook::Start(native) => (
+                        "goose-session-start",
+                        serde_json::json!({ "session_id": native }),
+                    ),
+                    GooseHook::Stop(native, message) => (
+                        "goose-stop",
+                        serde_json::json!({ "session_id": native, "last_assistant_message": message }),
+                    ),
+                };
+                script.push_str(&format!(
+                    "printf '%s' {payload} | sh -c {command}\n",
+                    payload = shell_literal(&payload.to_string()),
+                    command = shell_literal(&crate::harness::goose::hook_command(kind)),
+                ));
+            }
+            self.write_executable(&self.path("bin/fake-goose"), &script);
+        }
+
+        #[cfg(target_os = "linux")]
+        fn launch_goose(&self, target: LaunchTarget) -> Result<EndPayload> {
+            let _lock = supervise::TEST_IO_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            start_launch(self);
+            let usage = || UsageSource::Unavailable("not consulted".into());
+            let completion =
+                launch_with_ctx(&self.ctx(&usage), target, None, vec![]).map_err(|e| e.error)?;
+            let end = completion.end.clone();
+            record_completion(self, completion);
+            Ok(end)
+        }
+    }
+
+    fn fresh_goose<'a>(
+        agent: &'a str,
+        cwd: &'a str,
+        allow: [&'a [PathBuf]; 3],
+    ) -> LaunchTarget<'a> {
+        LaunchTarget::Fresh {
+            agent,
+            cwd: Some(cwd),
+            cli_harness: None,
+            allow_read: allow[0],
+            allow_write: allow[1],
+            allow_exec: allow[2],
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_goose_launch_records_its_session_policy_and_mapped_turn() {
+        let mut f = Fixture::new("goose-launch");
+        f.goose_session(&[
+            GooseHook::Start("20261101_1"),
+            GooseHook::Stop("20261101_1", Some("launch answer")),
+        ]);
+        let work = f.work();
+        let end = f
+            .launch_goose(fresh_goose("gexplorer", &work, [&[], &[], &[]]))
+            .unwrap();
+
+        let argv = f.goose_argv();
+        assert_eq!(argv[0], "session");
+        assert!(argv.iter().any(|a| a == "--no-profile"), "{argv:?}");
+        assert!(!argv
+            .iter()
+            .any(|a| a == "-q" || a == "-i" || a == "--resume"));
+        let id = flag_value(&argv, "-n").unwrap().to_string();
+        Uuid::parse_str(&id).expect("the preset id is a UUID");
+        assert!(flag_value(&argv, "--with-extension")
+            .unwrap()
+            .starts_with("box:"));
+        let root = f.cfg.goose.root_in(&f.env);
+        let work_dir = std::fs::canonicalize(crate::harness::goose::work_dir(&root)).unwrap();
+        assert_eq!(f.call("cwd").trim(), work_dir.display().to_string());
+        let env = f.call("env");
+        assert!(
+            env.lines().any(|l| l == format!("CCC_GOOSE_SESSION={id}")),
+            "{env}"
+        );
+        assert!(
+            env.lines().any(|l| l.starts_with("CCC_GOOSE_HOOK=/")),
+            "{env}"
+        );
+        assert!(env.lines().any(|l| l == "GOOSE_MODE=auto"), "{env}");
+        // The sidecar was saved before Goose started.
+        assert!(
+            f.call("sessions")
+                .lines()
+                .any(|l| l == format!("{id}.json")),
+            "{}",
+            f.call("sessions")
+        );
+
+        let record = session::load_from(&f.sessions_dir(), &id).unwrap();
+        assert!(record.opened_at_terminal);
+        assert_eq!(
+            record.goose_policy.as_ref().unwrap().read_roots,
+            vec![f.canonical("work")]
+        );
+        assert_eq!(spawn_record(&f.env).goose_policy, record.goose_policy);
+
+        assert_eq!(end.session.as_deref(), Some(id.as_str()));
+        assert_eq!(end.result.as_deref(), Some("launch answer"));
+        assert_eq!(end.turns, Some(1));
+        let records = launch_records(&f);
+        let mapped = records
+            .iter()
+            .find_map(|r| match r {
+                audit::Record::Session(s) => Some(s),
+                _ => None,
+            })
+            .expect("the SessionStart hook recorded the mapping");
+        assert_eq!(mapped.session, id);
+        assert_eq!(mapped.native.as_deref(), Some("20261101_1"));
+        let turn = records
+            .iter()
+            .find_map(|r| match r {
+                audit::Record::Turn(t) => Some(t),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            (turn.harness, turn.session.as_str()),
+            (Harness::Goose, id.as_str())
+        );
+        let ended = records
+            .iter()
+            .find_map(|r| match r {
+                audit::Record::End(e) => Some(&e.payload),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(ended.session.as_deref(), Some(id.as_str()));
+        assert_eq!(ended.result.as_deref(), Some("launch answer"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_goose_launch_records_only_its_own_session() {
+        type Case<'a> = (&'a str, Vec<GooseHook<'a>>, Option<&'a str>, usize);
+        let cases: [Case; 3] = [
+            (
+                "new-after-mapped",
+                vec![
+                    GooseHook::Start("20261101_1"),
+                    GooseHook::Stop("20261101_1", Some("mine")),
+                    GooseHook::Start("20261101_2"),
+                    GooseHook::Stop("20261101_2", Some("from /new")),
+                ],
+                Some("mine"),
+                2,
+            ),
+            (
+                "unmapped-only",
+                vec![GooseHook::Stop("20261101_2", Some("from /new"))],
+                None,
+                1,
+            ),
+            ("no-hooks", vec![], None, 0),
+        ];
+        for (label, hooks, result, turns) in cases {
+            let mut f = Fixture::new(&format!("goose-launch-{label}"));
+            f.goose_session(&hooks);
+            let work = f.work();
+            let end = f
+                .launch_goose(fresh_goose("gexplorer", &work, [&[], &[], &[]]))
+                .unwrap();
+            let id = flag_value(&f.goose_argv(), "-n").unwrap().to_string();
+            assert_eq!(end.session.as_deref(), Some(id.as_str()), "{label}");
+            assert_eq!(end.result.as_deref(), result, "{label}");
+            assert_eq!(end.turns, Some(turns), "{label}");
+            let saved = std::fs::read_dir(f.sessions_dir())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".json"))
+                .collect::<Vec<_>>();
+            assert_eq!(saved, [format!("{id}.json")], "{label}");
+            let mapped = launch_records(&f)
+                .iter()
+                .filter(|r| matches!(r, audit::Record::Session(_)))
+                .count();
+            assert_eq!(mapped, usize::from(label == "new-after-mapped"), "{label}");
+        }
+    }
+
+    #[test]
+    fn a_goose_launch_ending_in_a_new_session_notes_its_own_id() {
+        let turn = |session: &str, result: &str| audit::Turn {
+            ts: jiff::Timestamp::now(),
+            inv: "inv".into(),
+            harness: Harness::Goose,
+            session: session.into(),
+            turn: None,
+            result: Some(result.into()),
+            transcript: None,
+        };
+        let own = "own-id".to_string();
+        let (end, note) = goose_launch_end(
+            Some(own.clone()),
+            &[turn("own-id", "mine"), turn("20261101_2", "from /new")],
+        );
+        assert_eq!(end.result.as_deref(), Some("mine"));
+        let note = note.expect("a note after a /new turn");
+        assert!(note.contains("(20261101_2)"), "{note}");
+        assert!(
+            note.contains("ccc launch --resume own-id reopens"),
+            "{note}"
+        );
+        for turns in [vec![turn("own-id", "mine")], vec![]] {
+            let (_, note) = goose_launch_end(Some(own.clone()), &turns);
+            assert_eq!(note, None, "{turns:?}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_goose_launch_resume_reopens_a_headless_session_marked_as_at_a_terminal() {
+        let mut f = Fixture::new("goose-launch-resume");
+        f.goose();
+        let (code, out) = f.run_goose("gexplorer", &f.work(), &GooseFlags::default());
+        assert_eq!(code.unwrap(), 0, "{out}");
+        let id = flag_value(&f.goose_argv(), "-n").unwrap().to_string();
+        let before = session::load_from(&f.sessions_dir(), &id).unwrap();
+        assert!(!before.opened_at_terminal);
+
+        // A launch that fails its box preflight never reached a terminal.
+        std::fs::remove_file(f.path("calls/argv")).unwrap();
+        let saved = f.cfg.clone();
+        f.cfg.goose.bwrap = f.path("missing/bwrap").display().to_string();
+        let err = f
+            .launch_goose(LaunchTarget::Resume {
+                id: &id,
+                fork: false,
+            })
+            .unwrap_err();
+        f.cfg = saved;
+        assert!(format!("{err:#}").contains("bubblewrap"), "{err:#}");
+        assert!(!f.path("calls/argv").exists(), "goose was spawned");
+        assert!(
+            !session::load_from(&f.sessions_dir(), &id)
+                .unwrap()
+                .opened_at_terminal
+        );
+
+        f.goose_session(&[
+            GooseHook::Start("20261101_4"),
+            GooseHook::Stop("20261101_4", Some("resumed answer")),
+        ]);
+        let end = f
+            .launch_goose(LaunchTarget::Resume {
+                id: &id,
+                fork: false,
+            })
+            .unwrap();
+        let argv = f.goose_argv();
+        assert_eq!(&argv[..2], ["session", "--resume"]);
+        assert_eq!(flag_value(&argv, "-n"), Some(id.as_str()));
+        assert!(!argv
+            .iter()
+            .any(|a| a == "--with-extension" || a == "--no-profile"));
+        assert!(f
+            .call("env")
+            .lines()
+            .any(|l| l == format!("CCC_GOOSE_SESSION={id}")));
+        assert_eq!(end.session.as_deref(), Some(id.as_str()));
+        assert_eq!(end.result.as_deref(), Some("resumed answer"));
+        let after = session::load_from(&f.sessions_dir(), &id).unwrap();
+        assert!(after.opened_at_terminal);
+        assert_eq!(after.goose_policy, before.goose_policy);
+
+        // A later headless resume keeps the mark.
+        f.goose();
+        let (code, out) = f.resume_goose(&id, false);
+        assert_eq!(code.unwrap(), 0, "{out}");
+        assert!(
+            session::load_from(&f.sessions_dir(), &id)
+                .unwrap()
+                .opened_at_terminal
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn goose_launch_grants_and_refusals() {
+        let mut f = Fixture::new("goose-launch-grants");
+        f.goose_session(&[]);
+        // Own git tops, so a host /tmp/.git does not join the surfaces.
+        for dir in ["exec/.git", "write", "work/.git"] {
+            std::fs::create_dir_all(f.path(dir)).unwrap();
+        }
+        let work = f.work();
+        let write = [f.path("write")];
+        let exec = [f.path("exec")];
+        let end = f
+            .launch_goose(fresh_goose("gdelegator", &work, [&[], &write, &exec]))
+            .unwrap();
+        let id = end.session.unwrap();
+        let policy = session::load_from(&f.sessions_dir(), &id)
+            .unwrap()
+            .goose_policy
+            .unwrap();
+        assert_eq!(
+            policy.write_roots,
+            vec![f.canonical("work"), f.canonical("write")]
+        );
+        assert_eq!(policy.exec_roots, vec![f.canonical("exec")]);
+        assert!(
+            f.call("argv").contains("ccc:"),
+            "the ccc extension is named"
+        );
+        std::fs::remove_file(f.path("calls/argv")).unwrap();
+
+        // An overlapping write and exec grant.
+        std::fs::create_dir_all(f.path("exec/sub")).unwrap();
+        let inside = [f.path("exec/sub")];
+        let err = f
+            .launch_goose(fresh_goose("gdelegator", &work, [&[], &inside, &exec]))
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains(&f.canonical("exec/sub").display().to_string()),
+            "{err:#}"
+        );
+        assert!(!f.path("calls/argv").exists());
+
+        // --allow-* on a Claude launch.
+        let read = [f.path("write")];
+        let err = f
+            .launch_goose(fresh_goose("explorer", &work, [&read, &[], &[]]))
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("applies only to the goose harness"),
+            "{err:#}"
+        );
+
+        // A failing preflight.
+        let saved = f.cfg.clone();
+        f.cfg.goose.bwrap = f.path("missing/bwrap").display().to_string();
+        let err = f
+            .launch_goose(fresh_goose("gexplorer", &work, [&[], &[], &[]]))
+            .unwrap_err();
+        f.cfg = saved;
+        assert!(format!("{err:#}").contains("bubblewrap"), "{err:#}");
+        assert!(!f.path("calls/argv").exists(), "goose was spawned");
+        let saved = std::fs::read_dir(f.sessions_dir())
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().path().extension() == Some("json".as_ref()))
+            .count();
+        assert_eq!(saved, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_resume_fork_on_goose_is_refused_and_the_record_left_alone() {
+        let mut f = Fixture::new("goose-launch-fork");
+        f.goose();
+        let (code, _) = f.run_goose("gexplorer", &f.work(), &GooseFlags::default());
+        assert_eq!(code.unwrap(), 0);
+        let id = flag_value(&f.goose_argv(), "-n").unwrap().to_string();
+        let path = session::path_in(&f.sessions_dir(), &id).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        std::fs::remove_file(f.path("calls/argv")).unwrap();
+
+        let err = launch_in(
+            LaunchTarget::Resume {
+                id: &id,
+                fork: true,
+            },
+            None,
+            vec![],
+            &f.env,
+            || Ok(f.cfg.clone()),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Goose has no headless fork"),
+            "{err:#}"
+        );
+        assert!(!f.path("calls/argv").exists(), "goose was spawned");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 }

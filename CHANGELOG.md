@@ -1,5 +1,46 @@
 # Changelog
 
+## Unreleased
+
+- **New harness: Goose, for self-hosted models.** ccc can now run agents
+  through [Goose](https://github.com/aaif-goose/goose) against an
+  OpenAI-compatible server you host (llama-server, vLLM, ollama). Because such
+  models get less trust than Claude, Goose agents are locked down hard: they
+  get only the tools ccc provides, and only the ones their definition names.
+  A definition opts in with `harness: goose` and a `goose_model`, picks its
+  tools with `goose_tools` (`read`, `write`, `shell`, `ccc`), and, if it may
+  start subagents, lists which agent types in `goose_agents`. Definitions that
+  do not name Goose in `harness` never run on it. Site settings go under
+  `[goose]` in the config, model-server settings under `[goose.env]`, and
+  `CCC_GOOSE_BIN` / `CCC_GOOSE_MODEL_*` work as they do for the other
+  harnesses. `agents/goose-explorer.md` is a read-only example.
+- **You decide which directories a Goose agent can touch.** It may read its
+  working directory plus anything passed with the new `--allow-read` flag on
+  `ccc run` and `ccc launch`; write with `--allow-write` (and the working
+  directory, if it has `write`); and start subagents in `--allow-exec`
+  directories. ccc refuses grants that would let the model tamper with things
+  that run later: a write directory may not cover ccc's own config or state,
+  dot-directories in `$HOME`, anything on `PATH`, harness binaries, or a
+  project a subagent will run in. Any directories a Goose agent grants to the
+  subagents it starts must lie within its own grants (a Claude or Codex
+  subagent still has whatever tools its own definition gives it). The README's *Goose confinement* section has the full
+  rules and what they guarantee.
+- **Requirement: bubblewrap.** Goose agents that read, write or run commands
+  need [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`) 0.8 or
+  later with unprivileged user namespaces. Their file and shell tools run in a
+  bubblewrap sandbox with no network, a cleared environment, a read-only root
+  and only the granted directories mounted; a system-call filter also blocks
+  most socket types and io_uring. A run fails at the start if the sandbox
+  cannot be created. See the README's *Goose box* section, including the few
+  things the sandbox does not stop.
+- `ccc resume`, `ccc launch` and `ccc launch --resume` work with Goose
+  sessions, reusing the directory grants recorded when the session began;
+  `--fork` is refused. A Goose agent cannot resume a session a human has
+  opened at the terminal.
+- `ccc which` on a Goose agent shows the directory grants a run would get.
+- Goose telemetry is always off, and Goose ignores your own Goose settings:
+  it runs with an empty home directory and cannot download its model catalog.
+
 ## 0.3.0 — 2026-10-27
 
 - **Upgrade note: subagents no longer bypass permissions by default.** The

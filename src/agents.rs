@@ -1,7 +1,7 @@
 //! Agent definitions: `<type>.md` files with YAML frontmatter and a prose body
 //! that becomes the system prompt / developer instructions.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -9,6 +9,7 @@ use serde::de::{Deserializer, Error as _};
 use serde::Deserialize;
 
 use crate::config::{blank_to_none, Harness};
+use crate::goose_policy::GooseTool;
 
 /// Bodies larger than this cannot be passed on the command line safely
 /// (Linux `MAX_ARG_STRLEN` is 128 KiB).
@@ -52,6 +53,12 @@ struct Frontmatter {
     codex_effort: Option<String>,
     #[serde(default)]
     codex_sandbox: Option<Sandbox>,
+    #[serde(default)]
+    goose_model: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_goose_tools")]
+    goose_tools: Option<StringList>,
+    #[serde(default, deserialize_with = "deserialize_goose_agents")]
+    goose_agents: Option<StringList>,
 }
 
 /// A string field may be comma-separated; a YAML list is also accepted.
@@ -73,6 +80,24 @@ where
     D: Deserializer<'de>,
 {
     deserialize_string_list(deserializer, "harness")
+}
+
+fn deserialize_goose_tools<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<StringList>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_string_list(deserializer, "goose_tools")
+}
+
+fn deserialize_goose_agents<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<StringList>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_string_list(deserializer, "goose_agents")
 }
 
 fn deserialize_string_list<'de, D>(
@@ -131,6 +156,24 @@ fn parse_harnesses(value: StringList) -> Result<Option<Vec<Harness>>> {
     Ok(Some(harnesses))
 }
 
+/// `goose_tools`, defaulting to `read` when absent or empty.
+fn parse_goose_tools(value: Option<StringList>) -> Result<BTreeSet<GooseTool>> {
+    let Some(values) = value.and_then(StringList::into_vec) else {
+        return Ok(BTreeSet::from([GooseTool::Read]));
+    };
+    let mut tools = BTreeSet::new();
+    for value in values {
+        let tool = GooseTool::parse(&value).context("goose_tools")?;
+        if !tools.insert(tool) {
+            bail!(
+                "duplicate goose tool group {:?} in goose_tools",
+                tool.as_str()
+            );
+        }
+    }
+    Ok(tools)
+}
+
 /// A parsed `<type>.md`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentDef {
@@ -142,6 +185,13 @@ pub struct AgentDef {
     pub codex_model: Option<String>,
     pub codex_effort: Option<String>,
     pub codex_sandbox: Sandbox,
+    /// Goose only: the model passed to `goose run --model`.
+    pub goose_model: Option<String>,
+    /// Goose only: the tool groups the agent gets; `read` when unset.
+    pub goose_tools: BTreeSet<GooseTool>,
+    /// Goose only: the agent types its `ccc` tools may run; non-empty exactly
+    /// when `goose_tools` holds `ccc`.
+    pub goose_agents: Vec<String>,
     /// Allowed harnesses; `Some` must be non-empty. Parsed empty input is `None`.
     pub harness: Option<Vec<Harness>>,
     pub body: String,
@@ -161,7 +211,7 @@ impl AgentDef {
             let suffix = format!(".{harness}");
             let base = &name[..name.len() - suffix.len()];
             bail!(
-                "agent type {name:?} ends with reserved suffix {suffix:?}; {base}.claude.md / {base}.codex.md is an overlay of {base}.md"
+                "agent type {name:?} ends with reserved suffix {suffix:?}; {base}{suffix}.md is an overlay of {base}.md"
             );
         }
         let path = dir.join(format!("{name}.md"));
@@ -223,7 +273,38 @@ impl AgentDef {
         let effort = blank_to_none(fm.effort);
         let codex_model = blank_to_none(fm.codex_model);
         let codex_effort = blank_to_none(fm.codex_effort);
+        let goose_model = blank_to_none(fm.goose_model);
         let harness = fm.harness.map(parse_harnesses).transpose()?.flatten();
+        let lists_goose = harness
+            .as_ref()
+            .is_some_and(|h| h.contains(&Harness::Goose));
+        if !lists_goose {
+            // On a definition Goose never runs, these keys would be silently inert.
+            for (key, set) in [
+                ("goose_model", goose_model.is_some()),
+                ("goose_tools", fm.goose_tools.is_some()),
+                ("goose_agents", fm.goose_agents.is_some()),
+            ] {
+                if set {
+                    bail!("`{key}` is set, but the `harness` policy does not list goose");
+                }
+            }
+        }
+        let goose_tools = parse_goose_tools(fm.goose_tools)?;
+        let goose_agents = fm
+            .goose_agents
+            .and_then(StringList::into_vec)
+            .unwrap_or_default();
+        if goose_tools.contains(&GooseTool::Ccc) {
+            if goose_agents.is_empty() {
+                bail!("goose_tools includes \"ccc\", so goose_agents must name at least one agent type");
+            }
+        } else if !goose_agents.is_empty() {
+            bail!("goose_agents is set, but goose_tools does not include \"ccc\"");
+        }
+        if lists_goose && goose_model.is_none() {
+            bail!("the `harness` policy lists goose, so `goose_model` is required");
+        }
 
         if fm.name != stem {
             bail!(
@@ -235,6 +316,7 @@ impl AgentDef {
             if !allowed.iter().any(|h| match h {
                 Harness::Claude => model.is_some(),
                 Harness::Codex => codex_model.is_some(),
+                Harness::Goose => goose_model.is_some(),
             }) {
                 let allowed_text = allowed
                     .iter()
@@ -246,6 +328,7 @@ impl AgentDef {
                     .filter_map(|h| match h {
                         Harness::Claude if model.is_none() => Some("model"),
                         Harness::Codex if codex_model.is_none() => Some("codex_model"),
+                        Harness::Goose if goose_model.is_none() => Some("goose_model"),
                         _ => None,
                     })
                     .collect::<Vec<_>>()
@@ -277,17 +360,23 @@ impl AgentDef {
             codex_model,
             codex_effort,
             codex_sandbox: fm.codex_sandbox.unwrap_or_default(),
+            goose_model,
+            goose_tools,
+            goose_agents,
             harness,
             body,
             overlays: BTreeMap::new(),
         })
     }
 
-    /// Whether the definition policy permits this harness (true when no policy).
+    /// Whether the definition policy permits this harness. With no policy,
+    /// Claude and Codex are permitted; Goose only ever when the policy lists
+    /// it, so no definition runs confined by tools its author never chose.
     pub fn allows(&self, h: Harness) -> bool {
-        self.harness
-            .as_ref()
-            .is_none_or(|allowed| allowed.contains(&h))
+        match &self.harness {
+            Some(allowed) => allowed.contains(&h),
+            None => h != Harness::Goose,
+        }
     }
 
     /// The first entry in the harness policy, or `None` when no policy is set.
@@ -577,9 +666,11 @@ mod tests {
         );
         dir.write_file("c.claude.md", "\u{feff}  claude overlay  \n", 0o644);
         dir.write_file("c.codex.md", "\n codex overlay\n\n", 0o644);
+        dir.write_file("c.goose.md", "goose overlay\n", 0o644);
         let d = AgentDef::load(dir.path(), "c").unwrap();
         assert_eq!(d.body_for(Harness::Claude), "claude overlay");
         assert_eq!(d.body_for(Harness::Codex), "codex overlay");
+        assert_eq!(d.body_for(Harness::Goose), "goose overlay");
         let no_codex =
             AgentDef::parse("---\nname: c\ndescription: d\nmodel: m\n---\nbase\n", "c").unwrap();
         assert_eq!(no_codex.body_for(Harness::Codex), "base");
@@ -647,7 +738,7 @@ mod tests {
     #[test]
     fn reserves_harness_suffixes_but_allows_other_dotted_names() {
         let temp = crate::testutil::TempDir::new("dotted-agent");
-        for stem in ["review.claude", "review.codex"] {
+        for stem in ["review.claude", "review.codex", "review.goose"] {
             temp.write_file(
                 &format!("{stem}.md"),
                 &format!("---\nname: {stem}\ndescription: d\nmodel: m\n---\nbody\n"),
@@ -715,7 +806,7 @@ mod tests {
                 AgentDef::load(&dir, &stem).unwrap_or_else(|e| panic!("{}: {e:#}", path.display()));
             assert!(!d.body.is_empty(), "{stem} has an empty body");
             assert!(
-                d.model.is_some() || d.codex_model.is_some(),
+                d.model.is_some() || d.codex_model.is_some() || d.goose_model.is_some(),
                 "{stem} names no model"
             );
             for (e, harness) in [
@@ -729,5 +820,126 @@ mod tests {
             seen += 1;
         }
         assert!(seen >= 3, "expected the shipped stubs, found {seen}");
+    }
+
+    const GOOSE: &str =
+        "---\nname: g\ndescription: d\nharness: goose\ngoose_model: qwen3-coder-30b\n---\nbody\n";
+
+    fn goose_def(extra: &str) -> Result<AgentDef> {
+        AgentDef::parse(
+            &GOOSE.replace("goose_model:", &format!("{extra}goose_model:")),
+            "g",
+        )
+    }
+
+    #[test]
+    fn a_goose_definition_defaults_to_the_read_group() {
+        let d = AgentDef::parse(GOOSE, "g").unwrap();
+        assert_eq!(d.goose_model.as_deref(), Some("qwen3-coder-30b"));
+        assert_eq!(d.goose_tools, BTreeSet::from([GooseTool::Read]));
+        assert!(d.goose_agents.is_empty());
+        assert!(d.allows(Harness::Goose));
+        assert!(!d.allows(Harness::Claude));
+        for empty in ["goose_tools: \"\"\n", "goose_tools: []\n"] {
+            assert_eq!(
+                goose_def(empty).unwrap().goose_tools,
+                BTreeSet::from([GooseTool::Read])
+            );
+        }
+    }
+
+    #[test]
+    fn goose_tools_and_agents_take_csv_and_list_forms() {
+        let d = goose_def(
+            "goose_tools: write, shell, ccc\ngoose_agents:\n  - explorer\n  - reviewer\n",
+        )
+        .unwrap();
+        assert_eq!(
+            d.goose_tools,
+            BTreeSet::from([GooseTool::Write, GooseTool::Shell, GooseTool::Ccc])
+        );
+        assert_eq!(d.goose_agents, vec!["explorer", "reviewer"]);
+        let d = goose_def("goose_tools: [ccc]\ngoose_agents: explorer, scribe\n").unwrap();
+        assert_eq!(d.goose_tools, BTreeSet::from([GooseTool::Ccc]));
+        assert_eq!(d.goose_agents, vec!["explorer", "scribe"]);
+    }
+
+    #[test]
+    fn goose_is_opt_in_per_definition() {
+        let d = AgentDef::parse(
+            "---\nname: c\ndescription: d\nmodel: m\ncodex_model: g\n---\nbody\n",
+            "c",
+        )
+        .unwrap();
+        assert!(d.allows(Harness::Claude) && d.allows(Harness::Codex));
+        assert!(!d.allows(Harness::Goose));
+        let d = AgentDef::parse(
+            "---\nname: c\ndescription: d\nmodel: m\nharness: claude, goose\ngoose_model: q\n---\nbody\n",
+            "c",
+        )
+        .unwrap();
+        assert!(d.allows(Harness::Goose) && d.allows(Harness::Claude));
+        assert!(!d.allows(Harness::Codex));
+    }
+
+    #[test]
+    fn goose_definition_errors_name_their_key() {
+        let cases = [
+            (
+                "---\nname: g\ndescription: d\nharness: goose\n---\nbody\n",
+                "`goose_model` is required",
+            ),
+            (
+                "---\nname: g\ndescription: d\nmodel: m\nharness: claude, goose\n---\nbody\n",
+                "`goose_model` is required",
+            ),
+            (
+                "---\nname: g\ndescription: d\nmodel: m\ngoose_model: q\n---\nbody\n",
+                "`goose_model` is set, but the `harness` policy does not list goose",
+            ),
+            (
+                "---\nname: g\ndescription: d\nmodel: m\nharness: claude\ngoose_tools: read\n---\nbody\n",
+                "`goose_tools` is set",
+            ),
+            (
+                "---\nname: g\ndescription: d\nmodel: m\ngoose_agents: x\n---\nbody\n",
+                "`goose_agents` is set",
+            ),
+        ];
+        for (text, needle) in cases {
+            let err = format!("{:#}", AgentDef::parse(text, "g").unwrap_err());
+            assert!(err.contains(needle), "{text}: {err}");
+        }
+        for (extra, needle) in [
+            ("goose_tools: ccc\n", "goose_agents must name at least one"),
+            (
+                "goose_tools: ccc\ngoose_agents: \" , \"\n",
+                "goose_agents must name at least one",
+            ),
+            (
+                "goose_agents: explorer\n",
+                "goose_tools does not include \"ccc\"",
+            ),
+            (
+                "goose_tools: read, write\ngoose_agents: x\n",
+                "goose_tools does not include \"ccc\"",
+            ),
+            ("goose_tools: exec\n", "unknown goose tool group \"exec\""),
+            (
+                "goose_tools: read, read\n",
+                "duplicate goose tool group \"read\"",
+            ),
+            (
+                "goose_tools: 3\n",
+                "`goose_tools` must be a string or a list of strings",
+            ),
+            (
+                "goose_agents: {}\n",
+                "`goose_agents` must be a string or a list of strings",
+            ),
+        ] {
+            let err = format!("{:#}", goose_def(extra).unwrap_err());
+            assert!(err.contains(needle), "{extra}: {err}");
+        }
     }
 }

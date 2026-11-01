@@ -129,6 +129,8 @@ pub enum PromptSource {
 pub enum HookKind {
     CodexNotify,
     ClaudeStop,
+    GooseSessionStart,
+    GooseStop,
 }
 
 impl HookKind {
@@ -136,6 +138,8 @@ impl HookKind {
         match self {
             Self::CodexNotify => "codex-notify",
             Self::ClaudeStop => "claude-stop",
+            Self::GooseSessionStart => "goose-session-start",
+            Self::GooseStop => "goose-stop",
         }
     }
 }
@@ -153,8 +157,10 @@ impl std::str::FromStr for HookKind {
         match value {
             "codex-notify" => Ok(Self::CodexNotify),
             "claude-stop" => Ok(Self::ClaudeStop),
+            "goose-session-start" => Ok(Self::GooseSessionStart),
+            "goose-stop" => Ok(Self::GooseStop),
             _ => Err(format!(
-                "unknown hook kind {value:?}; expected codex-notify or claude-stop"
+                "unknown hook kind {value:?}; expected codex-notify, claude-stop, goose-session-start or goose-stop"
             )),
         }
     }
@@ -194,6 +200,9 @@ pub struct SpawnPayload {
     pub cwd: String,
     pub session: Option<String>,
     pub selection_notes: Vec<String>,
+    /// Goose only: the confinement policy the run spawns under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goose_policy: Option<crate::goose_policy::GoosePolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,6 +248,10 @@ pub struct SessionRecord {
     pub ts: Timestamp,
     pub inv: String,
     pub session: String,
+    /// The harness's own id for `session`, when it differs: Goose's id of a
+    /// launch's session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -340,7 +353,11 @@ pub fn classify_env(vars: &[(String, String)]) -> (BTreeMap<String, String>, Vec
         }
         let recognised = matches!(
             key.as_str(),
-            "CCC_CONFIG" | "CCC_AGENTS_CONFIG" | "CCC_CLAUDE_BIN" | "CCC_CODEX_BIN"
+            "CCC_CONFIG"
+                | "CCC_AGENTS_CONFIG"
+                | "CCC_CLAUDE_BIN"
+                | "CCC_CODEX_BIN"
+                | "CCC_GOOSE_BIN"
         ) || override_name(key);
         if recognised {
             known.insert(key.clone(), value.clone());
@@ -358,6 +375,7 @@ fn override_name(key: &str) -> bool {
     let suffix = [
         "CODEX_MODEL_",
         "CODEX_EFFORT_",
+        "GOOSE_MODEL_",
         "HARNESS_",
         "MODEL_",
         "EFFORT_",
@@ -376,17 +394,8 @@ fn audit_dir(env: &dyn EnvSource) -> PathBuf {
     config::state_home_in(env).join("ccc/audit")
 }
 
-fn ensure_dir(dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("creating audit directory {}", dir.display()))?;
-    #[cfg(unix)]
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("setting mode on {}", dir.display()))?;
-    Ok(())
-}
-
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 
 fn open_append(path: &Path) -> Result<File> {
     let mut options = OpenOptions::new();
@@ -524,7 +533,7 @@ impl Recorder {
     pub fn new(env: &dyn EnvSource) -> Result<Self> {
         let started_at = Timestamp::now();
         let dir = audit_dir(env);
-        ensure_dir(&dir)?;
+        crate::fsutil::ensure_private_dir(&dir).context("preparing the audit directory")?;
         let config_path = config::config_path_in(env).path;
         let agents_config_path = config::agents_config_path_in(env).path;
         let (classified, other) = classify_env(&env.vars_with_prefix("CCC_"));
@@ -622,6 +631,7 @@ impl Recorder {
             ts: Timestamp::now(),
             inv: self.lineage.invocation_id.clone(),
             session: session.to_string(),
+            native: None,
         }))
     }
 
@@ -824,6 +834,23 @@ pub fn ingest_hook(
                 transcript,
             )
         }
+        HookKind::GooseSessionStart => {
+            return goose_session_start(dir, &trace, inv, &value, env);
+        }
+        HookKind::GooseStop => {
+            let native = goose_session_id(&value)?;
+            let result = value
+                .get("last_assistant_message")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            // The launch's own session is the one its first `SessionStart`
+            // mapped; any other id is a `/new` session, recorded as Goose's.
+            let session = match launch_session(dir, &trace, &inv)? {
+                Some(mapped) if mapped.native.as_deref() == Some(native) => mapped.session,
+                _ => native.to_string(),
+            };
+            (Harness::Goose, session, None, result, None)
+        }
     };
     append_turn(
         dir,
@@ -839,6 +866,81 @@ pub fn ingest_hook(
         },
     )
     .map_err(|e| format!("appending audit turn: {e:#}"))
+}
+
+/// Goose's own session id from a hook payload.
+fn goose_session_id(value: &serde_json::Value) -> std::result::Result<&str, String> {
+    value
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "goose payload missing session_id".to_string())
+}
+
+/// The first `session` record invocation `inv` wrote to `trace`; `None` when
+/// the trace does not exist yet. A line that does not parse is skipped.
+fn launch_session(
+    dir: &Path,
+    trace: &str,
+    inv: &str,
+) -> std::result::Result<Option<SessionRecord>, String> {
+    use std::io::BufRead;
+    #[derive(Deserialize)]
+    struct Tag<'a> {
+        t: &'a str,
+    }
+    let path = path_for(dir, trace).map_err(|e| format!("{e:#}"))?;
+    let reading = |e: std::io::Error| format!("reading audit trace {}: {e}", path.display());
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(reading(e)),
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line).map_err(reading)? == 0 {
+            return Ok(None);
+        }
+        if !serde_json::from_slice::<Tag>(&line).is_ok_and(|tag| tag.t == "session") {
+            continue;
+        }
+        if let Ok(record) = serde_json::from_slice::<SessionRecord>(&line) {
+            if record.inv == inv {
+                return Ok(Some(record));
+            }
+        }
+    }
+}
+
+/// Maps Goose's id of a launch's session to the ccc id the launch preset or
+/// resumed, from the first `SessionStart` of the invocation. A later one
+/// opens a `/new` session and records nothing.
+fn goose_session_start(
+    dir: &Path,
+    trace: &str,
+    inv: String,
+    value: &serde_json::Value,
+    env: &dyn EnvSource,
+) -> std::result::Result<(), String> {
+    let native = goose_session_id(value)?;
+    let var = crate::harness::goose::SESSION_VAR;
+    let session = env.get(var).ok_or_else(|| format!("missing {var}"))?;
+    crate::session::check_id(&session).map_err(|e| format!("{var}: {e:#}"))?;
+    if launch_session(dir, trace, &inv)?.is_some() {
+        return Ok(());
+    }
+    append_record(
+        &path_for(dir, trace).map_err(|e| format!("{e:#}"))?,
+        &Record::Session(SessionRecord {
+            ts: Timestamp::now(),
+            inv,
+            session,
+            native: Some(native.to_string()),
+        }),
+    )
+    .map_err(|e| format!("appending audit session: {e:#}"))
 }
 
 pub fn read_trace(dir: &Path, trace_id: &str) -> Result<Vec<Record>> {
@@ -1242,10 +1344,211 @@ mod tests {
         .is_err());
     }
 
+    fn goose_hook_env(
+        trace: &str,
+        parent: &str,
+        session: Option<&str>,
+    ) -> BTreeMap<String, String> {
+        let mut environment = hook_env(trace, parent);
+        if let Some(session) = session {
+            environment.insert(crate::harness::goose::SESSION_VAR.into(), session.into());
+        }
+        environment
+    }
+
+    fn sessions_and_turns(dir: &Path, trace: &str) -> (Vec<SessionRecord>, Vec<Turn>) {
+        let mut sessions = Vec::new();
+        let mut turns = Vec::new();
+        for record in read_trace(dir, trace).unwrap() {
+            match record {
+                Record::Session(s) => sessions.push(s),
+                Record::Turn(t) => turns.push(t),
+                _ => {}
+            }
+        }
+        (sessions, turns)
+    }
+
+    #[test]
+    fn goose_session_start_maps_the_first_native_id_and_ignores_later_ones() {
+        let dir = TempDir::new("hook-goose-start");
+        let trace = Uuid::new_v4().to_string();
+        let parent = Uuid::new_v4().to_string();
+        let ccc_id = Uuid::new_v4().to_string();
+        let environment = goose_hook_env(&trace, &parent, Some(&ccc_id));
+        for native in ["20261101_1", "20261101_2"] {
+            ingest_hook(
+                dir.path(),
+                HookKind::GooseSessionStart,
+                &format!(r#"{{"session_id":"{native}"}}"#),
+                &environment,
+            )
+            .unwrap();
+        }
+        let (sessions, turns) = sessions_and_turns(dir.path(), &trace);
+        assert!(turns.is_empty());
+        assert_eq!(sessions.len(), 1, "{sessions:?}");
+        assert_eq!(sessions[0].inv, parent);
+        assert_eq!(sessions[0].session, ccc_id);
+        assert_eq!(sessions[0].native.as_deref(), Some("20261101_1"));
+        let line = std::fs::read_to_string(path_for(dir.path(), &trace).unwrap()).unwrap();
+        assert!(line.contains(r#""native":"20261101_1""#), "{line}");
+
+        // Another invocation in the same trace maps its own session.
+        let other = Uuid::new_v4().to_string();
+        ingest_hook(
+            dir.path(),
+            HookKind::GooseSessionStart,
+            r#"{"session_id":"20261101_3"}"#,
+            &goose_hook_env(&trace, &other, Some(&ccc_id)),
+        )
+        .unwrap();
+        assert_eq!(sessions_and_turns(dir.path(), &trace).0.len(), 2);
+    }
+
+    #[test]
+    fn launch_session_finds_the_invocations_first_session_past_other_lines() {
+        let dir = TempDir::new("hook-goose-launch-session");
+        let trace = Uuid::new_v4().to_string();
+        let path = path_for(dir.path(), &trace).unwrap();
+        assert!(launch_session(dir.path(), &trace, "a").unwrap().is_none());
+        let session = |inv: &str, native: &str| {
+            serde_json::to_string(&Record::Session(SessionRecord {
+                ts: Timestamp::now(),
+                inv: inv.into(),
+                session: format!("ccc-{native}"),
+                native: Some(native.into()),
+            }))
+            .unwrap()
+        };
+        let lines = [
+            "{not json".to_string(),
+            r#"{"t":"turn","inv":"a"}"#.to_string(),
+            r#"{"t":"session","inv":"a"}"#.to_string(),
+            session("b", "b1"),
+            session("a", "a1"),
+            session("a", "a2"),
+        ];
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let got = launch_session(dir.path(), &trace, "a").unwrap().unwrap();
+        assert_eq!(got.native.as_deref(), Some("a1"));
+        let got = launch_session(dir.path(), &trace, "b").unwrap().unwrap();
+        assert_eq!(got.native.as_deref(), Some("b1"));
+        assert!(launch_session(dir.path(), &trace, "c").unwrap().is_none());
+    }
+
+    #[test]
+    fn goose_session_start_without_ids_records_nothing() {
+        let dir = TempDir::new("hook-goose-start-bad");
+        let trace = Uuid::new_v4().to_string();
+        let parent = Uuid::new_v4().to_string();
+        let good = Uuid::new_v4().to_string();
+        let cases = [
+            (None, r#"{"session_id":"20261101_1"}"#),
+            (Some("../escape"), r#"{"session_id":"20261101_1"}"#),
+            (Some(""), r#"{"session_id":"20261101_1"}"#),
+            (Some(good.as_str()), r#"{}"#),
+            (Some(good.as_str()), r#"{"session_id":""}"#),
+            (Some(good.as_str()), r#"{"session_id":7}"#),
+        ];
+        for (session, payload) in cases {
+            let err = ingest_hook(
+                dir.path(),
+                HookKind::GooseSessionStart,
+                payload,
+                &goose_hook_env(&trace, &parent, session),
+            )
+            .unwrap_err();
+            assert!(!err.is_empty(), "{session:?} {payload}");
+        }
+        assert!(!path_for(dir.path(), &trace).unwrap().exists());
+        assert!(ingest_hook(
+            dir.path(),
+            HookKind::GooseStop,
+            r#"{"last_assistant_message":"x"}"#,
+            &goose_hook_env(&trace, &parent, Some(&good)),
+        )
+        .unwrap_err()
+        .contains("session_id"));
+        assert!(!path_for(dir.path(), &trace).unwrap().exists());
+    }
+
+    #[test]
+    fn goose_stop_records_the_ccc_id_only_for_the_mapped_session() {
+        let dir = TempDir::new("hook-goose-stop");
+        let trace = Uuid::new_v4().to_string();
+        let parent = Uuid::new_v4().to_string();
+        let ccc_id = Uuid::new_v4().to_string();
+        let environment = goose_hook_env(&trace, &parent, Some(&ccc_id));
+
+        let stop = |native: &str, message: Option<&str>| {
+            let payload = match message {
+                Some(m) => serde_json::json!({"session_id": native, "last_assistant_message": m}),
+                None => serde_json::json!({"session_id": native}),
+            };
+            ingest_hook(
+                dir.path(),
+                HookKind::GooseStop,
+                &payload.to_string(),
+                &environment,
+            )
+            .unwrap();
+        };
+        // Before any mapping, a stop records Goose's own id.
+        stop("20261101_1", Some("unmapped"));
+        ingest_hook(
+            dir.path(),
+            HookKind::GooseSessionStart,
+            r#"{"session_id":"20261101_1"}"#,
+            &environment,
+        )
+        .unwrap();
+        stop("20261101_1", Some("mapped"));
+        stop("20261101_9", Some("from /new"));
+        stop("20261101_1", None);
+
+        let (_, turns) = sessions_and_turns(dir.path(), &trace);
+        let got = turns
+            .iter()
+            .map(|t| (t.session.as_str(), t.result.as_deref()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            got,
+            [
+                ("20261101_1", Some("unmapped")),
+                (ccc_id.as_str(), Some("mapped")),
+                ("20261101_9", Some("from /new")),
+                (ccc_id.as_str(), None),
+            ]
+        );
+        assert!(turns
+            .iter()
+            .all(|t| t.harness == Harness::Goose && t.inv == parent && t.turn.is_none()));
+        assert!(turns.iter().all(|t| t.transcript.is_none()));
+    }
+
+    #[test]
+    fn a_session_record_without_native_still_reads() {
+        let line = r#"{"t":"session","ts":"2026-01-01T00:00:00Z","inv":"i","session":"s"}"#;
+        match serde_json::from_str::<Record>(line).unwrap() {
+            Record::Session(s) => {
+                assert_eq!(s.session, "s");
+                assert_eq!(s.native, None);
+                let back = serde_json::to_string(&Record::Session(s)).unwrap();
+                assert!(!back.contains("native"), "{back}");
+            }
+            other => panic!("expected a session record, got {other:?}"),
+        }
+    }
+
     #[test]
     fn hook_kind_has_canonical_spellings_and_rejects_unknown_values() {
         assert_eq!(HookKind::CodexNotify.as_str(), "codex-notify");
         assert_eq!(HookKind::ClaudeStop.to_string(), "claude-stop");
+        for kind in [HookKind::GooseSessionStart, HookKind::GooseStop] {
+            assert_eq!(kind.as_str().parse::<HookKind>().unwrap(), kind);
+        }
+        assert_eq!(HookKind::GooseStop.as_str(), "goose-stop");
         assert!("unknown"
             .parse::<HookKind>()
             .unwrap_err()
@@ -1274,6 +1577,8 @@ mod tests {
             ("CCC_MODEL_ALL".into(), "opus".into()),
             ("CCC_EFFORT_COMMENT_REWRITER".into(), "high".into()),
             ("CCC_CODEX_MODEL_ALL".into(), "gpt".into()),
+            ("CCC_GOOSE_BIN".into(), "/opt/goose".into()),
+            ("CCC_GOOSE_MODEL_EXPLORER".into(), "qwen".into()),
             ("CCC_MODEL_bad".into(), "secret".into()),
             ("CCC_SECRET".into(), "top-secret".into()),
             ("CCC_TRACE_ID".into(), "trace-secret".into()),
@@ -1283,6 +1588,8 @@ mod tests {
         assert_eq!(known.get("CCC_CONFIG").unwrap(), "/etc/c.toml");
         assert_eq!(known.get("CCC_AGENTS_CONFIG").unwrap(), "/etc/a.toml");
         assert!(known.contains_key("CCC_CODEX_MODEL_ALL"));
+        assert_eq!(known.get("CCC_GOOSE_BIN").unwrap(), "/opt/goose");
+        assert_eq!(known.get("CCC_GOOSE_MODEL_EXPLORER").unwrap(), "qwen");
         assert!(other.contains(&"CCC_MODEL_bad".into()));
         assert!(other.contains(&"CCC_SECRET".into()));
         assert!(!other.iter().any(|name| name == "CCC_TRACE_ID"));
@@ -1782,6 +2089,7 @@ mod tests {
             ts: Timestamp::UNIX_EPOCH,
             inv: Uuid::new_v4().to_string(),
             session: "s".into(),
+            native: None,
         });
         assert_eq!(serde_json::to_value(&child).unwrap()["t"], "child");
         assert_eq!(serde_json::to_value(&session).unwrap()["t"], "session");

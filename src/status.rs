@@ -574,6 +574,8 @@ impl IdleIndex {
                     }
                 }
             }
+            // Goose keeps its sessions in SQLite, with no per-session file whose mtime gives an idle age.
+            Harness::Goose => {}
         }
         None
     }
@@ -1659,6 +1661,7 @@ mod tests {
                 ts: "2026-01-01T00:00:02Z".parse().unwrap(),
                 inv: inv.into(),
                 session: session.into(),
+                native: None,
             }));
         }
         write_records(dir, TRACE, &records);
@@ -1826,6 +1829,7 @@ mod tests {
                 ts: "2026-01-01T00:00:02Z".parse().unwrap(),
                 inv: CHILD.into(),
                 session: "sess".into(),
+                native: None,
             }),
             start(second, Some(CHILD), "2026-01-01T00:00:03Z"),
             start(SIBLING, None, "2026-01-01T00:00:04Z"),
@@ -1885,12 +1889,14 @@ mod tests {
                     ts: "2026-01-01T00:00:01Z".parse().unwrap(),
                     inv: CHILD.into(),
                     session: "duplicate".into(),
+                    native: None,
                 }),
                 start(duplicate, None, "2026-01-01T00:00:02Z"),
                 Record::Session(crate::audit::SessionRecord {
                     ts: "2026-01-01T00:00:03Z".parse().unwrap(),
                     inv: duplicate.into(),
                     session: "duplicate".into(),
+                    native: None,
                 }),
             ])],
             &scope,

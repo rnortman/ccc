@@ -468,6 +468,7 @@ mod tests {
             tools: Some(vec!["Read".into(), "Grep".into()]),
             sandbox: Sandbox::ReadOnly,
             body: "You are an explorer.\nCite \"files\".".into(),
+            goose: None,
         }
     }
 

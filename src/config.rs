@@ -19,14 +19,16 @@ pub enum Harness {
     #[default]
     Claude,
     Codex,
+    Goose,
 }
 
 impl Harness {
-    pub const ALL: [Harness; 2] = [Harness::Claude, Harness::Codex];
+    pub const ALL: [Harness; 3] = [Harness::Claude, Harness::Codex, Harness::Goose];
     pub fn as_str(self) -> &'static str {
         match self {
             Harness::Claude => "claude",
             Harness::Codex => "codex",
+            Harness::Goose => "goose",
         }
     }
 
@@ -34,7 +36,10 @@ impl Harness {
         match s.trim().to_ascii_lowercase().as_str() {
             "claude" => Ok(Harness::Claude),
             "codex" => Ok(Harness::Codex),
-            other => anyhow::bail!("unknown harness {other:?} (expected \"claude\" or \"codex\")"),
+            "goose" => Ok(Harness::Goose),
+            other => anyhow::bail!(
+                "unknown harness {other:?} (expected \"claude\", \"codex\" or \"goose\")"
+            ),
         }
     }
 }
@@ -168,7 +173,8 @@ impl Effort {
     }
 
     /// The efforts one harness accepts: Claude's `--effort` takes `low` through
-    /// `max`, Codex's `model_reasoning_effort` takes `minimal` through `xhigh`.
+    /// `max`, Codex's `model_reasoning_effort` takes `minimal` through `xhigh`,
+    /// and Goose has no reasoning-effort setting.
     pub fn accepted_by(harness: Harness) -> &'static [Effort] {
         match harness {
             Harness::Claude => &[
@@ -185,6 +191,7 @@ impl Effort {
                 Effort::High,
                 Effort::XHigh,
             ],
+            Harness::Goose => &[],
         }
     }
 
@@ -193,6 +200,9 @@ impl Effort {
     pub fn parse_for(s: &str, harness: Harness) -> Result<Effort> {
         let e = Effort::parse(s)?;
         let accepted = Effort::accepted_by(harness);
+        if accepted.is_empty() {
+            anyhow::bail!("{harness} accepts no effort (got {:?})", e.as_str());
+        }
         if !accepted.contains(&e) {
             let names: Vec<&str> = accepted.iter().map(|e| e.as_str()).collect();
             anyhow::bail!(
@@ -219,6 +229,7 @@ pub struct Config {
     pub agents: BTreeMap<String, AgentOverrides>,
     pub claude: ClaudeConfig,
     pub codex: CodexConfig,
+    pub goose: GooseConfig,
     pub mqtt: MqttConfig,
     pub process: ProcessConfig,
     pub launch: LaunchConfig,
@@ -231,13 +242,14 @@ pub struct Config {
 struct SiteFile {
     claude: ClaudeConfig,
     codex: CodexConfig,
+    goose: GooseConfig,
     mqtt: MqttConfig,
     process: ProcessConfig,
     launch: LaunchConfig,
 }
 
 /// Top-level keys of [`SiteFile`].
-const SITE_KEYS: &[&str] = &["claude", "codex", "mqtt", "process", "launch"];
+const SITE_KEYS: &[&str] = &["claude", "codex", "goose", "mqtt", "process", "launch"];
 
 /// The agents config file: where agent definitions live and how to route them.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -316,6 +328,7 @@ pub struct AgentOverrides {
     pub effort: Option<String>,
     pub codex_model: Option<String>,
     pub codex_effort: Option<String>,
+    pub goose_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -506,6 +519,172 @@ impl Default for CodexConfig {
     }
 }
 
+/// The longest `[goose] tool_wait_s`: Goose fails a stdio-extension call
+/// after a hard-coded 300 s, and a tool reply must reach it before then.
+pub const GOOSE_MAX_TOOL_WAIT_S: u64 = 280;
+
+/// `[goose]`: how Goose is run against a self-hosted model endpoint. ccc does
+/// not model Goose providers; endpoint settings are Goose's own environment
+/// variables, passed through `env`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct GooseConfig {
+    /// Goose `--provider`.
+    pub provider: String,
+    /// `GOOSE_PATH_ROOT`; `None` is `<state home>/ccc/goose`.
+    pub root: Option<String>,
+    /// How long one `ccc_run`, `ccc_wait` or `shell` call waits, in seconds.
+    pub tool_wait_s: u64,
+    /// Goose `--max-turns`; `None` leaves Goose's own default.
+    pub max_turns: Option<u32>,
+    /// Appended to every goose argv.
+    pub extra_args: Vec<String>,
+    /// Set in Goose's environment, verbatim.
+    pub env: BTreeMap<String, String>,
+    /// Per-model settings, keyed by the resolved model name.
+    pub models: BTreeMap<String, GooseModelConfig>,
+    /// The bubblewrap binary: a bare name looked up on `PATH`, or an absolute
+    /// path (`~/` allowed).
+    pub bwrap: String,
+    /// Extra directories mounted read-only in the box, each at its own path.
+    pub box_ro: Vec<String>,
+    /// `PATH` inside the box.
+    pub box_path: String,
+}
+
+/// `[goose.models."<model>"]`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct GooseModelConfig {
+    /// Set in Goose's environment after `[goose.env]`, winning over it.
+    pub env: BTreeMap<String, String>,
+}
+
+impl Default for GooseConfig {
+    fn default() -> Self {
+        GooseConfig {
+            provider: "openai".to_string(),
+            root: None,
+            tool_wait_s: 240,
+            max_turns: None,
+            extra_args: Vec::new(),
+            env: BTreeMap::new(),
+            models: BTreeMap::new(),
+            bwrap: "bwrap".to_string(),
+            box_ro: Vec::new(),
+            box_path: "/usr/local/bin:/usr/bin:/bin".to_string(),
+        }
+    }
+}
+
+impl GooseConfig {
+    fn validate(&self) -> Result<()> {
+        if self.provider.trim().is_empty() {
+            anyhow::bail!("[goose] provider is blank");
+        }
+        if !(1..=GOOSE_MAX_TOOL_WAIT_S).contains(&self.tool_wait_s) {
+            anyhow::bail!(
+                "[goose] tool_wait_s must be between 1 and {GOOSE_MAX_TOOL_WAIT_S} (got {}); Goose fails a tool call after 300 s",
+                self.tool_wait_s
+            );
+        }
+        if self.max_turns == Some(0) {
+            anyhow::bail!("[goose] max_turns must be at least 1");
+        }
+        if self.bwrap.trim().is_empty() {
+            anyhow::bail!("[goose] bwrap is blank");
+        }
+        // A relative path would resolve against a different cwd in each process.
+        if self.bwrap.contains('/') && !absolute_after_tilde(&self.bwrap) {
+            anyhow::bail!(
+                "[goose] bwrap must be a bare name looked up on PATH, or an absolute path (got {:?})",
+                self.bwrap
+            );
+        }
+        // Goose ignores a relative GOOSE_PATH_ROOT.
+        if let Some(root) = &self.root {
+            if !absolute_after_tilde(root) {
+                anyhow::bail!("[goose] root must be absolute or start with `~/` (got {root:?})");
+            }
+        }
+        for entry in &self.box_ro {
+            if !absolute_after_tilde(entry) {
+                anyhow::bail!(
+                    "[goose] box_ro entries must be absolute or start with `~/` (got {entry:?})"
+                );
+            }
+        }
+        let tables = std::iter::once(("[goose.env]".to_string(), &self.env)).chain(
+            self.models
+                .iter()
+                .map(|(m, c)| (format!("[goose.models.{m:?}] env"), &c.env)),
+        );
+        for (table, vars) in tables {
+            if let Some(key) = vars
+                .keys()
+                .find(|k| k.is_empty() || k.contains('=') || k.contains('\0'))
+            {
+                anyhow::bail!("{table} has an invalid variable name {key:?}");
+            }
+            if let Some(key) = vars
+                .keys()
+                .find(|k| crate::harness::goose::is_telemetry_var(k))
+            {
+                anyhow::bail!(
+                    "{table} sets {key:?}, which ccc controls: Goose telemetry is always off"
+                );
+            }
+            if let Some(key) = vars
+                .keys()
+                .find(|k| crate::harness::goose::is_isolation_var(k))
+            {
+                anyhow::bail!("{table} sets {key:?}, which ccc sets for Goose's isolation");
+            }
+        }
+        Ok(())
+    }
+
+    /// The Goose root: `root` with `~` expanded, else `<state home>/ccc/goose`.
+    pub fn root_in(&self, env: &dyn EnvSource) -> PathBuf {
+        match &self.root {
+            Some(root) => expand_tilde_in(env, root),
+            None => state_home_in(env).join("ccc/goose"),
+        }
+    }
+
+    /// The variables set in Goose's environment for `model`: `[goose.env]`,
+    /// then that model's `env`, later winning.
+    pub fn env_for(&self, model: &str) -> BTreeMap<String, String> {
+        let mut out = self.env.clone();
+        if let Some(m) = self.models.get(model) {
+            out.extend(m.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        out
+    }
+
+    /// The `box_ro` directories, `~` expanded and canonicalised. An entry
+    /// that does not exist or is not a directory is an error naming it.
+    pub fn box_ro_in(&self, env: &dyn EnvSource) -> Result<Vec<PathBuf>> {
+        self.box_ro
+            .iter()
+            .map(|entry| {
+                let path = expand_tilde_in(env, entry);
+                let canonical = std::fs::canonicalize(&path)
+                    .with_context(|| format!("[goose] box_ro entry {}", path.display()))?;
+                if !canonical.is_dir() {
+                    anyhow::bail!("[goose] box_ro entry {} is not a directory", path.display());
+                }
+                Ok(canonical)
+            })
+            .collect()
+    }
+}
+
+/// Whether `s` is an absolute path, or one that `~` expansion makes absolute.
+fn absolute_after_tilde(s: &str) -> bool {
+    s == "~" || s.starts_with("~/") || std::path::Path::new(s).is_absolute()
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct MqttConfig {
@@ -581,6 +760,7 @@ impl Config {
             agents: agents.agents,
             claude: site.claude,
             codex: site.codex,
+            goose: site.goose,
             mqtt: site.mqtt,
             process: site.process,
             launch: site.launch,
@@ -609,6 +789,7 @@ impl Config {
                 self.process.kill_grace_s
             );
         }
+        self.goose.validate()?;
         Ok(())
     }
 
@@ -1110,6 +1291,7 @@ effort = "low"
             agents_cfg("defualt_harness = \"claude\""),
             site_cfg("[claude]\nprofile = \"team01\""),
             agents_cfg("[agents.x]\ncodex_efort = \"low\""),
+            agents_cfg("[agents.x]\ngoose_modl = \"m\""),
         ] {
             let err = format!("{:#}", result.unwrap_err());
             assert!(err.contains("unknown field"), "{err}");
@@ -1319,7 +1501,296 @@ effort = "low"
     fn harness_parsing() {
         assert_eq!(Harness::parse("Claude").unwrap(), Harness::Claude);
         assert_eq!(Harness::parse(" codex ").unwrap(), Harness::Codex);
-        assert!(Harness::parse("gemini").is_err());
+        assert_eq!(Harness::parse("GOOSE").unwrap(), Harness::Goose);
+        let err = Harness::parse("gemini").unwrap_err().to_string();
+        assert!(err.contains("\"claude\", \"codex\" or \"goose\""), "{err}");
+        for h in Harness::ALL {
+            assert_eq!(Harness::parse(h.as_str()).unwrap(), h);
+        }
+    }
+
+    #[test]
+    fn goose_accepts_no_effort() {
+        assert!(Effort::accepted_by(Harness::Goose).is_empty());
+        let err = Effort::parse_for("low", Harness::Goose)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("goose accepts no effort"), "{err}");
+    }
+
+    #[test]
+    fn goose_defaults_apply_without_a_section() {
+        let g = site_cfg("").unwrap().goose;
+        assert_eq!(g.provider, "openai");
+        assert_eq!(g.root, None);
+        assert_eq!(g.tool_wait_s, 240);
+        assert_eq!(g.max_turns, None);
+        assert!(g.extra_args.is_empty() && g.env.is_empty() && g.models.is_empty());
+        assert_eq!(g.bwrap, "bwrap");
+        assert!(g.box_ro.is_empty());
+        assert_eq!(g.box_path, "/usr/local/bin:/usr/bin:/bin");
+        let e = env(&[("HOME", "/home/u")]);
+        assert_eq!(
+            g.root_in(&e),
+            PathBuf::from("/home/u/.local/state/ccc/goose")
+        );
+        let e = env(&[("HOME", "/home/u"), ("XDG_STATE_HOME", "/xdg/state")]);
+        assert_eq!(g.root_in(&e), PathBuf::from("/xdg/state/ccc/goose"));
+    }
+
+    #[test]
+    fn parses_the_documented_goose_section() {
+        let g = site_cfg(
+            r#"
+[goose]
+provider = "ollama"
+root = "~/goose-root"
+tool_wait_s = 30
+max_turns = 200
+extra_args = ["--debug"]
+bwrap = "/usr/bin/bwrap"
+box_ro = ["~/.cargo", "/opt/rust"]
+box_path = "/usr/bin"
+
+[goose.env]
+OPENAI_BASE_URL = "http://127.0.0.1:8080/v1"
+OPENAI_API_KEY = "none"
+
+[goose.models."qwen3-coder-30b"]
+env = { OPENAI_BASE_URL = "http://127.0.0.1:8081/v1" }
+"#,
+        )
+        .unwrap()
+        .goose;
+        assert_eq!(g.provider, "ollama");
+        assert_eq!(g.tool_wait_s, 30);
+        assert_eq!(g.max_turns, Some(200));
+        assert_eq!(g.extra_args, vec!["--debug"]);
+        assert_eq!(g.bwrap, "/usr/bin/bwrap");
+        assert_eq!(g.box_ro, vec!["~/.cargo", "/opt/rust"]);
+        assert_eq!(g.box_path, "/usr/bin");
+        let e = env(&[("HOME", "/home/u")]);
+        assert_eq!(g.root_in(&e), PathBuf::from("/home/u/goose-root"));
+
+        let base = g.env_for("other-model");
+        assert_eq!(base["OPENAI_BASE_URL"], "http://127.0.0.1:8080/v1");
+        assert_eq!(base.len(), 2);
+        let qwen = g.env_for("qwen3-coder-30b");
+        assert_eq!(qwen["OPENAI_BASE_URL"], "http://127.0.0.1:8081/v1");
+        assert_eq!(qwen["OPENAI_API_KEY"], "none");
+    }
+
+    #[test]
+    fn goose_values_that_cannot_work_are_refused_at_load() {
+        for (text, needle) in [
+            (
+                "[goose]
+tool_wait_s = 0
+",
+                "tool_wait_s",
+            ),
+            (
+                "[goose]
+tool_wait_s = 281
+",
+                "tool_wait_s",
+            ),
+            (
+                "[goose]
+max_turns = 0
+",
+                "max_turns",
+            ),
+            (
+                "[goose]
+provider = \" \"
+",
+                "provider",
+            ),
+            (
+                "[goose]
+bwrap = \"\"
+",
+                "bwrap",
+            ),
+            (
+                "[goose]
+bwrap = \"tools/bwrap\"
+",
+                "[goose] bwrap must be a bare name",
+            ),
+            (
+                "[goose]
+bwrap = \"./bwrap\"
+",
+                "[goose] bwrap must be a bare name",
+            ),
+            (
+                "[goose]
+root = \"rel/goose\"
+",
+                "root",
+            ),
+            (
+                "[goose]
+box_ro = [\"rel\"]
+",
+                "box_ro",
+            ),
+            (
+                "[goose.env]
+\"A=B\" = \"x\"
+",
+                "[goose.env]",
+            ),
+            (
+                "[goose.models.m]
+env = { \"\" = \"x\" }
+",
+                "[goose.models.\"m\"] env",
+            ),
+            (
+                "[goose]
+model = \"x\"
+",
+                "unknown field",
+            ),
+            (
+                "[goose.models.m]
+envv = {}
+",
+                "unknown field",
+            ),
+        ] {
+            let err = format!("{:#}", site_cfg(text).unwrap_err());
+            assert!(err.contains(needle), "{text}: {err}");
+        }
+        for ok in [
+            "[goose]
+tool_wait_s = 1
+",
+            "[goose]
+tool_wait_s = 280
+",
+            "[goose]
+root = \"/srv/goose\"
+",
+            "[goose]
+root = \"~\"
+",
+        ] {
+            site_cfg(ok).unwrap_or_else(|e| panic!("{ok}: {e:#}"));
+        }
+    }
+
+    #[test]
+    fn goose_telemetry_variables_are_refused_in_every_env_table() {
+        for key in [
+            "GOOSE_TELEMETRY_OFF",
+            "GOOSE_TELEMETRY_ENABLED",
+            "OTEL_SDK_DISABLED",
+            "LANGFUSE_PUBLIC_KEY",
+            "LANGFUSE_SECRET_KEY",
+            "LANGFUSE_INIT_PROJECT_PUBLIC_KEY",
+            "LANGFUSE_INIT_PROJECT_SECRET_KEY",
+            "LANGFUSE_HOST",
+        ] {
+            for (text, table) in [
+                (format!("[goose.env]\n{key} = \"x\"\n"), "[goose.env]"),
+                (
+                    format!("[goose.models.m]\nenv = {{ {key} = \"x\" }}\n"),
+                    "[goose.models.\"m\"] env",
+                ),
+            ] {
+                let err = format!("{:#}", site_cfg(&text).unwrap_err());
+                assert!(err.contains(table), "{text}: {err}");
+                assert!(err.contains(&format!("{key:?}")), "{text}: {err}");
+                assert!(err.contains("telemetry is always off"), "{text}: {err}");
+            }
+        }
+        let g = site_cfg(
+            "[goose.env]
+OPENAI_BASE_URL = \"http://127.0.0.1:8090/v1\"
+OTEL_EXPORTER_OTLP_ENDPOINT = \"http://127.0.0.1:4318\"
+[goose.models.m]
+env = { OPENAI_API_KEY = \"none\" }
+",
+        )
+        .unwrap()
+        .goose;
+        assert_eq!(g.env["OPENAI_BASE_URL"], "http://127.0.0.1:8090/v1");
+    }
+
+    #[test]
+    fn goose_isolation_variables_are_refused_in_every_env_table() {
+        for key in ["HOME", "HTTPS_PROXY", "https_proxy", "CCC_GOOSE_HOST_ENV"] {
+            for (text, table) in [
+                (format!("[goose.env]\n{key} = \"x\"\n"), "[goose.env]"),
+                (
+                    format!("[goose.models.m]\nenv = {{ {key} = \"x\" }}\n"),
+                    "[goose.models.\"m\"] env",
+                ),
+            ] {
+                let err = format!("{:#}", site_cfg(&text).unwrap_err());
+                assert!(err.contains(table), "{text}: {err}");
+                assert!(err.contains(&format!("{key:?}")), "{text}: {err}");
+                assert!(err.contains("Goose's isolation"), "{text}: {err}");
+            }
+        }
+        let g = site_cfg(
+            "[goose.env]\nNO_PROXY = \"llm.example\"\nno_proxy = \"llm.example\"\nHTTP_PROXY = \"http://p:3128\"\nALL_PROXY = \"http://p:3128\"\n",
+        )
+        .unwrap()
+        .goose;
+        assert_eq!(g.env["NO_PROXY"], "llm.example");
+    }
+
+    #[test]
+    fn goose_in_the_agents_config_is_refused_with_the_wrong_file_message() {
+        let err = format!(
+            "{:#}",
+            agents_cfg(
+                "[goose]
+"
+            )
+            .unwrap_err()
+        );
+        assert!(
+            err.contains("`goose` belongs in the site config, not the agents config."),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn box_ro_entries_are_expanded_and_canonicalised_when_resolved() {
+        let home = crate::testutil::TempDir::new("goose-box-ro");
+        std::fs::create_dir_all(home.path().join("real/.cargo")).unwrap();
+        std::os::unix::fs::symlink(home.path().join("real"), home.path().join("link")).unwrap();
+        home.write_file("file", "", 0o600);
+        let canonical_home = std::fs::canonicalize(home.path()).unwrap();
+        let e = env(&[("HOME", home.path().to_str().unwrap())]);
+        let g = site_cfg(
+            "[goose]
+box_ro = [\"~/link/.cargo\"]
+",
+        )
+        .unwrap()
+        .goose;
+        assert_eq!(
+            g.box_ro_in(&e).unwrap(),
+            vec![canonical_home.join("real/.cargo")]
+        );
+        for (entry, needle) in [("~/missing", "missing"), ("~/file", "not a directory")] {
+            let g = site_cfg(&format!(
+                "[goose]
+box_ro = [\"{entry}\"]
+"
+            ))
+            .unwrap()
+            .goose;
+            let err = format!("{:#}", g.box_ro_in(&e).unwrap_err());
+            assert!(err.contains("box_ro") && err.contains(needle), "{err}");
+        }
     }
 
     #[test]

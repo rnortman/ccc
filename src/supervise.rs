@@ -168,22 +168,54 @@ fn managed_signals(group: bool) -> [libc::c_int; 3] {
     }
 }
 
+/// The signals the supervisor manages, as a set.
 #[cfg(unix)]
-fn block_signals(group: bool) -> Result<()> {
+pub(crate) fn managed_set(group: bool) -> libc::sigset_t {
+    // SAFETY: an all-zero sigset_t is a valid value that sigemptyset then
+    // initialises; the signals added are valid.
     unsafe {
-        let signals = managed_signals(group);
         let mut set = std::mem::zeroed();
         libc::sigemptyset(&mut set);
-        for sig in signals {
+        for sig in managed_signals(group) {
             if sig != 0 {
                 libc::sigaddset(&mut set, sig);
             }
         }
-        if libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) != 0 {
-            return Err(std::io::Error::last_os_error()).context("blocking harness signals");
-        }
+        set
     }
-    Ok(())
+}
+
+/// Blocks the managed signals in the calling thread, so threads it starts
+/// inherit the mask and only a waiter receives them.
+#[cfg(unix)]
+pub(crate) fn block_signals(group: bool) -> Result<()> {
+    let set = managed_set(group);
+    // SAFETY: `set` is an initialised sigset_t.
+    match unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) } {
+        0 => Ok(()),
+        rc => Err(std::io::Error::from_raw_os_error(rc)).context("blocking harness signals"),
+    }
+}
+
+/// Makes `cmd`'s child start with no signal blocked, whatever the spawning
+/// thread's mask.
+#[cfg(unix)]
+pub(crate) fn unmask_signals_on_exec(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure runs between fork and exec and calls only
+    // async-signal-safe functions, without allocating.
+    unsafe {
+        cmd.pre_exec(|| {
+            let mut set = std::mem::zeroed();
+            if libc::sigemptyset(&mut set) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            match libc::pthread_sigmask(libc::SIG_SETMASK, &set, std::ptr::null_mut()) {
+                0 => Ok(()),
+                rc => Err(std::io::Error::from_raw_os_error(rc)),
+            }
+        });
+    }
 }
 
 #[cfg(not(unix))]
@@ -199,17 +231,7 @@ fn spawn_child(inv: &Invocation, opts: &SuperviseOpts<'_>) -> Result<Child> {
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
     }
-    unsafe {
-        cmd.pre_exec(|| {
-            let mut set = std::mem::zeroed();
-            if libc::sigemptyset(&mut set) != 0
-                || libc::pthread_sigmask(libc::SIG_SETMASK, &set, std::ptr::null_mut()) != 0
-            {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    unmask_signals_on_exec(&mut cmd);
     if opts.detach_group {
         cmd.process_group(0);
     }
@@ -317,15 +339,7 @@ fn waiter(
         let timeout = deadline
             .map(|d: Instant| d.saturating_duration_since(Instant::now()))
             .unwrap_or(Duration::from_secs(86400));
-        let mut set = unsafe { std::mem::zeroed() };
-        unsafe {
-            libc::sigemptyset(&mut set);
-            for sig in managed_signals(opts.detach_group) {
-                if sig != 0 {
-                    libc::sigaddset(&mut set, sig);
-                }
-            }
-        }
+        let set = managed_set(opts.detach_group);
         let ts = libc::timespec {
             tv_sec: timeout.as_secs() as _,
             tv_nsec: timeout.subsec_nanos() as _,

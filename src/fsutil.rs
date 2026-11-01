@@ -57,10 +57,60 @@ pub fn write_atomically(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
+/// Makes `dir` a directory only this user can enter. Missing ancestors are
+/// created with the process umask; a missing `dir` is created with mode 0700,
+/// and an existing one is narrowed to 0700.
+pub fn ensure_private_dir(dir: &Path) -> Result<()> {
+    if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => {}
+        Err(e) => return Err(e).with_context(|| format!("creating {}", dir.display())),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("securing {}", dir.display()))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testutil::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_private_dir_is_created_0700_and_an_existing_one_narrowed() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = TempDir::new("fsutil-private");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        let fresh = base.path().join("a/b");
+        ensure_private_dir(&fresh).unwrap();
+        assert_eq!(mode(&fresh), 0o700);
+
+        let wide = base.path().join("wide");
+        std::fs::create_dir(&wide).unwrap();
+        std::fs::set_permissions(&wide, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_private_dir(&wide).unwrap();
+        assert_eq!(mode(&wide), 0o700);
+
+        let file = base.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        assert!(ensure_private_dir(&file).is_err());
+    }
 
     #[test]
     fn a_new_file_is_created_private_and_no_temp_is_left_behind() {

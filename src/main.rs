@@ -8,6 +8,8 @@ mod config;
 mod exec;
 mod fsutil;
 mod glob;
+mod goose_policy;
+mod goose_tools;
 mod harness;
 mod output;
 mod procs;
@@ -24,7 +26,7 @@ use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use jiff::Timestamp;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::agents::AgentDef;
 use crate::config::{Config, Effort, Harness, ProcessEnv};
@@ -62,6 +64,9 @@ enum Command {
     Launch(LaunchArgs),
     #[command(hide = true)]
     Hook(HookArgs),
+    /// The MCP tool servers a Goose run uses as its extensions.
+    #[command(hide = true)]
+    GooseTools(GooseToolsArgs),
 }
 
 #[derive(Debug, Args)]
@@ -124,6 +129,22 @@ struct RunArgs {
     /// Force a harness.
     #[arg(long, value_parser = parse_harness)]
     harness: Option<Harness>,
+    /// Goose only: a directory the agent may also read. Repeatable.
+    #[arg(long, value_name = "DIR")]
+    allow_read: Vec<PathBuf>,
+    /// Goose only: a directory the agent may also write; needs `write` in
+    /// `goose_tools`. Repeatable.
+    #[arg(long, value_name = "DIR")]
+    allow_write: Vec<PathBuf>,
+    /// Goose only: a directory the agent's `ccc_run` may use as a child's
+    /// working directory; needs `ccc` in `goose_tools`. Repeatable.
+    #[arg(long, value_name = "DIR")]
+    allow_exec: Vec<PathBuf>,
+    /// Set by `ccc goose-tools` on the runs it starts: write and exec roots
+    /// come from `--allow-write`/`--allow-exec` only, and paths must already
+    /// be canonical.
+    #[arg(long, hide = true)]
+    goose_nested: bool,
     /// Emit a JSON object instead of text plus a trailer line.
     #[arg(long)]
     json: bool,
@@ -188,9 +209,47 @@ struct LaunchArgs {
     /// Without an agent type: Claude effort.
     #[arg(long, value_parser = parse_claude_effort, conflicts_with_all = ["agent", "resume"])]
     effort: Option<Effort>,
+    /// Goose only: a directory the agent may also read. Repeatable.
+    #[arg(
+        long,
+        value_name = "DIR",
+        conflicts_with = "resume",
+        requires = "agent"
+    )]
+    allow_read: Vec<PathBuf>,
+    /// Goose only: a directory the agent may also write; needs `write` in
+    /// `goose_tools`. Repeatable.
+    #[arg(
+        long,
+        value_name = "DIR",
+        conflicts_with = "resume",
+        requires = "agent"
+    )]
+    allow_write: Vec<PathBuf>,
+    /// Goose only: a directory the agent's `ccc_run` may use as a child's
+    /// working directory; needs `ccc` in `goose_tools`. Repeatable.
+    #[arg(
+        long,
+        value_name = "DIR",
+        conflicts_with = "resume",
+        requires = "agent"
+    )]
+    allow_exec: Vec<PathBuf>,
     /// Arguments passed through to the harness verbatim; everything after `--`.
     #[arg(last = true, allow_hyphen_values = true)]
     passthrough: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct GooseToolsArgs {
+    #[arg(long, value_enum)]
+    role: goose_tools::Role,
+    /// The hex-encoded confinement policy.
+    #[arg(long)]
+    policy: String,
+    /// The longest a `shell` call may run, in seconds; `box-inner` only.
+    #[arg(long)]
+    tool_wait_s: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -250,6 +309,9 @@ fn launch_target(args: &LaunchArgs) -> exec::LaunchTarget<'_> {
                 agent,
                 cwd: args.cwd.as_deref(),
                 cli_harness: args.harness,
+                allow_read: &args.allow_read,
+                allow_write: &args.allow_write,
+                allow_exec: &args.allow_exec,
             },
             None => exec::LaunchTarget::Roleless {
                 cwd: args.cwd.as_deref(),
@@ -273,6 +335,12 @@ fn dispatch(cli: Cli) -> Result<i32> {
             args.prompt_file.as_deref(),
             args.profile.as_deref(),
             args.harness,
+            &exec::GooseFlags {
+                allow_read: args.allow_read,
+                allow_write: args.allow_write,
+                allow_exec: args.allow_exec,
+                nested: args.goose_nested,
+            },
             args.json,
         ),
         Command::Resume(args) => exec::resume(
@@ -287,10 +355,14 @@ fn dispatch(cli: Cli) -> Result<i32> {
             let passthrough = std::mem::take(&mut args.passthrough);
             exec::launch(launch_target(&args), args.profile.as_deref(), passthrough)
         }
+        Command::GooseTools(args) => goose_tools::run(args.role, &args.policy, args.tool_wait_s),
         Command::Hook(args) => {
             let mut stdin = std::io::stdin();
             let mut stdout = std::io::stdout();
             let mut stderr = std::io::stderr();
+            if !restore_for_hook(args.kind, args.payload.is_some(), &mut stdin, &mut stderr) {
+                return Ok(0);
+            }
             Ok(dispatch_hook(
                 args.kind,
                 args.payload,
@@ -342,6 +414,34 @@ fn kill(args: KillArgs) -> Result<i32> {
         &mut std::io::stdout(),
         &mut std::io::stderr(),
     )
+}
+
+/// For a Goose hook, puts back the host's environment Goose's empty home and
+/// HTTPS sink replaced, before the audit directory is read. On a failure it
+/// says so, drains an unread payload and returns false: the hook records
+/// nothing and still allows, since a non-zero exit is a Goose deny verdict.
+fn restore_for_hook(
+    kind: audit::HookKind,
+    payload_given: bool,
+    input: &mut dyn Read,
+    diagnostic: &mut dyn Write,
+) -> bool {
+    if !matches!(
+        kind,
+        audit::HookKind::GooseSessionStart | audit::HookKind::GooseStop
+    ) {
+        return true;
+    }
+    match harness::goose::restore_host_env() {
+        Ok(()) => true,
+        Err(e) => {
+            let _ = writeln!(diagnostic, "ccc: {e:#}");
+            if !payload_given {
+                let _ = std::io::copy(input, &mut std::io::sink());
+            }
+            false
+        }
+    }
 }
 
 fn dispatch_hook(
@@ -438,9 +538,20 @@ fn which_with(
         config_path_text(&ctx.sources.agents)
     )?;
     let def = AgentDef::load(&ctx.cfg.agents_dir_in(ctx.env), agent)?;
-    let (r, notes) = resolve::resolve(ctx.cfg, ctx.env, &def, cli_harness)?;
+    let (mut r, notes) = resolve::resolve(ctx.cfg, ctx.env, &def, cli_harness)?;
     for note in &notes {
         writeln!(err, "note: {note}")?;
+    }
+    if r.harness == Harness::Goose {
+        let cwd = std::env::current_dir()?;
+        match exec::goose_policy(ctx.cfg, ctx.env, &def, &cwd, &exec::GooseFlags::default()) {
+            Ok(policy) => r.goose = Some(policy),
+            Err(e) => writeln!(
+                err,
+                "note: a run in {} with no --allow-* flags would be refused: {e:#}",
+                cwd.display()
+            )?,
+        }
     }
     let prompt = if def.overlays.contains_key(&r.harness) {
         format!("{}.{}.md", agent, r.harness)
@@ -463,7 +574,7 @@ fn which_with(
                 &[],
             )?)
         }
-        Harness::Codex => None,
+        Harness::Codex | Harness::Goose => None,
     };
     if let Some(c) = &choice {
         c.report();
@@ -514,6 +625,7 @@ fn which_output(
             "profile": choice.map(|c| c.account.profile.clone()),
             "degraded": choice.and_then(|c| c.degraded.clone()),
             "candidates": candidates,
+            "goose_policy": r.goose,
             "config": sources.site.path.path.to_string_lossy(),
             "agents_config": sources.agents.path.path.to_string_lossy(),
         });
@@ -532,6 +644,10 @@ fn which_output(
         if r.harness == Harness::Claude && choice.is_none() {
             out.push('\n');
             out.push_str(AMBIENT_LINE);
+        }
+        if let Some(p) = &r.goose {
+            out.push('\n');
+            out.push_str(&goose_policy_line(p));
         }
         if let Some(c) = choice {
             out.push_str(&format!(
@@ -569,6 +685,28 @@ fn which_output(
         }
         Ok(out)
     }
+}
+
+/// The Goose policy as one line: tools, allowlisted agents and each root set,
+/// `-` for an empty list.
+fn goose_policy_line(p: &goose_policy::GoosePolicy) -> String {
+    fn list<T: AsRef<str>>(items: impl IntoIterator<Item = T>) -> String {
+        let joined: Vec<String> = items.into_iter().map(|i| i.as_ref().to_string()).collect();
+        if joined.is_empty() {
+            "-".into()
+        } else {
+            joined.join(",")
+        }
+    }
+    let roots = |rs: &[std::path::PathBuf]| list(rs.iter().map(|r| r.display().to_string()));
+    format!(
+        "goose_tools={} goose_agents={} read_roots={} write_roots={} exec_roots={}",
+        list(p.tools.iter().map(|t| t.as_str())),
+        list(&p.agents),
+        roots(&p.read_roots),
+        roots(&p.write_roots),
+        roots(&p.exec_roots),
+    )
 }
 
 /// One table cell for a number a profile may not have: a bucket the account
@@ -618,6 +756,7 @@ mod tests {
             tools: Some(vec!["Read".into(), "Grep".into()]),
             sandbox: Sandbox::ReadOnly,
             body: "body".into(),
+            goose: None,
         }
     }
 
@@ -788,6 +927,9 @@ mod tests {
                 agent: "explorer",
                 cwd: Some("/srv"),
                 cli_harness: Some(Harness::Codex),
+                allow_read: &[],
+                allow_write: &[],
+                allow_exec: &[],
             },
         );
         target(
@@ -797,6 +939,43 @@ mod tests {
                 fork: true,
             },
         );
+        target(
+            &[
+                "ccc",
+                "launch",
+                "gexplorer",
+                "--allow-read",
+                "/r",
+                "--allow-write",
+                "/w",
+                "--allow-exec",
+                "/e",
+                "--allow-read",
+                "/r2",
+            ],
+            exec::LaunchTarget::Fresh {
+                agent: "gexplorer",
+                cwd: None,
+                cli_harness: None,
+                allow_read: &[PathBuf::from("/r"), PathBuf::from("/r2")],
+                allow_write: &[PathBuf::from("/w")],
+                allow_exec: &[PathBuf::from("/e")],
+            },
+        );
+    }
+
+    #[test]
+    fn launch_allow_flags_need_an_agent_type_and_no_resume() {
+        for flag in ["--allow-read", "--allow-write", "--allow-exec"] {
+            for argv in [
+                vec!["ccc", "launch", "--resume", "ID", flag, "/d"],
+                vec!["ccc", "launch", flag, "/d"],
+            ] {
+                let err = Cli::try_parse_from(&argv).unwrap_err();
+                assert_eq!(err.exit_code(), 2, "{argv:?}");
+            }
+        }
+        assert!(Cli::try_parse_from(["ccc", "launch", "--goose-nested", "gexplorer"]).is_err());
     }
 
     #[test]
@@ -863,6 +1042,36 @@ mod tests {
         }
         let rendered = Cli::command().render_help().to_string();
         assert!(!rendered.contains("hook"));
+    }
+
+    #[test]
+    fn goose_tools_parses_each_role_and_stays_hidden() {
+        for (word, role) in [
+            ("host", goose_tools::Role::Host),
+            ("box", goose_tools::Role::Boxed),
+            ("box-inner", goose_tools::Role::BoxInner),
+        ] {
+            let parsed =
+                Cli::try_parse_from(["ccc", "goose-tools", "--role", word, "--policy", "7b7d"])
+                    .unwrap();
+            match parsed.command {
+                Command::GooseTools(args) => {
+                    assert_eq!(args.role, role);
+                    assert_eq!(args.policy, "7b7d");
+                    assert_eq!(args.tool_wait_s, None);
+                }
+                other => panic!("parsed as {other:?}"),
+            }
+        }
+        assert!(Cli::try_parse_from(["ccc", "goose-tools", "--policy", "7b7d"]).is_err());
+        assert!(
+            Cli::try_parse_from(["ccc", "goose-tools", "--role", "nope", "--policy", "7b7d"])
+                .is_err()
+        );
+        assert!(!Cli::command()
+            .render_help()
+            .to_string()
+            .contains("goose-tools"));
     }
 
     #[test]
@@ -954,6 +1163,84 @@ mod tests {
         fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
             Err(std::io::Error::other("test read"))
         }
+    }
+
+    /// `ccc hook goose-stop` run as Goose runs it: an empty `HOME`,
+    /// `CCC_GOOSE_HOST_ENV` set to `host_env`, and `payload` on stdin.
+    fn goose_stop_hook(
+        empty_home: &Path,
+        host_env: &str,
+        trace: &str,
+        payload: &[u8],
+    ) -> std::process::Output {
+        let mut child = std::process::Command::new(crate::testutil::ccc_binary())
+            .args(["hook", "goose-stop"])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", empty_home)
+            .env(harness::goose::HOST_ENV_VAR, host_env)
+            .env("CCC_TRACE_ID", trace)
+            .env("CCC_PARENT_INVOCATION_ID", uuid::Uuid::new_v4().to_string())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(payload).unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    #[test]
+    fn a_goose_hook_writes_under_the_restored_home() {
+        let dir = TempDir::new("hook-goose-home");
+        let empty = dir.path().join("empty");
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&empty).unwrap();
+        // The launching ccc creates the audit directory.
+        std::fs::create_dir_all(real.join(".local/state/ccc/audit")).unwrap();
+        let trace = uuid::Uuid::new_v4().to_string();
+        let carried = crate::goose_policy::hex_encode(
+            serde_json::json!({"HOME": real, "HTTPS_PROXY": null})
+                .to_string()
+                .as_bytes(),
+        );
+        let out = goose_stop_hook(
+            &empty,
+            &carried,
+            &trace,
+            br#"{"session_id":"g1","last_assistant_message":"done"}"#,
+        );
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert!(out.stderr.is_empty(), "{out:?}");
+        let records = audit::read_trace(&real.join(".local/state/ccc/audit"), &trace).unwrap();
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_goose_hook_with_an_undecodable_host_env_records_nothing_and_allows() {
+        let dir = TempDir::new("hook-goose-bad-env");
+        let empty = dir.path().join("empty");
+        // Where a hook that went on under the unrestored home would record.
+        let audit_dir = empty.join(".local/state/ccc/audit");
+        std::fs::create_dir_all(&audit_dir).unwrap();
+        let trace = uuid::Uuid::new_v4().to_string();
+        // Over a pipe buffer: the write fails unless the hook drains it.
+        let payload = serde_json::json!({
+            "session_id": "g1",
+            "last_assistant_message": "x".repeat(256 * 1024),
+        })
+        .to_string();
+        let out = goose_stop_hook(&empty, "not hex", &trace, payload.as_bytes());
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(stderr.contains(harness::goose::HOST_ENV_VAR), "{stderr}");
+        assert_eq!(std::fs::read_dir(&audit_dir).unwrap().count(), 0);
+        let others: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(others, ["empty"]);
     }
 
     #[test]
@@ -1239,6 +1526,161 @@ mod tests {
         .unwrap();
         assert!(v["effort"].is_null());
         assert!(v["tools"].is_null());
+    }
+
+    #[test]
+    fn which_shows_the_goose_policy_both_ways() {
+        use std::collections::BTreeSet;
+        let mut r = resolved();
+        r.harness = Harness::Goose;
+        r.effort = None;
+        r.tools = None;
+        r.goose = Some(goose_policy::GoosePolicy {
+            tools: BTreeSet::from([goose_policy::GooseTool::Read, goose_policy::GooseTool::Ccc]),
+            agents: vec!["explorer".into(), "reviewer".into()],
+            read_roots: vec!["/w".into(), "/r".into()],
+            write_roots: vec![],
+            exec_roots: vec!["/e".into()],
+        });
+        let text = which_output(&r, None, "explorer.md", &test_sources(), false).unwrap();
+        assert_eq!(
+            text.lines().nth(1),
+            Some("goose_tools=read,ccc goose_agents=explorer,reviewer read_roots=/w,/r write_roots=- exec_roots=/e")
+        );
+        let v: serde_json::Value = serde_json::from_str(
+            &which_output(&r, None, "explorer.md", &test_sources(), true).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            v["goose_policy"]["agents"],
+            serde_json::json!(["explorer", "reviewer"])
+        );
+        assert_eq!(v["goose_policy"]["exec_roots"], serde_json::json!(["/e"]));
+        assert_eq!(
+            v["goose_policy"]["tools"],
+            serde_json::json!(["read", "ccc"])
+        );
+        assert!(serde_json::from_str::<serde_json::Value>(
+            &which_output(&resolved(), None, "explorer.md", &test_sources(), true).unwrap()
+        )
+        .unwrap()["goose_policy"]
+            .is_null());
+    }
+
+    #[test]
+    fn which_computes_the_goose_policy_or_notes_its_refusal() {
+        use crate::usage::{UsageReport, UsageSource};
+        let dir = TempDir::new("which-goose");
+        std::fs::create_dir_all(dir.path().join("agents")).unwrap();
+        std::fs::write(
+            dir.path().join("agents/greader.md"),
+            "---\nname: greader\ndescription: Reads\nharness: goose\ngoose_model: qwen3\ngoose_tools: read\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("agents/gwriter.md"),
+            "---\nname: gwriter\ndescription: Writes\nharness: goose\ngoose_model: qwen3\ngoose_tools: write\n---\nbody\n",
+        )
+        .unwrap();
+        let cfg = Config {
+            agents_dir: Some(dir.path().join("agents").display().to_string()),
+            ..Config::default()
+        };
+        // A relative PATH entry refuses every write-capable run, whatever the cwd.
+        let env: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::from([
+            (
+                "XDG_CONFIG_HOME".to_string(),
+                dir.path().join("xdg").display().to_string(),
+            ),
+            ("PATH".to_string(), "relative/bin:/usr/bin".to_string()),
+        ]);
+        let mut sources = sources_in(&env);
+        sources.site.read = false;
+        let usage = || {
+            UsageSource::Report(UsageReport {
+                profiles: vec![],
+                daemon_status: None,
+            })
+        };
+        let ctx = WhichCtx {
+            cfg: &cfg,
+            sources: &sources,
+            env: &env,
+            now: Timestamp::now(),
+            usage: &usage,
+        };
+        let given = std::env::current_dir().unwrap();
+        let cwd = std::fs::canonicalize(&given).unwrap();
+
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        which_with(&ctx, "greader", None, false, &mut out, &mut err).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(
+            text.lines().nth(1),
+            Some(
+                format!(
+                    "goose_tools=read goose_agents=- read_roots={} write_roots=- exec_roots=-",
+                    cwd.display()
+                )
+                .as_str()
+            ),
+            "{text}"
+        );
+
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        which_with(&ctx, "gwriter", None, false, &mut out, &mut err).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let err = String::from_utf8(err).unwrap();
+        assert!(
+            err.contains(&format!(
+                "note: a run in {} with no --allow-* flags would be refused",
+                given.display()
+            )),
+            "{err}"
+        );
+        assert!(!text.contains("goose_tools="), "{text}");
+    }
+
+    #[test]
+    fn run_takes_the_goose_flags_and_resume_refuses_them() {
+        let cli = Cli::try_parse_from([
+            "ccc",
+            "run",
+            "g",
+            "--allow-read",
+            "/r",
+            "--allow-read",
+            "/r2",
+            "--allow-write",
+            "/w",
+            "--allow-exec",
+            "/e",
+            "--goose-nested",
+            "p",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Run(a) => {
+                assert_eq!(
+                    a.allow_read,
+                    vec![PathBuf::from("/r"), PathBuf::from("/r2")]
+                );
+                assert_eq!(a.allow_write, vec![PathBuf::from("/w")]);
+                assert_eq!(a.allow_exec, vec![PathBuf::from("/e")]);
+                assert!(a.goose_nested);
+            }
+            other => panic!("{other:?}"),
+        }
+        for flag in ["--allow-read", "--allow-write", "--allow-exec"] {
+            let err = Cli::try_parse_from(["ccc", "resume", "s", flag, "/d"]).unwrap_err();
+            assert_eq!(err.exit_code(), EXIT_USAGE, "{flag}");
+        }
+        assert!(Cli::try_parse_from(["ccc", "resume", "s", "--goose-nested"]).is_err());
+        let help = Cli::try_parse_from(["ccc", "run", "--help"])
+            .unwrap_err()
+            .to_string();
+        assert!(help.contains("--allow-exec"), "{help}");
+        assert!(!help.contains("--goose-nested"), "{help}");
     }
 
     #[test]

@@ -47,6 +47,26 @@ impl Drop for TempDir {
     }
 }
 
+/// The `ccc` binary beside this test executable. `cargo test` builds it
+/// because `tests/cli_binary.rs` is an integration-test target;
+/// `cargo test --bin ccc` selects no integration test and does not.
+#[cfg(target_os = "linux")]
+pub fn ccc_binary() -> PathBuf {
+    let binary = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("ccc");
+    assert!(
+        binary.is_file(),
+        "{} is missing: run `cargo test` without `--bin ccc`",
+        binary.display()
+    );
+    binary
+}
+
 #[cfg(target_os = "linux")]
 pub struct BoundedChild {
     child: Option<Child>,

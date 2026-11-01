@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agents::Sandbox;
 use crate::config::{ClaudeAuth, Effort, EnvSource, Harness};
+use crate::goose_policy::GoosePolicy;
 
 /// One recorded session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +49,13 @@ pub struct SessionRecord {
     /// The session this one was forked from, when it was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forked_from: Option<String>,
+    /// Goose only: the confinement policy fixed when the session was created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goose_policy: Option<GoosePolicy>,
+    /// Goose only: a `ccc launch` has opened this session at a terminal, where
+    /// the human may have added tools to it. Never cleared.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub opened_at_terminal: bool,
 }
 
 /// An advisory per-session exclusion lock. The file is deliberately retained
@@ -191,6 +199,8 @@ mod tests {
             trace: None,
             inv: None,
             forked_from: None,
+            goose_policy: None,
+            opened_at_terminal: false,
         }
     }
 

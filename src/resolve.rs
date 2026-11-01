@@ -10,6 +10,7 @@ use crate::config::{
     blank_to_none, env_agent_key, env_override, env_value, AgentOverrides, Config, Effort,
     EnvSource, Harness,
 };
+use crate::goose_policy::GoosePolicy;
 
 /// Everything a harness driver needs about one run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +26,9 @@ pub struct Resolved {
     /// Codex only.
     pub sandbox: Sandbox,
     pub body: String,
+    /// Goose only: the confinement policy. [`resolve`] leaves it `None` for
+    /// the caller to fill in.
+    pub goose: Option<GoosePolicy>,
 }
 
 impl Resolved {
@@ -220,9 +224,10 @@ pub fn resolve(
     let agent = def.name.as_str();
     let (harness, _source, notes) = resolve_harness(cfg, env, def, cli_harness)?;
 
-    let (model_env, effort_env) = match harness {
-        Harness::Claude => ("MODEL", "EFFORT"),
-        Harness::Codex => ("CODEX_MODEL", "CODEX_EFFORT"),
+    let (model_env, model_key) = match harness {
+        Harness::Claude => ("MODEL", "model"),
+        Harness::Codex => ("CODEX_MODEL", "codex_model"),
+        Harness::Goose => ("GOOSE_MODEL", "goose_model"),
     };
 
     let model = pick(
@@ -233,37 +238,41 @@ pub fn resolve(
         |o| match harness {
             Harness::Claude => o.model.clone(),
             Harness::Codex => o.codex_model.clone(),
+            Harness::Goose => o.goose_model.clone(),
         },
         || match harness {
             Harness::Claude => def.model.clone(),
             Harness::Codex => def.codex_model.clone(),
+            Harness::Goose => def.goose_model.clone(),
         },
     );
 
     let Some(model) = model else {
         bail!(
-            "agent type {agent:?} has no {harness} model: its definition names no `{}` and nothing overrides one",
-            match harness {
-                Harness::Claude => "model",
-                Harness::Codex => "codex_model",
-            }
+            "agent type {agent:?} has no {harness} model: its definition names no `{model_key}` and nothing overrides one"
         );
     };
 
-    let effort = pick(
-        cfg,
-        env,
-        agent,
-        effort_env,
-        |o| match harness {
-            Harness::Claude => o.effort.clone(),
-            Harness::Codex => o.codex_effort.clone(),
-        },
-        || match harness {
-            Harness::Claude => def.effort.clone(),
-            Harness::Codex => def.codex_effort.clone(),
-        },
-    );
+    // Goose has no reasoning-effort setting, so it has no effort rungs.
+    let effort = match harness {
+        Harness::Claude => pick(
+            cfg,
+            env,
+            agent,
+            "EFFORT",
+            |o| o.effort.clone(),
+            || def.effort.clone(),
+        ),
+        Harness::Codex => pick(
+            cfg,
+            env,
+            agent,
+            "CODEX_EFFORT",
+            |o| o.codex_effort.clone(),
+            || def.codex_effort.clone(),
+        ),
+        Harness::Goose => None,
+    };
     let effort = match effort {
         Some(e) => Some(
             Effort::parse_for(&e, harness)
@@ -282,6 +291,7 @@ pub fn resolve(
             tools: def.tools.clone(),
             sandbox: def.codex_sandbox,
             body: def.body_for(harness).to_string(),
+            goose: None,
         },
         notes,
     ))
@@ -320,6 +330,7 @@ pub fn resolve_roleless(
         tools: None,
         sandbox: Sandbox::default(),
         body: String::new(),
+        goose: None,
     })
 }
 
@@ -873,5 +884,123 @@ mod tests {
         let (r, _) = resolve(&agents_cfg(""), &env(&[]), &d, None).unwrap();
         assert_eq!(r.effort, None);
         assert_eq!(r.tools, None);
+    }
+
+    fn goose_def() -> AgentDef {
+        AgentDef::parse(
+            "---\nname: explorer\ndescription: d\nharness: goose, claude\nmodel: def-claude\neffort: low\ngoose_model: def-goose\n---\nbody\n",
+            "explorer",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn goose_model_follows_every_rung_of_the_ladder() {
+        let c = agents_cfg(
+            "[agents.explorer]\ngoose_model = \"agent-goose\"\n[agents.\"*\"]\ngoose_model = \"star-goose\"\nmodel = \"star-claude\"\n",
+        );
+        let d = goose_def();
+        let goose = |cfg: &Config, pairs: &[(&str, &str)], d: &AgentDef| {
+            resolve(cfg, &env(pairs), d, None).unwrap().0
+        };
+        let r = goose(
+            &c,
+            &[
+                ("CCC_GOOSE_MODEL_EXPLORER", "env-goose"),
+                ("CCC_GOOSE_MODEL_ALL", "all-goose"),
+                ("CCC_MODEL_EXPLORER", "env-claude"),
+            ],
+            &d,
+        );
+        assert_eq!(r.harness, Harness::Goose);
+        assert_eq!(r.model, "env-goose");
+        assert_eq!(
+            goose(&c, &[("CCC_GOOSE_MODEL_ALL", "all-goose")], &d).model,
+            "all-goose"
+        );
+        assert_eq!(goose(&c, &[], &d).model, "agent-goose");
+        let wildcard = agents_cfg("[agents.\"*\"]\ngoose_model = \"star-goose\"\n");
+        assert_eq!(goose(&wildcard, &[], &d).model, "star-goose");
+        assert_eq!(goose(&agents_cfg(""), &[], &d).model, "def-goose");
+    }
+
+    #[test]
+    fn goose_resolves_no_effort_and_its_overlay_body() {
+        let mut d = goose_def();
+        d.overlays.insert(Harness::Goose, "goose body".into());
+        let (r, _) = resolve(
+            &agents_cfg("[agents.\"*\"]\neffort = \"high\"\n"),
+            &env(&[("CCC_EFFORT_ALL", "max")]),
+            &d,
+            None,
+        )
+        .unwrap();
+        assert_eq!(r.harness, Harness::Goose);
+        assert_eq!(r.effort, None);
+        assert_eq!(r.body, "goose body");
+        let (r, _) = resolve(&agents_cfg(""), &env(&[]), &d, Some(Harness::Claude)).unwrap();
+        assert_eq!(r.model, "def-claude");
+        assert_eq!(r.effort, Some(Effort::Low));
+        assert_eq!(r.body, "body");
+    }
+
+    #[test]
+    fn a_definition_without_a_policy_is_never_routed_to_goose() {
+        let d = def();
+        let (h, source, notes) = resolve_harness(
+            &agents_cfg("[agents.\"*\"]\nharness = \"goose\""),
+            &env(&[("CCC_HARNESS_ALL", "goose")]),
+            &d,
+            None,
+        )
+        .unwrap();
+        assert_eq!((h, source), (Harness::Claude, HarnessSource::Default));
+        assert_eq!(notes.len(), 2);
+        assert!(
+            notes[0].contains("CCC_HARNESS_ALL selected goose")
+                && notes[0].contains("allowed harnesses are: claude, codex; skipped"),
+            "{}",
+            notes[0]
+        );
+        assert!(
+            notes[1].contains("[agents.\"*\"] selected goose"),
+            "{}",
+            notes[1]
+        );
+
+        let (_, _, notes) = resolve_harness(
+            &agents_cfg("default_harness = \"goose\""),
+            &env(&[]),
+            &AgentDef::parse(
+                "---\nname: c\ndescription: d\nharness: claude, goose\nmodel: m\ngoose_model: q\n---\nbody\n",
+                "c",
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        assert!(notes.is_empty(), "{notes:?}");
+
+        for (cli, pairs) in [
+            (Some(Harness::Goose), vec![]),
+            (None, vec![("CCC_HARNESS_EXPLORER", "goose")]),
+        ] {
+            let err = resolve_harness(&agents_cfg(""), &env(&pairs), &d, cli)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("rejects harness goose") && err.contains("claude, codex"),
+                "{err}"
+            );
+        }
+        let err = resolve_harness(
+            &agents_cfg("default_harness = \"goose\""),
+            &env(&[]),
+            &d,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no allowed fallback harness"), "{err}");
     }
 }
