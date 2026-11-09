@@ -264,11 +264,9 @@ struct AgentsFile {
 const AGENTS_KEYS: &[&str] = &["agents_dir", "default_harness", "agents"];
 
 /// Model aliases every roleless launch knows; a `[launch.aliases]` entry of the
-/// same name wins.
-pub const BUILTIN_MODEL_ALIASES: &[(&str, &str)] = &[
-    ("opus", "claude-opus-5-5[1M]"),
-    ("fable", "claude-fable-5-1[1M]"),
-];
+/// same name wins. Each maps to Claude's own alias plus the 1M-context suffix,
+/// so Claude resolves the current model version and nothing here goes stale.
+pub const BUILTIN_MODEL_ALIASES: &[(&str, &str)] = &[("opus", "opus[1m]"), ("fable", "fable[1m]")];
 
 /// `[launch]`: a `ccc launch` with no agent type. Values are checked when such
 /// a launch resolves, so a bad one fails only that launch.
@@ -1126,7 +1124,7 @@ mod tests {
         assert_eq!(l.model, "opus");
         assert_eq!(l.effort, None);
         assert!(l.aliases.is_empty());
-        assert_eq!(l.expand(&l.model), "claude-opus-5-5[1M]");
+        assert_eq!(l.expand(&l.model), "opus[1m]");
     }
 
     #[test]
@@ -1136,16 +1134,13 @@ mod tests {
         )
         .unwrap()
         .launch;
-        assert_eq!(l.expand("opus"), "claude-opus-5-5[1M]");
+        assert_eq!(l.expand("opus"), "opus[1m]");
         assert_eq!(l.expand("fable"), "my-fable");
         assert_eq!(l.expand("haiku"), "claude-haiku-4-5");
         assert_eq!(l.expand("sonnet"), "sonnet");
         assert_eq!(l.expand("claude-opus-4-6[1M]"), "claude-opus-4-6[1M]");
         assert_eq!(l.expand("chain"), "opus");
-        assert_eq!(
-            LaunchConfig::default().expand("fable"),
-            "claude-fable-5-1[1M]"
-        );
+        assert_eq!(LaunchConfig::default().expand("fable"), "fable[1m]");
     }
 
     #[test]

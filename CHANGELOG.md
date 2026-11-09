@@ -40,6 +40,12 @@
 - `ccc which` on a Goose agent shows the directory grants a run would get.
 - Goose telemetry is always off, and Goose ignores your own Goose settings:
   it runs with an empty home directory and cannot download its model catalog.
+- **`--model fable` and `--model opus` now follow the current release.** The
+  built-in aliases expand to Claude's own aliases, `fable[1m]` and `opus[1m]`,
+  instead of pinned version strings, so Claude Code picks the current model
+  (Fable 5.2 today; `fable` was stuck on 5.1). The bundled example agents use
+  the same aliases. A `[launch.aliases]` entry still wins if you want to pin a
+  version.
 
 ## 0.3.0 — 2026-10-27
 

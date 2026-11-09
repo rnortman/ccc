@@ -292,8 +292,8 @@ Site config:
 model = "opus"              # an alias below or a full model string; default "opus"
 effort = "high"             # Claude --effort; optional, default: Claude's own
 [launch.aliases]            # layered over the built-ins; an entry here wins
-opus = "claude-opus-5-5[1M]"
-fable = "claude-fable-5-1[1M]"
+opus = "opus[1m]"
+fable = "fable[1m]"
 
 [claude]
 auth = "config-dir"        # config-dir: CLAUDE_CONFIG_DIR=<profiles_dir>/<profile>
@@ -618,8 +618,8 @@ The model is `--model`, else `[launch] model`, else `opus`; the effort is
 `--effort`, else `[launch] effort`, else Claude's own default. Environment
 overrides, `[agents.*]` and `[agents."*"]` do not apply: they configure agent
 types, and this launch has none. The model is looked up once in
-`[launch.aliases]`, then in the built-ins (`opus` → `claude-opus-5-5[1M]`,
-`fable` → `claude-fable-5-1[1M]`); any other name, such as a full model string
+`[launch.aliases]`, then in the built-ins (`opus` → `opus[1m]`,
+`fable` → `fable[1m]`, which Claude resolves to its current model); any other name, such as a full model string
 or Claude's own `sonnet`, is passed through verbatim. The account is scored
 against the expanded model, so `--model fable` picks a profile with Fable
 budget. A bad `[launch]` value fails only a roleless launch, naming the key,

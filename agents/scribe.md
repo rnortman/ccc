@@ -1,7 +1,7 @@
 ---
 name: scribe
 description: Writes the file it is told to write, with the content it is given.
-model: claude-fable-5-1[1M]
+model: fable[1m]
 effort: low
 tools: Read, Write, Edit, Glob, Grep
 codex_model: gpt-6-luna

@@ -1,7 +1,7 @@
 ---
 name: orchestrator
 description: Runs a multi-agent workflow by dispatching subagents through the ccc CLI.
-model: claude-opus-5-5[1M]
+model: opus[1m]
 effort: high
 codex_model: gpt-6-astra
 codex_effort: high

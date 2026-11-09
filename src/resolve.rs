@@ -370,7 +370,7 @@ mod tests {
     #[test]
     fn roleless_precedence_is_cli_then_launch_config_then_built_in() {
         let r = resolve_roleless(&agents_cfg(""), None, None).unwrap();
-        assert_eq!(r.model, "claude-opus-5-5[1M]");
+        assert_eq!(r.model, "opus[1m]");
         assert_eq!(r.effort, None);
         assert_eq!(r.agent, None);
         assert_eq!(r.harness, Harness::Claude);
@@ -379,11 +379,11 @@ mod tests {
 
         let c = site_cfg("[launch]\nmodel = \"fable\"\neffort = \"medium\"\n");
         let r = resolve_roleless(&c, None, None).unwrap();
-        assert_eq!(r.model, "claude-fable-5-1[1M]");
+        assert_eq!(r.model, "fable[1m]");
         assert_eq!(r.effort, Some(Effort::Medium));
 
         let r = resolve_roleless(&c, Some("opus"), Some(Effort::Max)).unwrap();
-        assert_eq!(r.model, "claude-opus-5-5[1M]");
+        assert_eq!(r.model, "opus[1m]");
         assert_eq!(r.effort, Some(Effort::Max));
 
         let r = resolve_roleless(&c, Some("claude-sonnet-4-5"), None).unwrap();
@@ -427,7 +427,7 @@ mod tests {
 
         let unused = blank_alias;
         let r = resolve_roleless(&unused, None, None).unwrap();
-        assert_eq!(r.model, "claude-opus-5-5[1M]");
+        assert_eq!(r.model, "opus[1m]");
     }
 
     #[test]

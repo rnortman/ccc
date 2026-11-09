@@ -8141,7 +8141,7 @@ mod tests {
             let i = args.iter().position(|a| a == flag).expect(flag);
             args[i + 1].clone()
         };
-        assert_eq!(after("--model"), "claude-fable-5-1[1M]");
+        assert_eq!(after("--model"), "fable[1m]");
         assert_eq!(after("--effort"), "high");
         assert!(!args.iter().any(|a| a == "--agent"), "{args:?}");
         assert!(!args.iter().any(|a| a == "--agents"), "{args:?}");
@@ -8151,7 +8151,7 @@ mod tests {
         let records = launch_records(&f);
         let spawn = spawn_of(&records);
         assert_eq!(spawn.payload.agent, None);
-        assert_eq!(spawn.payload.model, "claude-fable-5-1[1M]");
+        assert_eq!(spawn.payload.model, "fable[1m]");
         assert_eq!(spawn.payload.effort, Some(Effort::High));
         assert_eq!(spawn.payload.profile.as_deref(), Some("team04"));
         assert_eq!(spawn.payload.session.as_deref(), Some(preset.as_str()));
@@ -8161,7 +8161,7 @@ mod tests {
         assert!(json["agent"].is_null(), "{raw}");
         let saved = session::load_from(&f.sessions_dir(), &preset).unwrap();
         assert_eq!(saved.agent, None);
-        assert_eq!(saved.model, "claude-fable-5-1[1M]");
+        assert_eq!(saved.model, "fable[1m]");
         assert_eq!(saved.profile.as_deref(), Some("team04"));
         assert_eq!(saved.harness, Harness::Claude);
     }

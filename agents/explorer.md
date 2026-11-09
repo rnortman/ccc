@@ -1,7 +1,7 @@
 ---
 name: explorer
 description: Answers a few related questions about a codebase, with citations.
-model: claude-opus-5-5[1M]
+model: opus[1m]
 effort: low
 tools: Read, Grep, Glob, Bash
 codex_model: gpt-5.6-terra

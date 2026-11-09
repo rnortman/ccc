@@ -1975,17 +1975,19 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let eof = Arc::new(AtomicBool::new(false));
-        let wrote = Arc::new(AtomicBool::new(false));
-        let writer_wrote = Arc::clone(&wrote);
+        // The payload can exceed the pipe's capacity: a user over
+        // fs.pipe-user-pages-soft gets 8 KiB pipes. The writer then blocks
+        // until the reader drains it, and gets EPIPE once the reader stops and
+        // every read end closes, so its write errors are expected.
         let writer_thread = std::thread::spawn(move || {
             let mut writer = writer;
             let mut first = vec![b'x'; 16 * 1024];
             first[..6].copy_from_slice(b"first\n");
             let mut second = vec![b'y'; 16 * 1024];
             second[..6].copy_from_slice(b"later\n");
-            writer.write_all(&first).unwrap();
-            writer.write_all(&second).unwrap();
-            writer_wrote.store(true, Ordering::Release);
+            let _ = writer
+                .write_all(&first)
+                .and_then(|()| writer.write_all(&second));
         });
         let reader_stop = Arc::clone(&stop);
         let reader_bytes = Arc::clone(&bytes);
@@ -2007,15 +2009,6 @@ mod tests {
         let lines = Arc::new(Mutex::new(on_line));
         let (reader_result_tx, reader_result_rx) = std::sync::mpsc::sync_channel(1);
         let ready_deadline = Instant::now() + Duration::from_secs(5);
-        let writer_ready = loop {
-            if wrote.load(Ordering::Acquire) {
-                break true;
-            }
-            if Instant::now() >= ready_deadline {
-                break false;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
         let pipe_ready = loop {
             if Instant::now() >= ready_deadline {
                 break false;
@@ -2045,10 +2038,12 @@ mod tests {
         let captured_at_stop = line_seen_rx.recv_timeout(Duration::from_secs(1));
         let reader_result = reader_result_rx.recv_timeout(Duration::from_secs(1));
         let captured_after = bytes.lock().unwrap().len();
+        // Stop the reader before joining anything: the writer may be blocked
+        // on a full pipe and only unblocks once every read end is closed.
+        stop.store(true, Ordering::Release);
+        let reader_join = reader_thread.join();
         drop(probe);
         let writer_join = writer_thread.join();
-        let reader_join = reader_thread.join();
-        assert!(writer_ready, "writer never became ready");
         assert!(pipe_ready, "pipe never became readable");
         assert!(
             captured_at_stop.is_ok(),
