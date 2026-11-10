@@ -246,7 +246,7 @@ ccc reads two TOML files with disjoint keys:
 | | Site config | Agents config |
 |---|---|---|
 | Path | `CCC_CONFIG`, else `~/.config/ccc/config.toml` | `CCC_AGENTS_CONFIG`, else `~/.config/ccc/agents.toml` |
-| Keys | `[claude]`, `[codex]`, `[goose]`, `[mqtt]`, `[process]`, `[launch]` | `agents_dir`, `default_harness`, `[agents.*]` |
+| Keys | `[claude]`, `[codex]`, `[goose]`, `[mqtt]`, `[bus]`, `[process]`, `[launch]` | `agents_dir`, `default_harness`, `[agents.*]` |
 
 The site config describes the machine and the operator: accounts and how they
 are scored, Codex approval, the usage broker, kill grace, roleless-launch
@@ -321,8 +321,16 @@ mqtt_timeout_ms = 8000      # bounds the whole read: connect, fetch, disconnect
 five_hour_knee_pct = 60.0   # ramp from util5 40
 five_hour_floor_pct = 20.0  # excluded from util5 80
 
+[claude.api_keys.team]      # a Platform API key with a monthly budget; see "API key accounts"
+key_file = "~/.config/ccc/keys/team.key"
+budget_usd = 420.0
+models = ["*fable*"]
+
 [mqtt]                      # absent: the usage client's own config discovery
 config = "~/.config/claude-usage-mqtt/config.toml"
+
+[bus]                       # publishing to the agent tree; see "Bus"
+enabled = false
 
 [codex]
 approval = "never"
@@ -348,7 +356,10 @@ env = { OPENAI_BASE_URL = "http://127.0.0.1:8081/v1" }
 ccc does not model Goose's providers: endpoint settings are Goose's own
 environment variables (`OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OLLAMA_HOST`,
 …), set through `[goose.env]` or inherited from ccc's own environment, so a
-secret need not be in the file. Every inherited `GOOSE_*` variable is removed,
+secret need not be in the file. The exception is `ANTHROPIC_API_KEY` when an
+API key account is configured: ccc then removes it from every Goose child
+(see "API key accounts"), and a Goose provider that needs it must have it set
+in `[goose.env]`. Every inherited `GOOSE_*` variable is removed,
 together with `EXTENSIONS`, `PLUGINS`, `SLASH_COMMANDS`, `CONTEXT_FILE_NAMES`
 and `SECURITY_PROMPT_ENABLED`, because Goose reads its config keys from the
 environment first. ccc sets `GOOSE_PATH_ROOT`, `GOOSE_MODE=auto` and
@@ -441,8 +452,10 @@ inert in this mode, but a `[claude.selection.profile.<name>]` table is still
 refused, as it is for any name not in `profiles`. `--profile NAME` works as
 below.
 
-A non-empty `profiles` list turns on everything that follows. For a Claude run
-without `--profile`, `ccc` reads the retained
+A non-empty `profiles` list turns on everything that follows. With a profile,
+under either `auth`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and
+`CLAUDE_CODE_USE_*` are removed from the child as well, without a note. For a
+Claude run without `--profile`, `ccc` reads the retained
 `claude/usage/#` snapshots once and scores every configured profile that has a
 local credential:
 
@@ -556,6 +569,281 @@ together, after a hand-off, with the limited turn's native report. A
 continuation that ran but whose result could not be written fails as that
 write failure, not as exit 4. Codex limits are not recognised and stay
 exit 1.
+
+## API key accounts
+
+A Claude Platform API key with a monthly dollar budget — a Team plan's
+included API credit, say — can sit beside the subscription profiles as a last
+resort. `ccc` spends it only when no profile can take a turn, keeps its own
+estimate of what the key has spent this month, and stops using it when that
+estimate reaches the budget or when the Platform refuses a turn for spend.
+
+```toml
+[claude.api_keys.team]
+key_file = "~/.config/ccc/keys/team.key"   # required; mode 0600, one non-empty line
+budget_usd = 420.0                         # required; > 0
+models = ["*fable*"]                       # required; globs over the resolved model
+reserve_usd = 20.0                         # default 0; stop this far short of the budget
+reset_tz = "UTC"                           # default "UTC"; IANA zone of the monthly refill
+exhausted_patterns = ["*credit balance is too low*"]   # default as shown; globs over a failed turn's message
+```
+
+The table name (`team`) names the key everywhere: in the trailer's
+`profile=`, in `--json`, in the session sidecar and the audit log, where
+`auth` is `api-key`. It must be made of `[A-Za-z0-9._-]` and must not also be
+in `[claude] profiles`. `budget_usd` must be finite and positive,
+`reserve_usd` at least 0 and below `budget_usd`, `models` and
+`exhausted_patterns` non-empty, and `reset_tz` a known zone; each is refused
+by name at load. `models` has no default: nothing spends money on a model
+class you did not name. `[claude] auth = "api-key"` is refused — a key is an
+account of its own, not a way to authenticate profiles.
+
+`reset_tz` sets the month the budget counts: the included credit is assumed
+to refill at the start of the calendar month in UTC. Nothing in `ccc` checks
+that. If the Platform console shows the credit refilling at midnight in
+another zone, set `reset_tz` to that zone.
+
+**A key turn** runs `claude` with `ANTHROPIC_API_KEY` set to the key (an
+inherited one is overwritten) and with `ANTHROPIC_AUTH_TOKEN`,
+`CLAUDE_CODE_USE_*`, `CLAUDE_CODE_OAUTH_TOKEN` and `CLAUDE_CONFIG_DIR`
+removed, so the child uses `~/.claude` — the transcript store every profile
+shares — and a session moves between a profile and the key in either
+direction. The trust marker goes to `$HOME/.claude.json`. A key file that is
+missing, not mode 0600 or not exactly one non-empty line fails the turn with
+exit 2 before anything runs.
+
+**When a key is spent.** `--profile <key>` on `ccc run` or `ccc resume` runs
+the turn on that key, with no selection, no budget check and no exhausted
+check; the turn is still charged and can still raise the exhausted flag.
+Without `--profile`, a key is considered only when no profile can take the
+turn and the reason is that quota is gone, never that data is missing:
+
+- A profile *lets a key spend* when it was set aside after a usage limit on
+  this invocation, or when it is usable but scores zero because a weekly
+  bucket the model draws on is spent.
+- A profile *holds the key back* when its login is not `ok`, its reading is
+  carried forward or older than `stale_grace_s`, it has no snapshot, the
+  usage data is unavailable (broker unreachable, daemon offline), it is at or
+  below its 5-hour floor, its snapshot has no general weekly window, or —
+  for a Fable model — no Fable weekly window. The 5-hour floor refills within
+  hours at no cost, and a missing Fable window cannot be told apart from a
+  Fable bucket the daemon failed to read, so neither spends money.
+- A profile with no local credential counts neither way.
+
+A key is considered when no profile holds it back and at least one lets it
+spend. The first key, in name order, that is not set aside, has its key
+file, has a `models` glob matching the model, and is in budget takes the
+turn, with a note: `no profile can take <model> (<reasons>); using API key
+<name>: $<spent> of $<budget> spent this month`. A key is **in budget** when
+it has no exhausted flag for the current month, its ledger can be read, and
+its spent figure is below `budget_usd - reserve_usd`. Turns in flight are not
+counted; `reserve_usd` is the allowance for them and for estimate drift.
+Otherwise selection ends as it would without keys, with a note saying which
+profile held the key back or why each key was passed over.
+
+So `models = ["*fable*"]` gives the key to Fable work only, when every
+account's Fable or general bucket is spent; `models = ["*"]` gives it to
+whichever class runs dry first. A subscription usage limit (see "Usage
+limits") continues the session on a key when the rule holds over the profiles
+left, including in a one-profile setup; a key turn refused for spend
+continues on a profile that can take it, or ends in exit 4.
+
+`ccc launch` never uses a key: `--profile <key>` is exit 2 (`an API key
+account cannot be used at the terminal: ccc cannot see what an interactive
+session spends`), and selection for a launch does not consider keys. With
+`[claude] profiles` empty there is no selection, so a key is used only through
+`--profile`.
+
+`ccc which <type>` prints one line per key under the candidate table — month,
+spent, budget, reserve, exhausted flag, whether `models` matches, and `would
+be used: yes|no (<reason>)` — and `--json` carries the same under
+`api_keys`. It reads the budget each time, which with the bus enabled
+publishes this host's spend level (see "Bus").
+
+**Who can read the key.** A key turn's Claude session holds the key in
+`ANTHROPIC_API_KEY`, so every process that session starts — shell commands,
+tools, hooks, MCP servers, nested runs — can read it. Anything among them
+that calls the Platform with it directly (a bare `claude`, a script, an SDK)
+spends the key without the ledger seeing it; that is the estimate's blind
+spot, and the exhausted flag and `ccc budget set` are the corrections. A
+nested `ccc` run is not such a path. With a key configured, `ccc` gives
+`ANTHROPIC_API_KEY` to a child only on a key turn, which it charges: a nested
+Claude run on a profile or the ambient login has the variable removed, a
+nested run on a key overwrites it and is charged, and every Codex and Goose
+spawn — headless or `launch`, fresh or resumed — has an inherited
+`ANTHROPIC_API_KEY` removed, with `note: ANTHROPIC_API_KEY removed from the
+child's environment; an API key account is configured and a <harness> turn
+is not charged to it` on stderr and in the spawn record. A `[goose.env]` entry
+that sets the variable is kept. A nested `ccc` under a different site config
+with no `[claude.api_keys]` does not apply the rule. So a key belongs only
+under agents and in directories trusted with it.
+
+### Before you rely on this
+
+`ccc`'s tests never run with a real key. Which credential a key turn bills,
+what the Platform says when it refuses a turn for spend, and how close the
+cost estimate is to the bill are assumptions, not tested facts; and `ccc`'s
+bus is not tested against a real broker. Run these once with your own key:
+
+| Step | Run | Should show | If not |
+|---|---|---|---|
+| A1, which credential is billed | With a subscription login present in `~/.claude`: `ccc run <agent> --profile <key> "say hi"`, then `ccc budget` | The trailer names the key as `profile`; `ccc budget` shows one more turn and a non-zero spend; the Platform console shows usage on the key; no profile's window moves in `ccc which` at the next usage reading | No config line corrects this. Remove the key's `[claude.api_keys.<key>]` table and stop: the subscription is being billed |
+| A2, the refusal message (the spend-limit refusal only) | In the Platform console set the key's or workspace's spend limit below its current usage; `ccc run <agent> --profile <key> "say hi"`; `ccc budget` | The turn is refused, in one of two ways. Exit 4, and `ccc budget` shows the key exhausted with the Platform's message: a configured pattern matches the spend-limit refusal. Or exit 1 with the Platform's message on stderr: none does yet | On exit 1: add a glob matching that message to the key's `exhausted_patterns`, beside what is there and not in place of it, and run again; it should now be exit 4. A turn that succeeds confirms nothing: the limit has not taken effect. Afterwards raise the limit back to the value you keep and `ccc budget clear <key>` |
+| A3, the estimate against the bill | After a few dozen key turns: `ccc budget`, beside the console's month-to-date figure for the key | The two agree within a few percent | `ccc budget set <key> --spent <console figure>`, and raise the key's `reserve_usd` to cover the drift seen |
+| The bus on your broker | With `[bus] enabled`: `mosquitto_sub -v -t '<prefix>/agents/#'` in one terminal, `ccc run …` in another; then `kill -9` a running `ccc` | The session record appears and is republished about every 30 seconds; the `ended` event; the retained record withdrawn; after the kill, a new subscriber no longer receives the record within 90 seconds; no refusal note on stderr | A refusal note: the broker user lacks write on `<prefix>/agents/<publisher>/#` (the ACL lines in "Bus"). A record that never expires: the broker does not honour MQTT 5 message expiry |
+
+Set a spend limit on the key or its workspace in the Platform console, and
+keep it: without one the Platform may bill overage instead of refusing a
+turn, and then nothing raises the exhausted flag and the estimate is the only
+brake. Under that limit the spend-limit refusal may well be the one that
+fires, which is why the A2 step provokes it.
+
+The A2 step does not settle the other refusal, the credit running out. That
+one cannot be provoked on demand, the two are not known to share a message,
+and the default pattern `*credit balance is too low*` is a guess at the
+credit-gone message which the step neither confirms nor refutes, so keep it
+whatever the step shows. It is settled the first time the credit actually
+runs out: a key turn that exits 4, with `ccc budget` showing the key
+exhausted, means a pattern matched; key turns that fail with exit 1 and a
+Platform message about credit or billing mean none did, and the remedy is the
+same — add a glob for that message to `exhausted_patterns`.
+
+## Budget
+
+Each key has one ledger per host, at `<state home>/ccc/budget/<name>.json`
+(state home is `$XDG_STATE_HOME`, else `~/.local/state`), written under a
+lock beside it:
+
+```json
+{ "v": 1, "month": "2026-11", "usd": 137.42, "turns": 212, "unmeasured_turns": 3,
+  "adjust_usd": 0.0, "exhausted": null, "cleared_at": null,
+  "updated_at": "2026-11-10T14:03:11Z" }
+```
+
+`month` is the current calendar month in the key's `reset_tz`; a ledger from
+another month reads as empty, flag and clear included — that is the monthly
+refill, and nothing is scheduled. `usd` sums Claude Code's own
+`total_cost_usd` over this host's key turns this month; `adjust_usd` is the
+manual correction below; this host's figure is `usd + adjust_usd`.
+
+Every key turn is charged once, when it ends, whatever account picked it. A
+turn that reports no cost — the child never started, was killed (`ccc kill`,
+a signal), or printed a result without `total_cost_usd` — is charged nothing
+and counted in `unmeasured_turns`, so that count is a ceiling on how blind the
+estimate is. A turn whose prompt was cut short is charged what it reported.
+A ledger that cannot be read or written is a note on stderr and in the end
+record's warnings, and the turn's result stands; selection passes over a key
+whose ledger cannot be read until `ccc budget set` rewrites it.
+
+A key turn that fails with a message matching one of the key's
+`exhausted_patterns` (case-insensitive `*` globs) raises the **exhausted
+flag** — the time, the invocation id and the message — and is then treated
+as a usage limit: the key is set aside and the session continues on a profile
+that can take it, or ends in exit 4 with its session id. The flag keeps the
+key out of selection for the rest of the month, on every host that reads the
+bus, until it is cleared.
+
+```
+ccc budget [--json]               # every key: month, spent (all hosts and this host), budget,
+                                  # reserve, turns, unmeasured, in budget, exhausted flag
+ccc budget set NAME --spent USD   # reconcile: make the all-hosts total equal USD
+ccc budget clear NAME             # clear the exhausted flag, for every reader
+```
+
+`set` writes `adjust_usd` on this host so that the total over every host
+equals the figure the Platform console shows; the correction may be negative.
+With the bus enabled and the broker unreadable it refuses with exit 1 rather
+than reconcile against a partial total. `clear` is for a false match or a
+top-up: it sets this host's `cleared_at`, which outranks every older flag on
+every host; when another host's flag is ahead of this host's clock it clears
+one second past that flag and says so. All three publish this host's level
+when the bus is enabled, and `clear` reports whether the publish reached the
+broker. With the bus off, or the broker unreadable, the report ends `spend:
+this host only`. `ccc budget` lists, by publisher and host, every record it
+ignored for being from another month: publishers of one key must agree on its
+`reset_tz`. With no key configured it says so and exits 0.
+
+**What the estimate does not see**: a `ccc` killed mid-turn (its turn is not
+even counted as unmeasured), anything that spends the key without going
+through `ccc` (see "Who can read the key"), another tool that spends the key
+and publishes nothing, and the gap between Claude Code's estimate and the
+bill. `reserve_usd`, the exhausted flag and `ccc budget set` are the three
+corrections. A pattern that never matches leaves the key's turns failing with
+exit 1 until the estimate reaches the budget; the message is in the end
+record, and the fix is one more glob in `exhausted_patterns`.
+
+## Bus
+
+With `[bus] enabled`, every `ccc run`, `resume` and `launch` publishes what it
+is doing into the **agent tree** on the usage broker, and the budget read
+sums every host's spend on a key. The tree is defined by
+[claude-usage-mqtt](https://github.com/rnortman/claude-usage-mqtt) — its
+README's "The agent tree" section is the schema — under the same
+`topic_prefix` as the usage data, and the bus takes its broker settings from
+the same `[mqtt] config`.
+
+```toml
+[bus]
+enabled = true              # default false: no connection, nothing published
+publisher = "ccc"           # default "ccc"; [A-Za-z0-9._-]; the <publisher> topic segment
+host = "atlas"              # default: the hostname, other characters replaced by '_'
+prompt_chars = 0            # default 0; N > 0 publishes the prompt's first N characters as `title`
+connect_timeout_ms = 3000   # > 0
+flush_timeout_ms = 2000     # > 0; the most a clean exit waits for queued publishes
+```
+
+Per invocation `ccc` publishes, under `<prefix>/agents/<publisher>/<host>/`:
+
+- `session/<invocation id>`, retained while the invocation runs and
+  republished about every 30 seconds, with an MQTT 5 expiry of 90 seconds so
+  a `ccc` that dies stops showing within that: the invocation id, its parent
+  and trace (as `parent` and `root`), harness, model, agent, account and its
+  kind (`subscription` or `api-key`; absent in ambient mode and for Codex and
+  Goose), cwd, pid, the harness session id once known, the turns' summed
+  `cost_usd` when they reported one, and under `meta` the command, effort,
+  `auth`, the agents config path, and on the end its exit code and launch
+  turn count. It is republished with the new account after a usage-limit
+  hand-off.
+- `ended`, not retained, when the invocation ends: the final record, with
+  `ok` (exit 0), `ended_at` and `duration_ms`; the retained record is then
+  withdrawn.
+- `account/<key>` for each API key, retained without expiry: this host's
+  month-to-date figure, turns, unmeasured turns, budget, exhausted flag and
+  clear — after every charge, every flag, every `ccc budget` and every budget
+  read.
+
+The prompt is not published unless `prompt_chars` is set: prompts carry
+whatever the caller put in them, and a broker is a wider audience than a 0700
+state directory. Every host needs a distinct `host`: two hosts publishing the
+same name overwrite each other's spend and the total under-counts.
+
+The broker user needs read on `<prefix>/#` and write on
+`<prefix>/agents/<publisher>/#`. With mosquitto:
+
+```
+user ccc
+topic read claude/usage/#
+topic write claude/usage/agents/ccc/#
+```
+
+The broker must be MQTT 5 and honour message expiry, or the records of a
+crashed `ccc` stay retained for ever. A broker that refuses the publisher's
+subtree says so in its acknowledgement, and each publishing `ccc` process
+reports it once: `note: the broker refused a publish (<reason>); check the
+ACL for <prefix>/agents/<publisher>/#` — on stderr and in the end record's
+warnings for `run`, `resume` and `launch`, on stderr for `ccc which`, and as
+a line of `ccc budget`'s report.
+
+Nothing here can block a spawn. The connection is made in the background; a
+broker that has not answered within `connect_timeout_ms` costs one note and
+the bus is off for the rest of that process, with budgets read from this
+host's ledgers alone. A clean exit waits at most `flush_timeout_ms` for
+queued publishes. A budget read — this host's levels published first, then
+one retained read of every host's — is bounded by `[claude.selection]
+mqtt_timeout_ms` and ends on `mqtt_quiesce_ms`, and happens only when the
+selection rule lets a key be considered, or for `ccc which` and `ccc budget`.
+Nothing in `ccc` reads the session records yet; they are there for dashboards
+and other tools.
 
 ## Process management
 

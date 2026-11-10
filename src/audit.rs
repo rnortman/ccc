@@ -555,6 +555,11 @@ impl Recorder {
         &self.lineage
     }
 
+    /// The agents-config path this invocation resolved.
+    pub fn agents_config(&self) -> &str {
+        &self.agents_config
+    }
+
     pub fn trace_path(&self) -> PathBuf {
         self.dir.join(format!("{}.jsonl", self.lineage.trace_id))
     }

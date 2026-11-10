@@ -17,7 +17,7 @@ use crate::resolve::Resolved;
 /// Environment variables that must not be set when an OAuth token is used;
 /// any of them would send the child to a different endpoint or credential.
 const TOKEN_CONFLICTS: [&str; 5] = [
-    "ANTHROPIC_API_KEY",
+    API_KEY_VAR,
     "ANTHROPIC_AUTH_TOKEN",
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
@@ -25,18 +25,34 @@ const TOKEN_CONFLICTS: [&str; 5] = [
 ];
 
 const TOKEN_VAR: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+/// The environment variable that carries a Platform API key to a Claude child.
+pub const API_KEY_VAR: &str = "ANTHROPIC_API_KEY";
 const CONFIG_DIR_VAR: &str = "CLAUDE_CONFIG_DIR";
+
+/// The field of a result, and of the native fields `parse` keeps, that
+/// carries the turn's cost in USD.
+const COST_FIELD: &str = "total_cost_usd";
+
+/// The cost in USD a parsed turn's native fields report, or `None` when they
+/// report none.
+pub fn reported_cost(native: &serde_json::Value) -> Option<f64> {
+    native.get(COST_FIELD)?.as_f64()
+}
 
 /// Variables to set, and variables to remove, for one account.
 pub type EnvEdits = (Vec<(String, String)>, Vec<String>);
 
-/// Which account the child runs as, and how it is pointed at it.
+/// Which account the child runs as, and how it is pointed at it. `profile`
+/// is the profile's name, or the key's name for an API key account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
     pub profile: String,
     pub auth: ClaudeAuth,
     pub token_dir: PathBuf,
     pub profiles_dir: PathBuf,
+    /// The key file of an API key account; `None` for a login. Set only by
+    /// [`Account::for_key`], together with `auth = ApiKey`.
+    key_file: Option<PathBuf>,
 }
 
 impl Account {
@@ -48,7 +64,27 @@ impl Account {
             auth: cfg.auth,
             token_dir: expand_tilde_in(env, &cfg.token_dir),
             profiles_dir: expand_tilde_in(env, &cfg.profiles_dir),
+            key_file: None,
         }
+    }
+
+    /// The API key account `[claude.api_keys.<name>]` describes, or `None`
+    /// when no key of that name is configured.
+    pub fn for_key(cfg: &ClaudeConfig, name: &str, env: &dyn EnvSource) -> Option<Account> {
+        let key = cfg.api_keys.get(name)?;
+        Some(Account {
+            profile: name.to_string(),
+            auth: ClaudeAuth::ApiKey,
+            token_dir: expand_tilde_in(env, &cfg.token_dir),
+            profiles_dir: expand_tilde_in(env, &cfg.profiles_dir),
+            key_file: Some(expand_tilde_in(env, &key.key_file)),
+        })
+    }
+
+    /// The key file of an API key account, `None` for a login: the one test
+    /// of whether this account spends a key's budget.
+    pub fn key_file(&self) -> Option<&Path> {
+        self.key_file.as_deref()
     }
 
     /// The directory exported as `CLAUDE_CONFIG_DIR` under `config-dir` auth,
@@ -63,6 +99,7 @@ impl Account {
         match self.auth {
             ClaudeAuth::Token => self.token_dir.join(format!("{}.token", self.profile)),
             ClaudeAuth::ConfigDir => self.config_dir().join(".credentials.json"),
+            ClaudeAuth::ApiKey => self.key_file.clone().unwrap_or_default(),
         }
     }
 
@@ -77,23 +114,27 @@ impl Account {
         if self.has_credential() {
             return Ok(());
         }
+        let what = match self.auth {
+            ClaudeAuth::ApiKey => "API key",
+            ClaudeAuth::Token | ClaudeAuth::ConfigDir => "profile",
+        };
         Err(format!(
-            "profile {} has no credential at {}",
+            "{what} {} has no credential at {}",
             self.profile,
             self.credential_path().display()
         ))
     }
 
-    /// The environment edits for this account: exactly one of the two account
-    /// variables is set and the other is removed.
-    pub fn env_edits(&self, env: &dyn EnvSource) -> Result<EnvEdits> {
+    /// The environment edits for this account: exactly one account variable
+    /// is set and every other way of naming an account or endpoint is removed.
+    pub fn env_edits(&self) -> Result<EnvEdits> {
         match self.auth {
+            // An inherited endpoint or credential variable is removed, not
+            // refused: a key turn's child holds `ANTHROPIC_API_KEY`, and a
+            // nested `ccc` started from it inherits that.
             ClaudeAuth::Token => {
-                if let Some(var) = conflicts_set(env).first() {
-                    bail!("{var} is set; unset it before using token authentication");
-                }
                 let path = self.credential_path();
-                let token = read_token(&path)?;
+                let token = read_token(&path, "token file")?;
                 let mut remove = conflict_removals();
                 remove.push(CONFIG_DIR_VAR.to_string());
                 Ok((vec![(TOKEN_VAR.to_string(), token)], remove))
@@ -108,6 +149,21 @@ impl Account {
                     vec![(CONFIG_DIR_VAR.to_string(), dir.display().to_string())],
                     remove,
                 ))
+            }
+            // TODO(api-key-assumptions-unconfirmed): A1 — that `claude -p` bills
+            // this key, not the subscription login in `~/.claude`, has not been
+            // checked against a real key.
+            ClaudeAuth::ApiKey => {
+                // An inherited key is overwritten: the config names the key.
+                // Without `CLAUDE_CONFIG_DIR` the child uses `~/.claude`.
+                let key = read_token(&self.credential_path(), "key file")?;
+                let remove = TOKEN_CONFLICTS
+                    .iter()
+                    .filter(|v| **v != API_KEY_VAR)
+                    .chain([TOKEN_VAR, CONFIG_DIR_VAR].iter())
+                    .map(|v| v.to_string())
+                    .collect();
+                Ok((vec![(API_KEY_VAR.to_string(), key)], remove))
             }
         }
     }
@@ -126,7 +182,7 @@ fn conflict_removals() -> Vec<String> {
 }
 
 /// The endpoint/credential variables `env` sets to a non-blank value, which a
-/// Claude spawn removes or, under token auth, refuses.
+/// Claude spawn removes.
 pub fn conflicts_set(env: &dyn EnvSource) -> Vec<&'static str> {
     TOKEN_CONFLICTS
         .into_iter()
@@ -209,35 +265,36 @@ pub fn trust_directory(account: Option<&Account>, env: &dyn EnvSource, cwd: &Pat
     crate::fsutil::write_atomically(&path, &serde_json::to_string_pretty(&root)?)
 }
 
-/// Reads a `~/.claude-tokens/<profile>.token` file: mode 0600, one non-empty line.
-fn read_token(path: &Path) -> Result<String> {
+/// Reads a secret file — a `~/.claude-tokens/<profile>.token` or an API key
+/// file, named `what` in errors: mode 0600, one non-empty line.
+fn read_token(path: &Path, what: &str) -> Result<String> {
     // Permissions are checked before the secret is read, so a world-readable
     // token never enters this process.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(path)
-            .with_context(|| format!("reading token file {}", path.display()))?
+            .with_context(|| format!("reading {what} {}", path.display()))?
             .permissions()
             .mode()
             & 0o777;
         if mode & 0o077 != 0 {
             bail!(
-                "token file {} is mode {mode:o}; it must not be readable by group or others (chmod 600)",
+                "{what} {} is mode {mode:o}; it must not be readable by group or others (chmod 600)",
                 path.display()
             );
         }
     }
 
     let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading token file {}", path.display()))?;
+        .with_context(|| format!("reading {what} {}", path.display()))?;
 
     let mut lines = text.lines().filter(|l| !l.trim().is_empty());
     let Some(token) = lines.next() else {
-        bail!("token file {} is empty", path.display());
+        bail!("{what} {} is empty", path.display());
     };
     if lines.next().is_some() {
-        bail!("token file {} has more than one line", path.display());
+        bail!("{what} {} has more than one line", path.display());
     }
     Ok(token.trim().to_string())
 }
@@ -337,7 +394,7 @@ fn build(r: &Resolved, c: &Common, d: &ClaudeDriver) -> Result<Invocation> {
     args.extend(c.extra_args.iter().cloned());
 
     let (env_set, env_remove) = match &d.account {
-        Some(acct) => acct.env_edits(d.env)?,
+        Some(acct) => acct.env_edits()?,
         None => ambient_env_edits(),
     };
 
@@ -387,7 +444,7 @@ fn parse(stdout: &str, stderr: &str) -> Result<Outcome, HarnessError> {
         .to_string();
     let native = json!({
         "num_turns": value.get("num_turns"),
-        "total_cost_usd": value.get("total_cost_usd"),
+        COST_FIELD: value.get(COST_FIELD),
         "duration_ms": value.get("duration_ms"),
         "modelUsage": value.get("modelUsage"),
     });
@@ -736,6 +793,7 @@ mod tests {
             auth: ClaudeAuth::Token,
             token_dir: dir.path().to_path_buf(),
             profiles_dir: PathBuf::from("/nope"),
+            key_file: None,
         };
         assert_eq!(acct.credential_path(), path);
         assert!(acct.has_credential());
@@ -755,7 +813,7 @@ mod tests {
     }
 
     #[test]
-    fn token_auth_refuses_conflicting_env_and_bad_token_files() {
+    fn token_auth_removes_inherited_conflicts_and_refuses_bad_token_files() {
         let dir = TempDir::new("claude-token-bad");
         dir.write_file("team03.token", "secret\n", 0o600);
         let acct = Account {
@@ -763,24 +821,28 @@ mod tests {
             auth: ClaudeAuth::Token,
             token_dir: dir.path().to_path_buf(),
             profiles_dir: PathBuf::from("/nope"),
+            key_file: None,
         };
+        // As a nested run under a key turn inherits it: the child spawns on
+        // the token with the variable removed.
         for var in TOKEN_CONFLICTS {
-            let err = acct.env_edits(&env(&[(var, "x")])).unwrap_err().to_string();
-            assert!(err.contains(var), "{err}");
+            let e = env(&[(var, "x")]);
+            let mut d = driver(&e);
+            d.account = Some(acct.clone());
+            let i = d.build(&resolved(), &common(run_mode())).unwrap();
+            assert_eq!(
+                i.env_set,
+                vec![(TOKEN_VAR.to_string(), "secret".to_string())]
+            );
+            assert!(i.env_remove.contains(&var.to_string()), "{var}");
         }
-        // An empty value is not a conflict.
-        assert!(acct.env_edits(&env(&[("ANTHROPIC_API_KEY", "")])).is_ok());
 
         dir.write_file("loose.token", "secret\n", 0o644);
         let loose = Account {
             profile: "loose".into(),
             ..acct.clone()
         };
-        assert!(loose
-            .env_edits(&env(&[]))
-            .unwrap_err()
-            .to_string()
-            .contains("mode"));
+        assert!(loose.env_edits().unwrap_err().to_string().contains("mode"));
 
         dir.write_file("two.token", "a\nb\n", 0o600);
         let two = Account {
@@ -788,7 +850,7 @@ mod tests {
             ..acct.clone()
         };
         assert!(two
-            .env_edits(&env(&[]))
+            .env_edits()
             .unwrap_err()
             .to_string()
             .contains("more than one line"));
@@ -798,11 +860,7 @@ mod tests {
             profile: "empty".into(),
             ..acct
         };
-        assert!(empty
-            .env_edits(&env(&[]))
-            .unwrap_err()
-            .to_string()
-            .contains("empty"));
+        assert!(empty.env_edits().unwrap_err().to_string().contains("empty"));
     }
 
     #[test]
@@ -812,12 +870,13 @@ mod tests {
             auth: ClaudeAuth::ConfigDir,
             token_dir: PathBuf::from("/tokens"),
             profiles_dir: PathBuf::from("/profiles"),
+            key_file: None,
         };
         assert_eq!(
             acct.credential_path(),
             PathBuf::from("/profiles/personal/.credentials.json")
         );
-        let (set, remove) = acct.env_edits(&env(&[("ANTHROPIC_API_KEY", "x")])).unwrap();
+        let (set, remove) = acct.env_edits().unwrap();
         assert_eq!(
             set,
             vec![(CONFIG_DIR_VAR.to_string(), "/profiles/personal".to_string())]
@@ -828,6 +887,110 @@ mod tests {
         for var in TOKEN_CONFLICTS {
             assert!(remove.contains(&var.to_string()), "{var}");
         }
+    }
+
+    /// A config with one key, `team`, whose key file is `<dir>/team.key`.
+    fn key_config(dir: &TempDir) -> ClaudeConfig {
+        let mut cfg = ClaudeConfig {
+            auth: ClaudeAuth::Token,
+            ..ClaudeConfig::default()
+        };
+        cfg.api_keys.insert(
+            "team".into(),
+            crate::config::ApiKeyConfig {
+                key_file: dir.path().join("team.key").display().to_string(),
+                budget_usd: 420.0,
+                models: vec!["*fable*".into()],
+                reserve_usd: 0.0,
+                reset_tz: "UTC".into(),
+                exhausted_patterns: vec!["*credit*".into()],
+            },
+        );
+        cfg
+    }
+
+    #[test]
+    fn a_key_account_comes_only_from_a_configured_key() {
+        let dir = TempDir::new("claude-key-for");
+        let cfg = key_config(&dir);
+        let acct = Account::for_key(&cfg, "team", &env(&[])).unwrap();
+        assert_eq!(acct.profile, "team");
+        assert_eq!(acct.auth, ClaudeAuth::ApiKey);
+        assert_eq!(acct.credential_path(), dir.path().join("team.key"));
+        assert!(!acct.has_credential());
+        let missing = acct.require_credential().unwrap_err();
+        assert!(
+            missing.starts_with("API key team has no credential at"),
+            "{missing}"
+        );
+        assert_eq!(Account::for_key(&cfg, "team03", &env(&[])), None);
+
+        let mut tilde = cfg.clone();
+        tilde.api_keys.get_mut("team").unwrap().key_file = "~/keys/team.key".into();
+        let acct = Account::for_key(&tilde, "team", &env(&[("HOME", "/home/tester")])).unwrap();
+        assert_eq!(
+            acct.credential_path(),
+            PathBuf::from("/home/tester/keys/team.key")
+        );
+    }
+
+    #[test]
+    fn key_auth_sets_the_key_and_removes_every_other_account_variable() {
+        let dir = TempDir::new("claude-key-env");
+        dir.write_file("team.key", "sk-ant-api-secret\n", 0o600);
+        let acct = Account::for_key(&key_config(&dir), "team", &env(&[])).unwrap();
+        let (set, mut remove) = acct.env_edits().unwrap();
+        assert_eq!(
+            set,
+            vec![(API_KEY_VAR.to_string(), "sk-ant-api-secret".to_string())]
+        );
+        remove.sort();
+        assert_eq!(
+            remove,
+            [
+                "ANTHROPIC_AUTH_TOKEN",
+                TOKEN_VAR,
+                "CLAUDE_CODE_USE_BEDROCK",
+                "CLAUDE_CODE_USE_FOUNDRY",
+                "CLAUDE_CODE_USE_VERTEX",
+                CONFIG_DIR_VAR,
+            ]
+        );
+    }
+
+    #[test]
+    fn key_auth_applies_the_secret_file_rules() {
+        let dir = TempDir::new("claude-key-bad");
+        let cfg = key_config(&dir);
+        let acct = Account::for_key(&cfg, "team", &env(&[])).unwrap();
+        for (contents, mode, expected) in [
+            ("secret\n", 0o644, "key file"),
+            ("secret\n", 0o644, "mode 644"),
+            ("a\nb\n", 0o600, "more than one line"),
+            ("\n", 0o600, "empty"),
+        ] {
+            dir.write_file("team.key", contents, mode);
+            let err = format!("{:#}", acct.env_edits().unwrap_err());
+            assert!(err.contains(expected), "{expected}: {err}");
+        }
+        std::fs::remove_file(dir.path().join("team.key")).unwrap();
+        let err = format!("{:#}", acct.env_edits().unwrap_err());
+        assert!(err.contains("reading key file"), "{err}");
+    }
+
+    #[test]
+    fn a_key_account_trusts_the_directory_in_the_home_config_file() {
+        let dir = TempDir::new("claude-key-trust");
+        let acct = Account::for_key(&key_config(&dir), "team", &env(&[])).unwrap();
+        let home = dir.path().join("home");
+        let e = env(&[
+            ("HOME", home.to_str().unwrap()),
+            ("CLAUDE_CONFIG_DIR", "/elsewhere"),
+        ]);
+        assert_eq!(
+            config_file(Some(&acct), &e, Path::new("/srv/work")),
+            home.join(".claude.json")
+        );
     }
 
     #[test]
@@ -854,6 +1017,17 @@ mod tests {
     }
 
     #[test]
+    fn reported_cost_reads_a_refused_result_and_is_none_without_one() {
+        let refused = r#"{"type":"result","is_error":true,"result":"no",
+            "session_id":"9f22dd1b-1111-2222-3333-444455556666","total_cost_usd":0.5}"#;
+        let err = parse(refused, "").unwrap_err();
+        assert_eq!(reported_cost(err.reported().unwrap().1), Some(0.5));
+        let free = r#"{"type":"result","is_error":false,"result":"ok",
+            "session_id":"9f22dd1b-1111-2222-3333-444455556666"}"#;
+        assert_eq!(reported_cost(&parse(free, "").unwrap().native), None);
+    }
+
+    #[test]
     fn parses_a_successful_result() {
         let stdout = r#"{"type":"result","subtype":"success","is_error":false,
             "session_id":"9f22dd1b-1111-2222-3333-444455556666","result":"PROBE-OK hello",
@@ -863,6 +1037,7 @@ mod tests {
         assert_eq!(out.session_id, "9f22dd1b-1111-2222-3333-444455556666");
         assert_eq!(out.result, "PROBE-OK hello");
         assert_eq!(out.native["total_cost_usd"], json!(0.0031));
+        assert_eq!(reported_cost(&out.native), Some(0.0031));
         assert!(out.native["modelUsage"]
             .get("claude-haiku-4-5-20251001")
             .is_some());
@@ -968,6 +1143,7 @@ mod tests {
             auth,
             token_dir: dir.path().join("tokens"),
             profiles_dir: dir.path().join("profiles"),
+            key_file: None,
         }
     }
 

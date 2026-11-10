@@ -539,7 +539,9 @@ impl IdleIndex {
                         crate::harness::claude::Account::from_config(&cfg.claude, profile, env)
                             .config_dir()
                     }
-                    _ if auth == Some(ClaudeAuth::Token) => home.join(".claude"),
+                    _ if matches!(auth, Some(ClaudeAuth::Token | ClaudeAuth::ApiKey)) => {
+                        home.join(".claude")
+                    }
                     _ => env
                         .get("CLAUDE_CONFIG_DIR")
                         .map(PathBuf::from)

@@ -33,6 +33,52 @@
   most socket types and io_uring. A run fails at the start if the sandbox
   cannot be created. See the README's *Goose box* section, including the few
   things the sandbox does not stop.
+- **API key accounts.** A Claude Platform API key with a monthly dollar
+  budget — a Team plan's included API credit, say — can now sit beside the
+  subscription profiles as a last resort. Configure it under
+  `[claude.api_keys.<name>]`: the key file, the budget, which models it may
+  serve (no default, so nothing spends money on a model you did not name), a
+  reserve to stop short of the budget, and the time zone of the monthly
+  refill. `ccc` uses the key only when no subscription profile can take a
+  turn because its quota is spent — never because usage data is missing or
+  doubtful — and `--profile <name>` on `ccc run` / `ccc resume` uses it
+  directly. `ccc launch` refuses a key, because `ccc` cannot see what an
+  interactive session spends. `ccc which` shows each key and whether it would
+  be used. **Before relying on a key, work through the README's "Before you
+  rely on this" checklist:** which credential the Platform bills and how it
+  refuses a turn when the credit is gone are assumed, not tested.
+- **A spend budget per key, and the new `ccc budget` command.** Each key turn
+  is charged the cost Claude Code reports into a monthly ledger on each host;
+  turns that report no cost are counted as unmeasured. When the Platform
+  refuses a turn for spend (recognised by the key's `exhausted_patterns`),
+  the key is flagged exhausted and stays out of use until `ccc budget clear`,
+  and the session carries on on a subscription profile if one can take it.
+  `ccc budget` shows each key's month; `ccc budget set NAME --spent USD`
+  corrects the estimate to the figure in the Platform console.
+- **Sessions and key spend published to MQTT (the "bus").** With
+  `[bus] enabled`, every `ccc run`, `resume` and `launch` publishes a live
+  record of itself — harness, model, agent, account, working directory,
+  cost, and its parent session — to the same MQTT broker that carries the
+  usage data, in the shared "agent tree" that claude-usage-mqtt defines so
+  other tools and dashboards can read it too. Each host also publishes its
+  spend on each key, so budgets count every host's spend and an exhausted
+  flag reaches every host at once. The prompt is published only if you set
+  `prompt_chars`. Requires claude-usage-mqtt 0.3.0 or later, an MQTT 5 broker
+  that honours message expiry, and a broker user with write access to
+  `<prefix>/agents/<publisher>/#` (the README's "Bus" section has the ACL).
+- **Behaviour change: under `auth = "token"`, a stray `ANTHROPIC_API_KEY`,
+  `ANTHROPIC_AUTH_TOKEN` or `CLAUDE_CODE_USE_*` in the environment no longer
+  stops `ccc`.** It used to refuse to run, naming the variable; it now
+  silently removes them from the Claude child, as `config-dir` auth always
+  has. This lets a `ccc` run nested under an API key turn start on a
+  profile. The cost: such a variable left in your shell is no longer
+  reported. It is still never passed to a subscription turn.
+- **Behaviour change: with an API key account configured, Codex and Goose
+  children no longer inherit `ANTHROPIC_API_KEY`.** `ccc` removes it, with a
+  note on stderr and in the spawn record, so a nested run cannot spend the
+  budgeted key unseen. A Goose provider that needs an Anthropic key must get
+  it from `[goose.env]`, which is kept. Without `[claude.api_keys]` nothing
+  changes.
 - `ccc resume`, `ccc launch` and `ccc launch --resume` work with Goose
   sessions, reusing the directory grants recorded when the session began;
   `--fork` is refused. A Goose agent cannot resume a session a human has

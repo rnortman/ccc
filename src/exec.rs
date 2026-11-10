@@ -1,6 +1,7 @@
 //! Running a resolved agent: pick the account, spawn the harness, record the
 //! session, render the result.
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -15,6 +16,8 @@ use crate::audit::{
     ChildPayload, Command as AuditCommand, EndPayload, PromptSource, Recorder, SpawnPayload,
     StartPayload,
 };
+use crate::budget::BudgetView;
+use crate::bus::{Bus, Live};
 use crate::config::{Config, Effort, EnvSource, Harness, ProcessEnv};
 use crate::harness::claude::{Account, ClaudeDriver};
 use crate::harness::codex::{self, CodexDriver};
@@ -34,17 +37,47 @@ use crate::usage::{self, UsageSource};
 ///
 /// The usage read is a closure because it costs a broker round trip: a Codex
 /// run, a run naming its own `--profile`, or a run under the ambient login
-/// never makes one.
+/// never makes one. The budget read is a closure for the same reason: only a
+/// selection that overflows to an API key makes it. `bus` and `live` publish
+/// this invocation into the agent tree; both are inert with the bus off.
 pub struct Ctx<'a> {
     pub cfg: &'a Config,
     pub env: &'a dyn EnvSource,
     pub now: Timestamp,
     pub usage: &'a (dyn Fn() -> UsageSource + Sync),
+    pub budget: &'a (dyn Fn() -> BTreeMap<String, BudgetView> + Sync),
+    /// False at the terminal: selection never considers an API key there.
+    api_keys_eligible: bool,
+    pub bus: &'a dyn Bus,
+    live: &'a Live,
     pub audit: &'a Recorder,
     session_locks: Arc<Mutex<Vec<(String, session::SessionLock)>>>,
 }
 
-impl Ctx<'_> {
+impl<'a> Ctx<'a> {
+    /// This context for a turn at the terminal, where no API key is selected.
+    fn at_terminal(&self) -> Ctx<'a> {
+        Ctx {
+            cfg: self.cfg,
+            env: self.env,
+            now: self.now,
+            usage: self.usage,
+            budget: self.budget,
+            api_keys_eligible: false,
+            bus: self.bus,
+            live: self.live,
+            audit: self.audit,
+            session_locks: Arc::clone(&self.session_locks),
+        }
+    }
+
+    fn keys(&self) -> crate::select::Keys<'_> {
+        crate::select::Keys {
+            eligible: self.api_keys_eligible,
+            budget: self.budget,
+        }
+    }
+
     fn owns_session(&self, id: &str) -> bool {
         self.session_locks
             .lock()
@@ -579,6 +612,7 @@ fn retry_on_limit(
         ctx.now,
         &(ctx.usage)(),
         &[limited.to_string()],
+        ctx.keys(),
     ) else {
         return declined(NO_OTHER_PROFILE);
     };
@@ -816,7 +850,7 @@ where
     F: FnOnce(&Ctx<'_>) -> std::result::Result<Completion, OperationError>,
     L: FnOnce() -> Result<Config>,
 {
-    if let Err(e) = recorder.start(start) {
+    if let Err(e) = recorder.start(start.clone()) {
         let trace_path = recorder.trace_path();
         if trace_path.is_file() {
             recorder.end(error_end(&e));
@@ -830,27 +864,65 @@ where
             return Err(e);
         }
     };
+    let now = Timestamp::now();
+    let bus = crate::bus::open(
+        &cfg,
+        env,
+        format!("ccc-{}", recorder.lineage().invocation_id),
+    );
+    let live = Live::new(
+        bus.identity(),
+        recorder.lineage(),
+        &start,
+        recorder.agents_config(),
+        cfg.bus.prompt_chars,
+        now,
+    );
     let usage = || usage::fetch(&cfg.mqtt, &cfg.claude.selection, env);
+    let budget = || crate::budget::bus_views(&cfg, env, Timestamp::now(), &*bus);
     let ctx = Ctx {
         cfg: &cfg,
         env,
-        now: Timestamp::now(),
+        now,
         usage: &usage,
+        budget: &budget,
+        api_keys_eligible: true,
+        bus: &*bus,
+        live: &live,
         audit: &recorder,
         session_locks: Arc::new(Mutex::new(Vec::new())),
     };
     let result = run(&ctx);
     match result {
-        Ok(completion) => {
+        Ok(mut completion) => {
+            close_bus(&*bus, &live, &mut completion.end, &stderr_note);
             recorder.end(completion.end.clone());
             Ok(completion)
         }
         Err(e) => {
-            let end = e.end.map(|end| *end).unwrap_or_else(|| error_end(&e.error));
+            let mut end = e.end.map(|end| *end).unwrap_or_else(|| error_end(&e.error));
+            close_bus(&*bus, &live, &mut end, &stderr_note);
             recorder.end(end);
             Err(e.error)
         }
     }
+}
+
+/// Ends this invocation on the bus from its end record, then closes the bus;
+/// every note the bus raised is said through `say` and joins the end
+/// record's warnings. This runs after any child has exited, so a note never
+/// lands on a terminal a `launch` child owns.
+fn close_bus(bus: &dyn Bus, live: &Live, end: &mut EndPayload, say: &dyn Fn(&str)) {
+    live.ended(bus, end, Timestamp::now());
+    for note in bus.close() {
+        let line = format!("note: {note}");
+        say(&line);
+        end.warnings.push(line);
+    }
+}
+
+fn stderr_note(line: &str) {
+    diag(format_args!("{line}"));
 }
 
 /// Everything a resume needs before a harness is spawned: the record, the
@@ -1188,6 +1260,16 @@ fn launch_with_ctx(
     profile: Option<&str>,
     passthrough: Vec<String>,
 ) -> std::result::Result<Completion, OperationError> {
+    if profile.is_some_and(|p| ctx.cfg.claude.api_keys.contains_key(p)) {
+        // TODO(api-key-at-launch): an interactive session reports no cost, so
+        // a key spent at the terminal would bypass the budget.
+        return Err(anyhow::anyhow!(
+            "an API key account cannot be used at the terminal: ccc cannot see what an interactive session spends"
+        )
+        .into());
+    }
+    let terminal = ctx.at_terminal();
+    let ctx = &terminal;
     let LaunchPrepared {
         mut inv,
         r,
@@ -1236,6 +1318,11 @@ fn launch_with_ctx(
         }
     };
     inv.env_set.extend(ctx.audit.lineage().child_env());
+    let mut notes = notes;
+    if let Some(note) = withhold_api_key(ctx.cfg, ctx.env, r.harness, &mut inv) {
+        diag(format!("note: {note}"));
+        notes.push(note);
+    }
     spawn_prologue(
         ctx,
         &r,
@@ -1674,6 +1761,11 @@ fn drive_with_meta_report(
     let driver = driver_for(ctx, r, common, account.clone(), output_file.clone())?;
     let mut inv = driver.build(r, common)?;
     inv.env_set.extend(ctx.audit.lineage().child_env());
+    let mut selection_notes = selection_notes;
+    if let Some(note) = withhold_api_key(ctx.cfg, ctx.env, r.harness, &mut inv) {
+        report(format!("note: {note}"));
+        selection_notes.push(note);
+    }
     if let Err(e) = spawn_prologue(
         ctx,
         r,
@@ -1688,7 +1780,43 @@ fn drive_with_meta_report(
         }
         return Err(e);
     }
-    let run_ctx = RunContext::new(r, profile.as_deref(), &inv);
+    let (mut driven, cost) = supervise_and_parse(
+        ctx,
+        r,
+        common,
+        &*driver,
+        &inv,
+        profile.as_deref(),
+        output_file,
+        report,
+        record,
+    );
+    if let Some(account) = account.as_ref().filter(|a| a.key_file().is_some()) {
+        settle_key_turn(ctx, account, cost, &mut driven.result);
+    }
+    ctx.live.charged(ctx.bus, cost, Timestamp::now());
+    Ok(driven)
+}
+
+/// Runs the built invocation under the supervisor and parses its result.
+/// Returns the result together with the cost the harness reported for the
+/// turn, `None` when it reported none: a child that never started or was
+/// terminated, or a result without `total_cost_usd`. The cost is read before
+/// a prompt shortfall discards a successful result, because that turn was
+/// billed.
+#[allow(clippy::too_many_arguments)]
+fn supervise_and_parse(
+    ctx: &Ctx,
+    r: &Resolved,
+    common: &Common,
+    driver: &dyn Driver,
+    inv: &Invocation,
+    profile: Option<&str>,
+    output_file: Option<PathBuf>,
+    report: &(dyn Fn(String) + Send + Sync),
+    record: &SessionRecord,
+) -> (DriveResult, Option<f64>) {
+    let run_ctx = RunContext::new(r, profile, inv);
 
     let on_spawned = |proc, pgid| {
         let Ok(supervisor) = crate::procs::ProcId::current() else {
@@ -1747,7 +1875,7 @@ fn drive_with_meta_report(
         }
     };
     let supervised = match supervise::run(
-        &inv,
+        inv,
         &SuperviseOpts {
             detach_group: true,
             grace: std::time::Duration::from_secs_f64(ctx.cfg.process.kill_grace_s),
@@ -1764,18 +1892,21 @@ fn drive_with_meta_report(
             if let Some(path) = &output_file {
                 let _ = codex::take_output_file(path);
             }
-            return Ok(DriveResult {
-                result: Err(HarnessError::unusable(format!("{e:#}"))
-                    .with_session_id(first_id.lock().unwrap().clone().or_else(|| {
-                        common
-                            .mode
-                            .continues()
-                            .map(str::to_string)
-                            .or_else(|| common.preset_session_id.clone())
-                    }))
-                    .annotate(&run_ctx)),
-                signal: None,
-            });
+            return (
+                DriveResult {
+                    result: Err(HarnessError::unusable(format!("{e:#}"))
+                        .with_session_id(first_id.lock().unwrap().clone().or_else(|| {
+                            common
+                                .mode
+                                .continues()
+                                .map(str::to_string)
+                                .or_else(|| common.preset_session_id.clone())
+                        }))
+                        .annotate(&run_ctx)),
+                    signal: None,
+                },
+                None,
+            );
         }
     };
     report_warnings(&supervised.warnings);
@@ -1791,20 +1922,24 @@ fn drive_with_meta_report(
             termination_message(&term, &supervised.status),
             prompt_shortfall.as_ref(),
         );
-        return Ok(DriveResult {
-            result: Err(HarnessError::unusable(message)
-                .with_session_id(first_id.lock().unwrap().clone().or_else(|| {
-                    common
-                        .mode
-                        .continues()
-                        .map(str::to_string)
-                        .or_else(|| common.preset_session_id.clone())
-                }))
-                .annotate(&run_ctx)),
-            signal,
-        });
+        return (
+            DriveResult {
+                result: Err(HarnessError::unusable(message)
+                    .with_session_id(first_id.lock().unwrap().clone().or_else(|| {
+                        common
+                            .mode
+                            .continues()
+                            .map(str::to_string)
+                            .or_else(|| common.preset_session_id.clone())
+                    }))
+                    .annotate(&run_ctx)),
+                signal,
+            },
+            None,
+        );
     }
     let parsed = driver.parse(&captured);
+    let cost = reported_cost(&parsed);
     let result = match (prompt_shortfall, parsed) {
         (Some(delivery), Ok(outcome)) => Err(HarnessError::unusable(format!(
             "the prompt was not fully delivered: {} of {} bytes were written before {}; the harness answered an incomplete prompt and its result is discarded",
@@ -1822,7 +1957,120 @@ fn drive_with_meta_report(
         }
         (None, parsed) => parsed.map_err(|e| e.annotate(&run_ctx)),
     };
-    Ok(DriveResult { result, signal })
+    (DriveResult { result, signal }, cost)
+}
+
+/// The cost a parsed turn reported, succeeded, refused or limited.
+fn reported_cost(parsed: &Result<Outcome, HarnessError>) -> Option<f64> {
+    let native = match parsed {
+        Ok(outcome) => &outcome.native,
+        Err(e) => e.reported()?.1,
+    };
+    crate::harness::claude::reported_cost(native)
+}
+
+/// Charges a finished API key turn to this host's ledger and publishes the
+/// new level, then, when the turn was refused with a message one of the
+/// key's `exhausted_patterns` matches, raises the key's exhausted flag and turns the failure into a
+/// usage limit, so the hand-off machinery treats the key as it treats a
+/// limited profile; the flagged level is published too. A ledger that cannot
+/// be written costs a note and nothing else.
+fn settle_key_turn(
+    ctx: &Ctx,
+    account: &Account,
+    cost: Option<f64>,
+    result: &mut std::result::Result<Outcome, HarnessError>,
+) {
+    let name = account.profile.as_str();
+    let Some(key) = ctx.cfg.claude.api_keys.get(name) else {
+        return;
+    };
+    let ledgers = crate::budget::Ledgers::in_env(ctx.env);
+    let publish =
+        |ledger: &crate::budget::Ledger| crate::budget::publish_level(ctx.bus, name, key, ledger);
+    match ledgers.charge(name, key, Timestamp::now(), cost) {
+        Ok(ledger) => publish(&ledger),
+        Err(e) => add_note(
+            result,
+            format!("note: could not charge the turn to API key {name}'s ledger: {e:#}"),
+        ),
+    }
+    let Err(HarnessError::Reported {
+        session_id,
+        message,
+        native,
+        warnings,
+    }) = result
+    else {
+        return;
+    };
+    if !crate::glob::any_match(&key.exhausted_patterns, message) {
+        return;
+    }
+    let limited = HarnessError::Limited {
+        session_id: session_id.take(),
+        message: std::mem::take(message),
+        native: native.take(),
+        warnings: std::mem::take(warnings),
+    };
+    let marked = ledgers.mark_exhausted(
+        name,
+        key,
+        Timestamp::now(),
+        Some(ctx.audit.lineage().invocation_id.clone()),
+        limited.message(),
+    );
+    *result = Err(limited);
+    match marked {
+        Ok(ledger) => publish(&ledger),
+        Err(e) => add_note(
+            result,
+            format!("note: could not record API key {name} as exhausted: {e:#}"),
+        ),
+    }
+}
+
+/// Puts `note` among the turn's warnings, which reach stderr and the end
+/// record; a turn with no warnings to carry it gets it on stderr only.
+fn add_note(result: &mut std::result::Result<Outcome, HarnessError>, note: String) {
+    let warnings = match result {
+        Ok(outcome) => Some(&mut outcome.warnings),
+        Err(e) => e.warnings_mut(),
+    };
+    match warnings {
+        Some(warnings) => warnings.push(note),
+        None => diag(&note),
+    }
+}
+
+/// With an API key account configured, removes `ANTHROPIC_API_KEY` from a
+/// Codex or Goose child, so the only child that receives it is a Claude key
+/// turn, which is charged. An `env_set` entry for the variable (Goose's
+/// `[goose.env]`) is the operator's and is kept. Returns a note when the
+/// removal was added and the variable is set and non-blank in `env`.
+fn withhold_api_key(
+    cfg: &Config,
+    env: &dyn EnvSource,
+    harness: Harness,
+    inv: &mut Invocation,
+) -> Option<String> {
+    use crate::harness::claude::API_KEY_VAR;
+    if harness == Harness::Claude || cfg.claude.api_keys.is_empty() {
+        return None;
+    }
+    if inv.env_set.iter().any(|(k, _)| k == API_KEY_VAR) {
+        return None;
+    }
+    if !inv.env_remove.iter().any(|k| k == API_KEY_VAR) {
+        inv.env_remove.push(API_KEY_VAR.to_string());
+    }
+    env.get(API_KEY_VAR)
+        .is_some_and(|v| !v.trim().is_empty())
+        .then(|| {
+            format!(
+                "{API_KEY_VAR} removed from the child's environment; an API key account is configured and a {harness} turn is not charged to it"
+            )
+        })
 }
 
 /// Pre-spawn bookkeeping common to one-shot and interactive paths.
@@ -1858,7 +2106,7 @@ fn spawn_prologue(
             )),
         }
     }
-    ctx.audit.spawn(spawn_payload(
+    let spawn = spawn_payload(
         r,
         &common.cwd,
         account,
@@ -1867,7 +2115,8 @@ fn spawn_prologue(
             .clone()
             .or_else(|| common.mode.continues().map(str::to_string)),
         notes,
-    ))?;
+    );
+    ctx.audit.spawn(spawn.clone())?;
     if r.harness == Harness::Claude {
         if account.is_none() {
             let removed = crate::harness::claude::conflicts_set(ctx.env);
@@ -1883,6 +2132,7 @@ fn spawn_prologue(
     if let Some(id) = preset {
         save_session(ctx, id, record);
     }
+    ctx.live.spawned(ctx.bus, &spawn, Timestamp::now());
     Ok(())
 }
 
@@ -2353,11 +2603,12 @@ fn turn_account(
     }
 }
 
-/// The account for a Claude turn, new or resumed: the one named by
-/// `--profile`, or the usage-driven choice under the configured auth.
+/// The account for a Claude turn, new or resumed: the API key or profile
+/// named by `--profile`, or the usage-driven choice under the configured auth.
 fn fresh_account(ctx: &Ctx, r: &Resolved, profile: Option<&str>) -> Result<Selected> {
     if let Some(profile) = profile {
-        let account = Account::from_config(&ctx.cfg.claude, profile, ctx.env);
+        let account = Account::for_key(&ctx.cfg.claude, profile, ctx.env)
+            .unwrap_or_else(|| Account::from_config(&ctx.cfg.claude, profile, ctx.env));
         if let Err(missing) = account.require_credential() {
             bail!(missing);
         }
@@ -2370,7 +2621,15 @@ fn fresh_account(ctx: &Ctx, r: &Resolved, profile: Option<&str>) -> Result<Selec
 }
 
 fn select_account(ctx: &Ctx, r: &Resolved, source: &UsageSource) -> Result<Selected> {
-    let choice = crate::select::choose(&ctx.cfg.claude, ctx.env, &r.model, ctx.now, source, &[])?;
+    let choice = crate::select::choose(
+        &ctx.cfg.claude,
+        ctx.env,
+        &r.model,
+        ctx.now,
+        source,
+        &[],
+        ctx.keys(),
+    )?;
     Ok(selected(choice))
 }
 
@@ -2383,6 +2642,7 @@ fn selected(choice: crate::select::Choice) -> Selected {
         notes.push(format!("falling back to configured order: {reason}"));
     }
     notes.extend(choice.tier_note());
+    notes.extend(choice.key_notes.iter().cloned());
     Selected {
         account: choice.account,
         notes,
@@ -2454,7 +2714,6 @@ mod tests {
     use crate::usage::{ProfileUsage, UsageReport, UsageWindow};
     use claude_usage_mqtt_core::{AuthState, FIVE_HOUR};
     use jiff::SignedDuration;
-    use std::collections::BTreeMap;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
@@ -2475,12 +2734,13 @@ mod tests {
     }
 
     fn account() -> Account {
-        Account {
-            profile: "team03".into(),
+        let cfg = crate::config::ClaudeConfig {
             auth: ClaudeAuth::Token,
             token_dir: "/t".into(),
             profiles_dir: "/p".into(),
-        }
+            ..crate::config::ClaudeConfig::default()
+        };
+        Account::from_config(&cfg, "team03", &std::collections::BTreeMap::new())
     }
 
     fn at(now: Timestamp, hours: i64) -> Option<Timestamp> {
@@ -2732,16 +2992,45 @@ mod tests {
         }
 
         fn ctx<'a>(&'a self, usage: &'a (dyn Fn() -> UsageSource + Sync)) -> Ctx<'a> {
+            self.ctx_with_budget(usage, &no_budget)
+        }
+
+        fn ctx_with_budget<'a>(
+            &'a self,
+            usage: &'a (dyn Fn() -> UsageSource + Sync),
+            budget: &'a (dyn Fn() -> BTreeMap<String, BudgetView> + Sync),
+        ) -> Ctx<'a> {
             Ctx {
                 cfg: &self.cfg,
                 env: &self.env,
                 now: self.now,
                 usage,
+                budget,
+                api_keys_eligible: true,
+                bus: &crate::bus::NoBus,
+                live: &OFF,
                 audit: &self.audit,
                 session_locks: Arc::new(Mutex::new(Vec::new())),
             }
         }
+
+        /// A context that publishes to `bus` as `live`.
+        fn ctx_with_bus<'a>(
+            &'a self,
+            usage: &'a (dyn Fn() -> UsageSource + Sync),
+            budget: &'a (dyn Fn() -> BTreeMap<String, BudgetView> + Sync),
+            bus: &'a dyn Bus,
+            live: &'a Live,
+        ) -> Ctx<'a> {
+            Ctx {
+                bus,
+                live,
+                ..self.ctx_with_budget(usage, budget)
+            }
+        }
     }
+
+    static OFF: Live = Live::off();
 
     #[cfg(target_os = "linux")]
     struct SpawnedCli {
@@ -3294,6 +3583,405 @@ mod tests {
         );
         assert_eq!(payload.session.as_deref(), Some("preset-session"));
         assert_eq!(payload.profile.as_deref(), Some("team03"));
+    }
+
+    /// Configures `[claude.api_keys.<name>]` with a 0600 key file holding
+    /// `sk-ant-api-<name>`.
+    fn api_key(f: &mut Fixture, name: &str) {
+        let path = f.path("tokens").join(format!("{name}.key"));
+        std::fs::write(&path, format!("sk-ant-api-{name}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        f.cfg.claude.api_keys.insert(
+            name.into(),
+            crate::config::ApiKeyConfig {
+                key_file: path.display().to_string(),
+                budget_usd: 420.0,
+                models: vec!["*".into()],
+                reserve_usd: 0.0,
+                reset_tz: "UTC".into(),
+                exhausted_patterns: vec!["*credit balance is too low*".into()],
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_naming_a_key_runs_on_the_key_without_selection() {
+        for ambient in [false, true] {
+            let mut f = Fixture::new("run-api-key");
+            if ambient {
+                f.cfg.claude.profiles.clear();
+            }
+            api_key(&mut f, "team");
+            f.env
+                .insert("ANTHROPIC_API_KEY".into(), "sk-ant-inherited".into());
+            f.env.insert(
+                "CLAUDE_CONFIG_DIR".into(),
+                f.path("elsewhere").display().to_string(),
+            );
+            f.claude_script(OK_RESULT);
+            start_run(&f, Some(PromptSource::Arg), None, Some("hi"));
+            let usage = || -> UsageSource { panic!("selection consulted for --profile <key>") };
+            let mut out = Vec::new();
+            let completion = run_with(
+                &f.ctx(&usage),
+                "explorer",
+                Some(&f.work()),
+                "hi".into(),
+                Some("team"),
+                None,
+                false,
+                &mut out,
+            )
+            .unwrap();
+            assert_eq!(completion, 0, "ambient={ambient}");
+            record_completion(&f, completion);
+
+            let env = f.call("env");
+            assert!(
+                env.lines()
+                    .any(|l| l == "ANTHROPIC_API_KEY=sk-ant-api-team"),
+                "{env}"
+            );
+            assert!(!env.contains("sk-ant-inherited"), "{env}");
+            assert!(
+                !env.lines().any(|l| l.starts_with("CLAUDE_CONFIG_DIR=")),
+                "{env}"
+            );
+            assert!(
+                !env.lines()
+                    .any(|l| l.starts_with("CLAUDE_CODE_OAUTH_TOKEN=")),
+                "{env}"
+            );
+
+            let spawn = audit_records(&f)
+                .into_iter()
+                .find_map(|r| match r {
+                    audit::Record::Spawn(spawn) => Some(spawn),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(spawn.payload.profile.as_deref(), Some("team"));
+            assert_eq!(spawn.payload.auth, Some(ClaudeAuth::ApiKey));
+            let saved = session::load_from(&f.sessions_dir(), "9f22dd1b-aaaa").unwrap();
+            assert_eq!(saved.profile.as_deref(), Some("team"));
+            assert_eq!(saved.auth, Some(ClaudeAuth::ApiKey));
+
+            let trusted: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(f.path(".claude.json")).unwrap())
+                    .unwrap();
+            let cwd = std::fs::canonicalize(f.work()).unwrap();
+            assert_eq!(
+                trusted["projects"][cwd.to_str().unwrap()]["hasTrustDialogAccepted"],
+                serde_json::json!(true)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_naming_a_key_without_its_key_file_is_refused() {
+        let mut f = Fixture::new("run-api-key-missing");
+        api_key(&mut f, "team");
+        std::fs::remove_file(f.path("tokens/team.key")).unwrap();
+        f.claude_script(OK_RESULT);
+        let usage = || UsageSource::Unavailable("not consulted".into());
+        let mut out = Vec::new();
+        let err = run_with(
+            &f.ctx(&usage),
+            "explorer",
+            Some(&f.work()),
+            "hi".into(),
+            Some("team"),
+            None,
+            false,
+            &mut out,
+        )
+        .unwrap_err();
+        let message = format!("{:#}", err.error);
+        assert!(
+            message.contains("API key team has no credential at"),
+            "{message}"
+        );
+        assert!(!f.path("calls/argv").exists());
+    }
+
+    /// This host's ledger for the key `name`, if one was written.
+    fn key_ledger(f: &Fixture, name: &str) -> Option<crate::budget::Ledger> {
+        let text = std::fs::read_to_string(f.path("state/ccc/budget").join(format!("{name}.json")))
+            .ok()?;
+        Some(serde_json::from_str(&text).unwrap())
+    }
+
+    #[cfg(unix)]
+    fn pinned_run(f: &Fixture, profile: &str) -> Completion {
+        start_run(f, Some(PromptSource::Arg), None, Some("hi"));
+        let usage = || UsageSource::Unavailable("not consulted".into());
+        let mut out = Vec::new();
+        run_with(
+            &f.ctx(&usage),
+            "explorer",
+            Some(&f.work()),
+            "hi".into(),
+            Some(profile),
+            None,
+            false,
+            &mut out,
+        )
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_key_turn_is_charged_its_reported_cost_and_a_profile_turn_is_not() {
+        let _lock = test_io_lock();
+        let mut f = Fixture::new("run-api-key-charge");
+        api_key(&mut f, "team");
+        f.token("team03");
+        f.claude_script(OK_RESULT);
+        assert_eq!(pinned_run(&f, "team03"), 0);
+        assert!(key_ledger(&f, "team").is_none());
+        assert!(!f.path("state/ccc/budget/team03.json").exists());
+        assert_eq!(pinned_run(&f, "team"), 0);
+        assert_eq!(pinned_run(&f, "team"), 0);
+        let ledger = key_ledger(&f, "team").unwrap();
+        assert_eq!(
+            (ledger.usd, ledger.turns, ledger.unmeasured_turns),
+            (0.02, 2, 0)
+        );
+        assert!(ledger.exhausted.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_key_turn_without_a_cost_is_counted_unmeasured() {
+        let _lock = test_io_lock();
+        let mut f = Fixture::new("run-api-key-no-cost");
+        api_key(&mut f, "team");
+        f.claude_script(r#"{"session_id":"9f22dd1b-aaaa","result":"the answer","is_error":false,"num_turns":1}"#);
+        assert_eq!(pinned_run(&f, "team"), 0);
+        let ledger = key_ledger(&f, "team").unwrap();
+        assert_eq!(
+            (ledger.usd, ledger.turns, ledger.unmeasured_turns),
+            (0.0, 1, 1)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_terminated_key_turn_is_counted_unmeasured() {
+        let _signal_lock = PROCESS_SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut f = Fixture::new("run-api-key-signal");
+        api_key(&mut f, "team");
+        f.cfg.process.kill_grace_s = 0.2;
+        let binary = f.path("signalled-claude");
+        f.write_executable(&binary, "#!/bin/sh\ntrap 'exit 1' TERM\nsleep 5 & wait\n");
+        f.env
+            .insert("CCC_CLAUDE_BIN".into(), binary.display().to_string());
+        supervise::set_test_signal(true);
+        let mut input = "prompt".as_bytes();
+        let mut output = Vec::new();
+        let code = run_from(
+            "explorer",
+            Some(&f.work()),
+            Some("prompt"),
+            None,
+            Some("team"),
+            None,
+            false,
+            &f.env,
+            || Ok(f.cfg.clone()),
+            &mut input,
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(code, crate::harness::EXIT_NO_RESULT);
+        let ledger = key_ledger(&f, "team").unwrap();
+        assert_eq!(
+            (ledger.usd, ledger.turns, ledger.unmeasured_turns),
+            (0.0, 1, 1)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_key_turn_whose_prompt_fell_short_is_charged_what_it_reported() {
+        let prompt = "p".repeat(1024 * 1024);
+        let mut f = Fixture::new("run-api-key-shortfall");
+        api_key(&mut f, "team");
+        f.claude_custom_script(&format!(
+            "head -c 1 >/dev/null; printf '%s' '{}'",
+            OK_RESULT
+        ));
+        let mut input = "ignored".as_bytes();
+        let mut output = Vec::new();
+        let code = run_from_report(
+            "explorer",
+            Some(&f.work()),
+            Some(&prompt),
+            None,
+            Some("team"),
+            None,
+            &GooseFlags::default(),
+            false,
+            &f.env,
+            || Ok(f.cfg.clone()),
+            &mut input,
+            &mut output,
+            &|_| {},
+        )
+        .unwrap();
+        assert_eq!(code, crate::harness::EXIT_NO_RESULT);
+        let ledger = key_ledger(&f, "team").unwrap();
+        assert_eq!(
+            (ledger.usd, ledger.turns, ledger.unmeasured_turns),
+            (0.01, 1, 0)
+        );
+    }
+
+    fn refused_turn(message: &str) -> String {
+        serde_json::json!({
+            "session_id": "9f22dd1b-aaaa",
+            "result": message,
+            "is_error": true,
+            "num_turns": 1,
+            "total_cost_usd": 0.0,
+        })
+        .to_string()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_key_turn_refused_for_spend_raises_the_flag_and_is_limited() {
+        let _lock = test_io_lock();
+        let mut f = Fixture::new("run-api-key-exhausted");
+        api_key(&mut f, "team");
+        f.claude_script(&refused_turn(
+            "Your credit balance is too low to access the Anthropic API.",
+        ));
+        let completion = pinned_run(&f, "team");
+        assert_eq!(completion, crate::harness::EXIT_LIMITED);
+        assert!(
+            warned(&completion, &["team hit a usage limit", PINNED]),
+            "{:?}",
+            completion.end.warnings
+        );
+        let ledger = key_ledger(&f, "team").unwrap();
+        assert_eq!((ledger.turns, ledger.unmeasured_turns), (1, 0));
+        let flag = ledger.exhausted.unwrap();
+        assert_eq!(
+            flag.session.as_deref(),
+            Some(f.audit.lineage().invocation_id.as_str())
+        );
+        assert!(flag.message.unwrap().contains("credit balance is too low"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_key_turn_refused_otherwise_stays_a_reported_failure() {
+        let _lock = test_io_lock();
+        let mut f = Fixture::new("run-api-key-reported");
+        api_key(&mut f, "team");
+        f.claude_script(&refused_turn("Something else went wrong."));
+        let completion = pinned_run(&f, "team");
+        assert_eq!(completion, crate::harness::EXIT_HARNESS_FAILED);
+        let ledger = key_ledger(&f, "team").unwrap();
+        assert_eq!(ledger.turns, 1);
+        assert!(ledger.exhausted.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_ledger_costs_a_note_and_not_the_turn() {
+        let _lock = test_io_lock();
+        let mut f = Fixture::new("run-api-key-damaged");
+        api_key(&mut f, "team");
+        std::fs::create_dir_all(f.path("state/ccc/budget")).unwrap();
+        std::fs::write(f.path("state/ccc/budget/team.json"), "{damaged").unwrap();
+        f.claude_script(OK_RESULT);
+        let completion = pinned_run(&f, "team");
+        assert_eq!(completion, 0);
+        assert!(
+            warned(&completion, &["could not charge", "team", "damaged"]),
+            "{:?}",
+            completion.end.warnings
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_ledger_still_limits_a_turn_refused_for_spend() {
+        let _lock = test_io_lock();
+        let mut f = Fixture::new("run-api-key-damaged-exhausted");
+        api_key(&mut f, "team");
+        std::fs::create_dir_all(f.path("state/ccc/budget")).unwrap();
+        std::fs::write(f.path("state/ccc/budget/team.json"), "{damaged").unwrap();
+        f.claude_script(&refused_turn(
+            "Your credit balance is too low to access the Anthropic API.",
+        ));
+        let completion = pinned_run(&f, "team");
+        assert_eq!(completion, crate::harness::EXIT_LIMITED);
+        for needle in [
+            "could not charge",
+            "could not record API key team as exhausted",
+            "team hit a usage limit",
+        ] {
+            assert!(
+                warned(&completion, &[needle]),
+                "{needle}: {:?}",
+                completion.end.warnings
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_launch_form_refuses_a_key() {
+        let mut f = Fixture::new("launch-api-key");
+        api_key(&mut f, "team");
+        f.launch_script("exit 0", false);
+        start_launch(&f);
+        let usage = || UsageSource::Unavailable("not consulted".into());
+        let targets = [
+            LaunchTarget::Fresh {
+                agent: "explorer",
+                cwd: None,
+                cli_harness: None,
+                allow_read: &[],
+                allow_write: &[],
+                allow_exec: &[],
+            },
+            LaunchTarget::Roleless {
+                cwd: None,
+                model: None,
+                effort: None,
+            },
+            LaunchTarget::Resume {
+                id: "9f22dd1b-aaaa",
+                fork: false,
+            },
+            LaunchTarget::Resume {
+                id: "9f22dd1b-aaaa",
+                fork: true,
+            },
+        ];
+        for target in targets {
+            let err = launch_with_ctx(&f.ctx(&usage), target, Some("team"), vec![]).unwrap_err();
+            let message = format!("{:#}", err.error);
+            assert!(
+                message.contains("an API key account cannot be used at the terminal"),
+                "{message}"
+            );
+        }
+        assert!(!audit_records(&f)
+            .iter()
+            .any(|r| matches!(r, audit::Record::Spawn(_))));
     }
 
     #[cfg(unix)]
@@ -6393,6 +7081,516 @@ mod tests {
         );
     }
 
+    /// [`limited_run`] with this host's ledgers behind the budget closure.
+    #[cfg(unix)]
+    fn keyed_limited_run(
+        f: &Fixture,
+        usage: &(dyn Fn() -> UsageSource + Sync),
+    ) -> (Completion, String) {
+        start_run(f, Some(PromptSource::Arg), None, Some("go and look"));
+        let budget = || crate::budget::bus_views(&f.cfg, &f.env, f.now, &crate::bus::NoBus);
+        let ctx = f.ctx_with_budget(usage, &budget);
+        let mut out: Vec<u8> = Vec::new();
+        let completion = run_with(
+            &ctx,
+            "explorer",
+            Some(&f.work()),
+            "go and look".to_string(),
+            None,
+            None,
+            false,
+            &mut out,
+        )
+        .unwrap();
+        (completion, String::from_utf8(out).unwrap())
+    }
+
+    /// A usage closure answering `reads[n]` on its n-th call, the last
+    /// thereafter.
+    fn usage_reads(reads: Vec<UsageSource>) -> impl Fn() -> UsageSource + Sync {
+        let n = Mutex::new(0usize);
+        move || {
+            let mut n = n.lock().unwrap();
+            let i = (*n).min(reads.len() - 1);
+            *n += 1;
+            reads[i].clone()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_subscription_limit_hands_off_to_a_key_when_no_profile_has_quota() {
+        for profiles in [&["team03", "team04"][..], &["team03"][..]] {
+            let _lock = test_io_lock();
+            let mut f = Fixture::new("run-limited-to-key");
+            f.cfg.claude.profiles = profiles.iter().map(|p| p.to_string()).collect();
+            for p in profiles {
+                f.token(p);
+            }
+            api_key(&mut f, "team");
+            claude_turns(
+                &mut f,
+                &[limited_turn("9f22dd1b-aaaa"), OK_RESULT.to_string()],
+            );
+            let usage = || {
+                report(vec![
+                    snapshot(Timestamp::now(), "team03", 0.0, 10.0),
+                    snapshot(Timestamp::now(), "team04", 0.0, 100.0),
+                ])
+            };
+
+            let (completion, text) = keyed_limited_run(&f, &usage);
+            assert_eq!(completion, 0, "{profiles:?}: {text}");
+            assert!(text.contains("profile=team"), "{text}");
+            let inv = f.audit.lineage().invocation_id.clone();
+            assert_eq!(
+                spawned_profiles(&f),
+                vec![
+                    (inv.clone(), Some("team03".to_string())),
+                    (inv, Some("team".to_string())),
+                ]
+            );
+            assert!(
+                warned(&completion, &["team03 hit a usage limit", "on team"]),
+                "{:?}",
+                completion.end.warnings
+            );
+            let ledger = key_ledger(&f, "team").unwrap();
+            assert_eq!(ledger.turns, 1);
+            assert!((ledger.usd - 0.01).abs() < 1e-9);
+            let record = session::load_from(&f.sessions_dir(), "9f22dd1b-aaaa").unwrap();
+            assert_eq!(record.profile.as_deref(), Some("team"));
+            assert_eq!(record.auth, Some(ClaudeAuth::ApiKey));
+        }
+    }
+
+    /// Starts the fixture's audit as `ccc run explorer <prompt>` and returns
+    /// the start payload.
+    fn bus_start(f: &Fixture, prompt: &str) -> StartPayload {
+        let start = StartPayload {
+            pid: std::process::id(),
+            cmd: AuditCommand::Run,
+            agent: Some("explorer".into()),
+            session: None,
+            cwd_arg: Some(f.work()),
+            profile_arg: None,
+            harness_arg: None,
+            json: false,
+            prompt_source: Some(PromptSource::Arg),
+            prompt_file: None,
+            prompt: Some(prompt.into()),
+            passthrough: vec![],
+            fork: false,
+        };
+        f.audit.start(start.clone()).unwrap();
+        start
+    }
+
+    /// Runs the explorer on `profile` (selection when `None`) with a
+    /// recording bus, closes the bus as the audited path does, and returns
+    /// the completion and the bus.
+    fn bus_run(
+        f: &Fixture,
+        profile: Option<&str>,
+        usage: &(dyn Fn() -> UsageSource + Sync),
+        close_notes: Vec<String>,
+    ) -> (Completion, crate::bus::RecordingBus) {
+        let start = bus_start(f, "go and look");
+        let mut bus =
+            crate::bus::RecordingBus::new("ccc", "atlas", crate::bus::Remote::Records(vec![]));
+        bus.close_notes = close_notes;
+        let live = Live::new(
+            bus.identity(),
+            f.audit.lineage(),
+            &start,
+            "/cfg/agents.toml",
+            0,
+            f.now,
+        );
+        let budget = || crate::budget::bus_views(&f.cfg, &f.env, f.now, &bus);
+        let ctx = f.ctx_with_bus(usage, &budget, &bus, &live);
+        let mut out = Vec::new();
+        let mut completion = run_with(
+            &ctx,
+            "explorer",
+            Some(&f.work()),
+            "go and look".into(),
+            profile,
+            None,
+            false,
+            &mut out,
+        )
+        .unwrap();
+        let said = Mutex::new(Vec::new());
+        close_bus(&bus, &live, &mut completion.end, &|line| {
+            said.lock().unwrap().push(line.to_string())
+        });
+        let said = said.into_inner().unwrap();
+        let closed: Vec<_> = bus
+            .close_notes
+            .iter()
+            .map(|n| format!("note: {n}"))
+            .collect();
+        assert_eq!(said, closed);
+        assert!(completion.end.warnings.ends_with(&closed));
+        (completion, bus)
+    }
+
+    /// The top-level keys a session record may carry: the generic schema's.
+    const GENERIC_FIELDS: &[&str] = &[
+        "v",
+        "id",
+        "publisher",
+        "host",
+        "state",
+        "started_at",
+        "updated_at",
+        "parent",
+        "root",
+        "session",
+        "harness",
+        "model",
+        "agent",
+        "account",
+        "account_kind",
+        "cwd",
+        "pid",
+        "title",
+        "cost_usd",
+        "ended_at",
+        "duration_ms",
+        "ok",
+        "meta",
+    ];
+
+    #[cfg(unix)]
+    #[test]
+    fn a_key_turn_is_published_at_spawn_charged_and_ended() {
+        let _lock = test_io_lock();
+        let mut f = Fixture::new("run-bus-key");
+        api_key(&mut f, "team");
+        f.claude_script(OK_RESULT);
+        let usage = || UsageSource::Unavailable("not consulted".into());
+        let refused = "the broker refused a publish (NotAuthorized); check the ACL for claude/usage/agents/ccc/#";
+        let (completion, bus) = bus_run(&f, Some("team"), &usage, vec![refused.into()]);
+        assert_eq!(completion, 0);
+        assert!(
+            completion
+                .end
+                .warnings
+                .contains(&format!("note: {refused}")),
+            "{:?}",
+            completion.end.warnings
+        );
+        let inv = f.audit.lineage().invocation_id.clone();
+        let calls = bus.calls();
+        use crate::bus::Recorded;
+        let [Recorded::PutSession(running), Recorded::PutAccount(level), Recorded::PutSession(costed), Recorded::EndSession(ended), Recorded::Close] =
+            calls.as_slice()
+        else {
+            panic!("{calls:#?}");
+        };
+
+        assert_eq!(running.id, inv);
+        assert_eq!(running.root.as_deref(), Some(inv.as_str()));
+        assert_eq!(running.parent, None);
+        assert_eq!(
+            (running.publisher.as_str(), running.host.as_str()),
+            ("ccc", "atlas")
+        );
+        assert_eq!(running.state, claude_usage_mqtt_core::SessionState::Running);
+        assert_eq!(running.harness.as_deref(), Some("claude"));
+        assert_eq!(running.model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(running.agent.as_deref(), Some("explorer"));
+        assert_eq!(running.account.as_deref(), Some("team"));
+        assert_eq!(
+            running.account_kind,
+            Some(claude_usage_mqtt_core::AccountKind::ApiKey)
+        );
+        assert_eq!(running.pid, Some(std::process::id()));
+        assert!(running.cwd.as_deref().unwrap().ends_with("work"));
+        assert!(running.session.is_some());
+        assert_eq!(running.cost_usd, None);
+        assert_eq!(running.title, None);
+        assert_eq!(running.meta["cmd"], "run");
+        assert_eq!(running.meta["auth"], "api-key");
+        assert_eq!(running.meta["effort"], "low");
+        assert_eq!(running.meta["agents_config"], "/cfg/agents.toml");
+
+        assert_eq!(level.account, "team");
+        assert_eq!(
+            (level.publisher.as_str(), level.host.as_str()),
+            ("ccc", "atlas")
+        );
+        assert!((level.usd - 0.01).abs() < 1e-9);
+        assert_eq!(level.turns, Some(1));
+
+        assert_eq!(costed.cost_usd, Some(0.01));
+        assert_eq!(costed.state, claude_usage_mqtt_core::SessionState::Running);
+
+        assert_eq!(ended.state, claude_usage_mqtt_core::SessionState::Ended);
+        assert_eq!(ended.ok, Some(true));
+        assert_eq!(ended.cost_usd, Some(0.01));
+        assert_eq!(ended.session.as_deref(), Some("9f22dd1b-aaaa"));
+        assert_eq!(ended.meta["exit"], 0);
+        assert!(ended.ended_at.is_some() && ended.duration_ms.is_some());
+        let wire = serde_json::to_value(ended).unwrap();
+        for key in wire.as_object().unwrap().keys() {
+            assert!(
+                GENERIC_FIELDS.contains(&key.as_str()),
+                "{key} at the top level"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_key_turn_refused_for_spend_publishes_the_flagged_level_and_ends_not_ok() {
+        let _lock = test_io_lock();
+        let mut f = Fixture::new("run-bus-exhausted");
+        api_key(&mut f, "team");
+        f.claude_script(&refused_turn(
+            "Your credit balance is too low to access the Anthropic API.",
+        ));
+        let usage = || UsageSource::Unavailable("not consulted".into());
+        let (completion, bus) = bus_run(&f, Some("team"), &usage, vec![]);
+        assert_eq!(completion, crate::harness::EXIT_LIMITED);
+        let levels: Vec<_> = bus
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                crate::bus::Recorded::PutAccount(level) => Some(level),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(levels.len(), 2, "{levels:?}");
+        assert!(levels[0].exhausted.is_none());
+        let flag = levels[1].exhausted.as_ref().unwrap();
+        assert_eq!(
+            flag.session.as_deref(),
+            Some(f.audit.lineage().invocation_id.as_str())
+        );
+        let (is_end, ended) = bus.sessions().pop().unwrap();
+        assert!(is_end);
+        assert_eq!(ended.ok, Some(false));
+        assert_eq!(ended.meta["exit"], crate::harness::EXIT_LIMITED);
+        // The refusal reported a cost of zero.
+        assert_eq!(ended.cost_usd, Some(0.0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hand_off_puts_the_record_again_with_the_new_account_and_sums_the_cost() {
+        let _lock = test_io_lock();
+        let mut f = Fixture::new("run-bus-handoff");
+        f.cfg.claude.profiles = vec!["team03".into()];
+        f.token("team03");
+        api_key(&mut f, "team");
+        let limited_with_cost = serde_json::json!({
+            "session_id": "9f22dd1b-aaaa",
+            "result": LIMITED_MESSAGE,
+            "is_error": true,
+            "num_turns": 1,
+            "total_cost_usd": 0.25,
+        })
+        .to_string();
+        claude_turns(&mut f, &[limited_with_cost, OK_RESULT.to_string()]);
+        let usage = || report(vec![snapshot(Timestamp::now(), "team03", 0.0, 10.0)]);
+        let (completion, bus) = bus_run(&f, None, &usage, vec![]);
+        assert_eq!(completion, 0);
+        let accounts: Vec<_> = bus
+            .sessions()
+            .into_iter()
+            .filter(|(is_end, _)| !is_end)
+            .map(|(_, r)| (r.account, r.account_kind, r.cost_usd))
+            .collect();
+        use claude_usage_mqtt_core::AccountKind;
+        assert_eq!(
+            accounts,
+            vec![
+                (Some("team03".into()), Some(AccountKind::Subscription), None),
+                (
+                    Some("team03".into()),
+                    Some(AccountKind::Subscription),
+                    Some(0.25)
+                ),
+                (Some("team".into()), Some(AccountKind::ApiKey), Some(0.25)),
+                (Some("team".into()), Some(AccountKind::ApiKey), Some(0.26)),
+            ]
+        );
+        let (_, ended) = bus.sessions().pop().unwrap();
+        assert_eq!((ended.ok, ended.cost_usd), (Some(true), Some(0.26)));
+        // The hand-off's budget read went through the bus, levels first.
+        assert!(bus
+            .calls()
+            .iter()
+            .any(|c| matches!(c, crate::bus::Recorded::Fetch(levels) if levels.len() == 1)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn with_the_bus_off_a_run_keeps_no_record() {
+        let _lock = test_io_lock();
+        let mut f = Fixture::new("run-bus-off");
+        f.claude_script(OK_RESULT);
+        f.token("team03");
+        let usage = || report(vec![snapshot(Timestamp::now(), "team03", 0.0, 10.0)]);
+        let start = bus_start(&f, "go and look");
+        let live = Live::new(None, f.audit.lineage(), &start, "/a", 4, f.now);
+        let ctx = f.ctx_with_bus(&usage, &no_budget, &crate::bus::NoBus, &live);
+        let mut out = Vec::new();
+        let completion = run_with(
+            &ctx,
+            "explorer",
+            Some(&f.work()),
+            "go and look".into(),
+            None,
+            None,
+            false,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(completion, 0);
+        assert!(live.record().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_subscription_limit_does_not_spend_a_key_on_doubtful_data() {
+        let stale = |now: Timestamp| ProfileUsage {
+            stale_reason: Some("upstream poll failed".into()),
+            ..snapshot(now, "team04", 0.0, 10.0)
+        };
+        let with_fable = |now: Timestamp, name: &str| {
+            let mut s = snapshot(now, name, 0.0, 10.0);
+            s.windows.push(UsageWindow {
+                key: "7-day_fable".into(),
+                utilization: 10.0,
+                resets_at: at(now, 100),
+            });
+            s
+        };
+        for fable in [false, true] {
+            let _lock = test_io_lock();
+            let mut f = Fixture::new("run-limited-key-held");
+            if fable {
+                // The explorer's model counts as Fable work here.
+                f.cfg.claude.selection.fable_models = vec!["*haiku*".into()];
+            }
+            f.token("team03");
+            f.token("team04");
+            api_key(&mut f, "team");
+            claude_turns(
+                &mut f,
+                &[limited_turn("9f22dd1b-aaaa"), OK_RESULT.to_string()],
+            );
+            let usage = || {
+                let now = Timestamp::now();
+                report(vec![
+                    with_fable(now, "team03"),
+                    if fable {
+                        snapshot(now, "team04", 0.0, 10.0)
+                    } else {
+                        stale(now)
+                    },
+                ])
+            };
+
+            let (completion, text) = keyed_limited_run(&f, &usage);
+            assert_eq!(completion, crate::harness::EXIT_LIMITED, "{fable}: {text}");
+            assert_eq!(spawned_profiles(&f).len(), 1);
+            assert!(key_ledger(&f, "team").is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_exhausted_key_turn_continues_on_a_profile_or_exits_4() {
+        for profile_able in [true, false] {
+            let _lock = test_io_lock();
+            let mut f = Fixture::new("run-key-exhausted-handoff");
+            f.token("team03");
+            f.token("team04");
+            api_key(&mut f, "team");
+            claude_turns(
+                &mut f,
+                &[
+                    refused_turn("Your credit balance is too low to access the Anthropic API."),
+                    OK_RESULT.to_string(),
+                ],
+            );
+            let now = Timestamp::now();
+            let spent = report(vec![
+                snapshot(now, "team03", 0.0, 100.0),
+                snapshot(now, "team04", 0.0, 100.0),
+            ]);
+            let later = if profile_able {
+                report(vec![
+                    snapshot(now, "team03", 0.0, 100.0),
+                    snapshot(now, "team04", 0.0, 10.0),
+                ])
+            } else {
+                // No snapshot for either: nothing usable, only a fallback.
+                report(vec![])
+            };
+            let usage = usage_reads(vec![spent, later]);
+
+            let (completion, text) = keyed_limited_run(&f, &usage);
+            let inv = f.audit.lineage().invocation_id.clone();
+            let ledger = key_ledger(&f, "team").unwrap();
+            assert!(ledger.exhausted.is_some());
+            if profile_able {
+                assert_eq!(completion, 0, "{text}");
+                assert_eq!(
+                    spawned_profiles(&f),
+                    vec![
+                        (inv.clone(), Some("team".to_string())),
+                        (inv, Some("team04".to_string())),
+                    ]
+                );
+                assert!(
+                    warned(&completion, &["team hit a usage limit", "on team04"]),
+                    "{:?}",
+                    completion.end.warnings
+                );
+            } else {
+                assert_eq!(completion, crate::harness::EXIT_LIMITED, "{text}");
+                assert!(text.contains("[ccc] session=9f22dd1b-aaaa"), "{text}");
+                assert_eq!(spawned_profiles(&f), vec![(inv, Some("team".to_string()))]);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_launch_never_selects_a_key() {
+        let _lock = test_io_lock();
+        let mut f = Fixture::new("launch-no-key-selection");
+        f.token("team03");
+        f.cfg.claude.profiles = vec!["team03".into()];
+        api_key(&mut f, "team");
+        let usage = || report(vec![snapshot(Timestamp::now(), "team03", 0.0, 100.0)]);
+        let budget =
+            || -> BTreeMap<String, BudgetView> { panic!("the budget is read for a launch") };
+        let ctx = f.ctx_with_budget(&usage, &budget);
+        let terminal = ctx.at_terminal();
+        let picked = select_account(&terminal, &resolved(), &usage()).unwrap();
+        assert_eq!(picked.account.profile, "team03");
+        // The same selection outside a launch takes the key.
+        let budget = || crate::budget::bus_views(&f.cfg, &f.env, f.now, &crate::bus::NoBus);
+        let ctx = f.ctx_with_budget(&usage, &budget);
+        let picked = select_account(&ctx, &resolved(), &usage()).unwrap();
+        assert_eq!(picked.account.profile, "team");
+        assert!(
+            picked
+                .notes
+                .iter()
+                .any(|n| n.contains("using API key team")),
+            "{:?}",
+            picked.notes
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_limited_run_on_a_single_profile_exits_4_not_2() {
@@ -6809,6 +8007,10 @@ mod tests {
         profile: Option<&str>,
     ) -> Result<ResumePrepared> {
         resume_prologue(&f.ctx(usage), id, fork, AccountPick::Requested(profile))
+    }
+
+    fn no_budget() -> BTreeMap<String, BudgetView> {
+        BTreeMap::new()
     }
 
     fn usage_not_consulted() -> UsageSource {
@@ -13016,5 +14218,182 @@ mod tests {
         );
         assert!(!f.path("calls/argv").exists(), "goose was spawned");
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    const WITHHELD_NOTE: &str = "ANTHROPIC_API_KEY removed from the child's environment; an API key account is configured and a {} turn is not charged to it";
+
+    /// The interactive invocation `launch_invocation` builds for `harness`:
+    /// the Codex or Goose explorer, or the Claude one on a token profile.
+    fn launch_built(f: &mut Fixture, harness: Harness) -> Invocation {
+        let (agent, cli_harness) = match harness {
+            Harness::Codex => {
+                f.cfg.agents.insert(
+                    "explorer".into(),
+                    crate::config::AgentOverrides {
+                        codex_model: Some("gpt-5.6-terra".into()),
+                        ..Default::default()
+                    },
+                );
+                ("explorer", Some(Harness::Codex))
+            }
+            Harness::Goose => {
+                f.goose();
+                ("gexplorer", None)
+            }
+            Harness::Claude => {
+                f.token("team03");
+                f.cfg.claude.profiles = vec!["team03".into()];
+                ("explorer", None)
+            }
+        };
+        let usage = || report(vec![snapshot(Timestamp::now(), "team03", 0.0, 10.0)]);
+        let ctx = f.ctx(&usage);
+        let prepared = prepare(
+            &ctx,
+            agent,
+            Some(&f.work()),
+            None,
+            cli_harness,
+            &GooseFlags::default(),
+        )
+        .unwrap();
+        let LaunchPrepared { inv, r, .. } = launch_invocation(&ctx, prepared, vec![]).unwrap();
+        assert_eq!(r.harness, harness);
+        inv
+    }
+
+    fn removes_api_key(inv: &Invocation) -> bool {
+        inv.env_remove.iter().any(|v| v == "ANTHROPIC_API_KEY")
+    }
+
+    #[test]
+    fn codex_and_goose_children_lose_the_api_key_only_when_a_key_is_configured() {
+        for harness in [Harness::Codex, Harness::Goose] {
+            for (configured, inherited, noted) in [
+                (true, Some("sk-ant-shell"), true),
+                (true, None, false),
+                (true, Some("  "), false),
+                (false, Some("sk-ant-shell"), false),
+            ] {
+                let label = format!("withhold-{harness}-{configured}-{inherited:?}");
+                let mut f = Fixture::new("withhold-key");
+                if configured {
+                    api_key(&mut f, "team");
+                }
+                if let Some(value) = inherited {
+                    f.env.insert("ANTHROPIC_API_KEY".into(), value.into());
+                }
+                let built = launch_built(&mut f, harness);
+                assert!(!removes_api_key(&built), "{label}: {built:?}");
+                let mut inv = built.clone();
+                let note = withhold_api_key(&f.cfg, &f.env, harness, &mut inv);
+                if configured {
+                    assert!(removes_api_key(&inv), "{label}: {inv:?}");
+                    assert_eq!(inv.env_set, built.env_set, "{label}");
+                } else {
+                    assert_eq!(inv, built, "{label}: nothing changes without a key");
+                }
+                let expected = noted.then(|| WITHHELD_NOTE.replace("{}", &harness.to_string()));
+                assert_eq!(note, expected, "{label}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_goose_env_api_key_is_kept_with_a_key_configured() {
+        let mut f = Fixture::new("withhold-goose-env");
+        api_key(&mut f, "team");
+        f.env
+            .insert("ANTHROPIC_API_KEY".into(), "sk-ant-shell".into());
+        f.cfg
+            .goose
+            .env
+            .insert("ANTHROPIC_API_KEY".into(), "sk-ant-goose".into());
+        let mut inv = launch_built(&mut f, Harness::Goose);
+        let built = inv.clone();
+        assert_eq!(
+            withhold_api_key(&f.cfg, &f.env, Harness::Goose, &mut inv),
+            None
+        );
+        assert_eq!(inv, built);
+        assert!(inv
+            .env_set
+            .iter()
+            .any(|(k, v)| k == "ANTHROPIC_API_KEY" && v == "sk-ant-goose"));
+        assert!(!removes_api_key(&inv), "{inv:?}");
+    }
+
+    #[test]
+    fn a_claude_invocation_is_left_to_its_account() {
+        let mut f = Fixture::new("withhold-claude");
+        api_key(&mut f, "team");
+        f.env
+            .insert("ANTHROPIC_API_KEY".into(), "sk-ant-shell".into());
+        let mut inv = launch_built(&mut f, Harness::Claude);
+        let built = inv.clone();
+        assert_eq!(
+            withhold_api_key(&f.cfg, &f.env, Harness::Claude, &mut inv),
+            None
+        );
+        assert_eq!(inv, built);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_codex_turn_with_a_key_configured_records_the_withheld_key_once() {
+        let mut f = Fixture::new("withhold-codex-drive");
+        api_key(&mut f, "team");
+        f.env
+            .insert("ANTHROPIC_API_KEY".into(), "sk-ant-shell".into());
+        std::fs::create_dir_all(f.path("calls")).unwrap();
+        f.codex_script(&format!(
+            "env > '{}'\nprintf '%s\\n' '{{\"type\":\"thread.started\",\"thread_id\":\"t-withheld\"}}' '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"answer\"}}}}' '{{\"type\":\"turn.completed\",\"usage\":{{}}}}'",
+            f.path("calls/env").display()
+        ));
+        let usage = || UsageSource::Unavailable("not consulted".into());
+        let ctx = f.ctx(&usage);
+        let mut resolved = resolved();
+        resolved.harness = Harness::Codex;
+        resolved.model = "gpt-5.6-luna".into();
+        let common = Common {
+            cwd: f.path("work"),
+            extra_args: vec![],
+            mode: run_mode(),
+            preset_session_id: None,
+        };
+        let diagnostics = Mutex::new(Vec::new());
+        let record = record_of(&resolved, &common.cwd, None, ctx.now);
+        let result = drive_with_meta_report(
+            &ctx,
+            &resolved,
+            &common,
+            None,
+            vec![],
+            &|message| diagnostics.lock().unwrap().push(message),
+            &record,
+        )
+        .unwrap();
+        assert!(result.result.is_ok());
+        let note = WITHHELD_NOTE.replace("{}", "codex");
+        assert_eq!(*diagnostics.lock().unwrap(), vec![format!("note: {note}")]);
+        let records = audit::read_trace(
+            &Recorder::dir_in(&f.env),
+            ctx.audit.lineage().trace_id.as_str(),
+        )
+        .unwrap();
+        let notes: Vec<Vec<String>> = records
+            .into_iter()
+            .filter_map(|r| match r {
+                audit::Record::Spawn(s) => Some(s.payload.selection_notes),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notes, vec![vec![note]]);
+        assert!(
+            !f.call("env")
+                .lines()
+                .any(|l| l.starts_with("ANTHROPIC_API_KEY=")),
+            "the Codex child inherited the key"
+        );
     }
 }

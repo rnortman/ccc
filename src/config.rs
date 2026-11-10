@@ -50,12 +50,14 @@ impl std::fmt::Display for Harness {
     }
 }
 
-/// How the Claude harness is pointed at an account.
+/// How the Claude harness is pointed at an account. `ApiKey` names what a
+/// turn ran under; it is not a way to authenticate `[claude] profiles`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ClaudeAuth {
     Token,
     ConfigDir,
+    ApiKey,
 }
 
 impl ClaudeAuth {
@@ -63,6 +65,7 @@ impl ClaudeAuth {
         match self {
             ClaudeAuth::Token => "token",
             ClaudeAuth::ConfigDir => "config-dir",
+            ClaudeAuth::ApiKey => "api-key",
         }
     }
 }
@@ -231,6 +234,7 @@ pub struct Config {
     pub codex: CodexConfig,
     pub goose: GooseConfig,
     pub mqtt: MqttConfig,
+    pub bus: BusConfig,
     pub process: ProcessConfig,
     pub launch: LaunchConfig,
 }
@@ -244,12 +248,15 @@ struct SiteFile {
     codex: CodexConfig,
     goose: GooseConfig,
     mqtt: MqttConfig,
+    bus: BusConfig,
     process: ProcessConfig,
     launch: LaunchConfig,
 }
 
 /// Top-level keys of [`SiteFile`].
-const SITE_KEYS: &[&str] = &["claude", "codex", "goose", "mqtt", "process", "launch"];
+const SITE_KEYS: &[&str] = &[
+    "claude", "codex", "goose", "mqtt", "bus", "process", "launch",
+];
 
 /// The agents config file: where agent definitions live and how to route them.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -339,6 +346,8 @@ pub struct ClaudeConfig {
     pub profiles_dir: String,
     pub extra_args: Vec<String>,
     pub selection: SelectionConfig,
+    /// `[claude.api_keys.<name>]`: Claude Platform API key accounts.
+    pub api_keys: BTreeMap<String, ApiKeyConfig>,
 }
 
 impl Default for ClaudeConfig {
@@ -351,7 +360,90 @@ impl Default for ClaudeConfig {
             profiles_dir: "~/.claude-profiles".to_string(),
             extra_args: Vec::new(),
             selection: SelectionConfig::default(),
+            api_keys: BTreeMap::new(),
         }
+    }
+}
+
+/// The message globs that mark a refused key turn as the credit running out.
+// TODO(api-key-assumptions-unconfirmed): A2 — this pattern is a guess at the
+// Platform's credit-gone message, and no default matches the spend-limit
+// refusal; neither has been seen from a real key.
+pub const DEFAULT_EXHAUSTED_PATTERNS: &[&str] = &["*credit balance is too low*"];
+
+/// One `[claude.api_keys.<name>]`: a Claude Platform API key with a monthly
+/// dollar budget. `key_file`, `budget_usd` and `models` have no default.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiKeyConfig {
+    /// Mode 0600, one non-empty line; `~` is expanded.
+    pub key_file: String,
+    pub budget_usd: f64,
+    /// Globs over the resolved model; a key never takes a model none matches.
+    pub models: Vec<String>,
+    /// How far short of `budget_usd` selection stops spending the key.
+    #[serde(default)]
+    pub reserve_usd: f64,
+    /// IANA zone whose calendar month is the budget period.
+    #[serde(default = "default_reset_tz")]
+    pub reset_tz: String,
+    /// Globs over a failed turn's message that mean the key is out of credit.
+    #[serde(default = "default_exhausted_patterns")]
+    pub exhausted_patterns: Vec<String>,
+}
+
+fn default_reset_tz() -> String {
+    "UTC".to_string()
+}
+
+fn default_exhausted_patterns() -> Vec<String> {
+    DEFAULT_EXHAUSTED_PATTERNS
+        .iter()
+        .map(|p| p.to_string())
+        .collect()
+}
+
+impl ApiKeyConfig {
+    /// Refuses a key table no budget can be kept against; `name` is the
+    /// table's key.
+    fn validate(&self, name: &str, profiles: &[String]) -> Result<()> {
+        let table = format!("[claude.api_keys.{name}]");
+        if !claude_usage_mqtt_core::is_topic_safe(name) {
+            anyhow::bail!("{table}: the name may use only A-Z, a-z, 0-9, '.', '_' and '-'");
+        }
+        if profiles.iter().any(|p| p == name) {
+            anyhow::bail!(
+                "{table}: {name} is also in [claude] profiles; a key and a profile cannot share a name"
+            );
+        }
+        if !self.budget_usd.is_finite() || self.budget_usd <= 0.0 {
+            anyhow::bail!(
+                "{table} budget_usd must be a finite number greater than 0 (got {})",
+                self.budget_usd
+            );
+        }
+        if !self.reserve_usd.is_finite()
+            || self.reserve_usd < 0.0
+            || self.reserve_usd >= self.budget_usd
+        {
+            anyhow::bail!(
+                "{table} reserve_usd must be a finite number, at least 0 and below budget_usd (got {})",
+                self.reserve_usd
+            );
+        }
+        if self.models.is_empty() {
+            anyhow::bail!("{table} models must name at least one model glob");
+        }
+        if self.exhausted_patterns.is_empty() {
+            anyhow::bail!("{table} exhausted_patterns must name at least one message glob");
+        }
+        if let Err(e) = jiff::tz::TimeZone::get(&self.reset_tz) {
+            anyhow::bail!(
+                "{table} reset_tz {:?} is not a known time zone: {e}",
+                self.reset_tz
+            );
+        }
+        Ok(())
     }
 }
 
@@ -689,6 +781,64 @@ pub struct MqttConfig {
     pub config: Option<String>,
 }
 
+/// `[bus]`: publishing this host's invocations and API key spend into the
+/// agent tree of the usage broker named by `[mqtt]`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct BusConfig {
+    /// Off: no connection, nothing published, budgets read this host only.
+    pub enabled: bool,
+    /// The `<pub>` segment of every topic. Topic-safe.
+    pub publisher: String,
+    /// The `<h>` segment; `None` takes the system hostname.
+    pub host: Option<String>,
+    /// How many leading characters of the prompt go into a session's
+    /// `title`; 0 publishes no prompt text.
+    pub prompt_chars: usize,
+    pub connect_timeout_ms: u64,
+    /// The most a clean exit waits for queued publishes.
+    pub flush_timeout_ms: u64,
+}
+
+impl Default for BusConfig {
+    fn default() -> Self {
+        BusConfig {
+            enabled: false,
+            publisher: "ccc".to_string(),
+            host: None,
+            prompt_chars: 0,
+            connect_timeout_ms: 3000,
+            flush_timeout_ms: 2000,
+        }
+    }
+}
+
+impl BusConfig {
+    fn validate(&self) -> Result<()> {
+        if !claude_usage_mqtt_core::is_topic_safe(&self.publisher) {
+            anyhow::bail!(
+                "[bus] publisher {:?} is not topic-safe (letters, digits, '.', '_', '-')",
+                self.publisher
+            );
+        }
+        if let Some(host) = &self.host {
+            if !claude_usage_mqtt_core::is_topic_safe(host) {
+                anyhow::bail!(
+                    "[bus] host {host:?} is not topic-safe (letters, digits, '.', '_', '-')"
+                );
+            }
+        }
+        if self.connect_timeout_ms == 0 || self.flush_timeout_ms == 0 {
+            anyhow::bail!(
+                "[bus] connect_timeout_ms and flush_timeout_ms must be greater than 0 (got {} and {})",
+                self.connect_timeout_ms,
+                self.flush_timeout_ms
+            );
+        }
+        Ok(())
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config::compose(SiteFile::default(), AgentsFile::default())
@@ -760,12 +910,21 @@ impl Config {
             codex: site.codex,
             goose: site.goose,
             mqtt: site.mqtt,
+            bus: site.bus,
             process: site.process,
             launch: site.launch,
         }
     }
 
     fn validate(&self) -> Result<()> {
+        if self.claude.auth == ClaudeAuth::ApiKey {
+            anyhow::bail!(
+                "[claude] auth = \"api-key\" is not a way to authenticate profiles; configure API keys under [claude.api_keys.<name>]"
+            );
+        }
+        for (name, key) in &self.claude.api_keys {
+            key.validate(name, &self.claude.profiles)?;
+        }
         self.claude.selection.validate()?;
         // A typo in an override name would silently leave that account on the
         // global knobs.
@@ -788,6 +947,7 @@ impl Config {
             );
         }
         self.goose.validate()?;
+        self.bus.validate()?;
         Ok(())
     }
 
@@ -1158,6 +1318,96 @@ mod tests {
             site_cfg("[launch]\nmodle = \"opus\"\n").unwrap_err()
         );
         assert!(err.contains("modle"), "{err}");
+    }
+
+    const KEY: &str = "[claude.api_keys.team]\nkey_file = \"~/keys/team.key\"\nbudget_usd = 420.0\nmodels = [\"*fable*\"]\n";
+
+    #[test]
+    fn api_keys_parse_with_their_defaults() {
+        assert!(site_cfg("").unwrap().claude.api_keys.is_empty());
+        let c = site_cfg(KEY).unwrap();
+        // A key needs no profiles: with none it is reachable through --profile.
+        assert!(c.claude.ambient());
+        let key = &c.claude.api_keys["team"];
+        assert_eq!(key.key_file, "~/keys/team.key");
+        assert_eq!(key.budget_usd, 420.0);
+        assert_eq!(key.models, vec!["*fable*".to_string()]);
+        assert_eq!(key.reserve_usd, 0.0);
+        assert_eq!(key.reset_tz, "UTC");
+        assert_eq!(
+            key.exhausted_patterns,
+            vec!["*credit balance is too low*".to_string()]
+        );
+        let c = site_cfg(&format!(
+            "{KEY}reserve_usd = 20.0\nreset_tz = \"America/New_York\"\nexhausted_patterns = [\"*spend limit*\"]\n"
+        ))
+        .unwrap();
+        let key = &c.claude.api_keys["team"];
+        assert_eq!(key.reserve_usd, 20.0);
+        assert_eq!(key.reset_tz, "America/New_York");
+        assert_eq!(key.exhausted_patterns, vec!["*spend limit*".to_string()]);
+    }
+
+    #[test]
+    fn api_key_tables_are_refused_by_name() {
+        let refused = |text: &str, expected: &str| {
+            let err = format!("{:#}", site_cfg(text).unwrap_err());
+            assert!(err.contains(expected), "{text}\n=> {err}");
+        };
+        for field in ["key_file", "budget_usd", "models"] {
+            let text: String = KEY
+                .lines()
+                .filter(|l| !l.starts_with(field))
+                .map(|l| format!("{l}\n"))
+                .collect();
+            refused(&text, field);
+        }
+        refused(&format!("{KEY}budgte_usd = 1.0\n"), "budgte_usd");
+        refused(
+            &KEY.replace("api_keys.team]", "api_keys.\"te am\"]"),
+            "[claude.api_keys.te am]: the name may use only",
+        );
+        refused(
+            &format!("[claude]\nprofiles = [\"team\"]\n{KEY}"),
+            "team is also in [claude] profiles",
+        );
+        for budget in ["0.0", "-1.0", "nan", "inf"] {
+            refused(
+                &KEY.replace("420.0", budget),
+                "[claude.api_keys.team] budget_usd must be",
+            );
+        }
+        for reserve in ["-1.0", "420.0", "500.0", "nan"] {
+            refused(
+                &format!("{KEY}reserve_usd = {reserve}\n"),
+                "[claude.api_keys.team] reserve_usd must be",
+            );
+        }
+        refused(
+            &KEY.replace("[\"*fable*\"]", "[]"),
+            "[claude.api_keys.team] models must",
+        );
+        refused(
+            &format!("{KEY}exhausted_patterns = []\n"),
+            "[claude.api_keys.team] exhausted_patterns must",
+        );
+        refused(
+            &format!("{KEY}reset_tz = \"Mars/Olympus_Mons\"\n"),
+            "[claude.api_keys.team] reset_tz \"Mars/Olympus_Mons\" is not a known time zone",
+        );
+    }
+
+    #[test]
+    fn api_key_auth_is_refused_for_profiles() {
+        let err = format!(
+            "{:#}",
+            site_cfg("[claude]\nauth = \"api-key\"\n").unwrap_err()
+        );
+        assert!(
+            err.contains("[claude] auth = \"api-key\" is not a way"),
+            "{err}"
+        );
+        assert_eq!(ClaudeAuth::ApiKey.as_str(), "api-key");
     }
 
     #[test]
@@ -1932,6 +2182,49 @@ box_ro = [\"{entry}\"]
         assert_eq!(blank_to_none(Some("".into())), None);
         assert_eq!(blank_to_none(Some("m".into())).as_deref(), Some("m"));
         assert_eq!(blank_to_none(None), None);
+    }
+
+    #[test]
+    fn bus_defaults_when_the_section_is_absent() {
+        let cfg = site_cfg("").unwrap();
+        assert!(!cfg.bus.enabled);
+        assert_eq!(cfg.bus.publisher, "ccc");
+        assert_eq!(cfg.bus.host, None);
+        assert_eq!(cfg.bus.prompt_chars, 0);
+        assert_eq!(cfg.bus.connect_timeout_ms, 3000);
+        assert_eq!(cfg.bus.flush_timeout_ms, 2000);
+        assert!(cfg.claude.api_keys.is_empty());
+
+        let cfg = site_cfg(
+            "[bus]\nenabled = true\npublisher = \"ccc-lab\"\nhost = \"atlas\"\nprompt_chars = 40\nconnect_timeout_ms = 500\nflush_timeout_ms = 100\n",
+        )
+        .unwrap();
+        assert!(cfg.bus.enabled);
+        assert_eq!(cfg.bus.publisher, "ccc-lab");
+        assert_eq!(cfg.bus.host.as_deref(), Some("atlas"));
+        assert_eq!(cfg.bus.prompt_chars, 40);
+        assert_eq!(cfg.bus.connect_timeout_ms, 500);
+        assert_eq!(cfg.bus.flush_timeout_ms, 100);
+    }
+
+    #[test]
+    fn bus_values_that_cannot_name_a_topic_or_bound_a_wait_are_refused() {
+        let cases = [
+            ("publisher = \"c c\"", "publisher"),
+            ("publisher = \"\"", "publisher"),
+            ("publisher = \"ccc/x\"", "publisher"),
+            ("host = \"at+las\"", "host"),
+            ("connect_timeout_ms = 0", "connect_timeout_ms"),
+            ("flush_timeout_ms = 0", "flush_timeout_ms"),
+        ];
+        for (line, key) in cases {
+            let text = format!("[bus]\n{line}\n");
+            let err = site_cfg(&text).unwrap_err().root_cause().to_string();
+            assert!(err.contains(key), "{line} gave {err}");
+            assert!(err.contains("[bus]"), "{line} gave {err}");
+        }
+        let err = format!("{:#}", site_cfg("[bus]\ntopic = \"x\"\n").unwrap_err());
+        assert!(err.contains("topic"), "{err}");
     }
 
     #[test]

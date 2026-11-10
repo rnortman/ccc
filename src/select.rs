@@ -13,12 +13,15 @@
 //! a positive score (tier 1) beats any account in its 5-hour ramp or scoring
 //! zero (tier 2), whatever the weekly rates say.
 
+use std::collections::BTreeMap;
+
 use anyhow::{bail, Result};
 use claude_usage_mqtt_core::{AuthState, FIVE_HOUR};
 use jiff::{SignedDuration, Timestamp};
 
 use crate::audit_view::sanitize;
-use crate::config::{ClaudeConfig, EnvSource, SelectionConfig};
+use crate::budget::BudgetView;
+use crate::config::{ApiKeyConfig, ClaudeConfig, EnvSource, SelectionConfig};
 use crate::glob::any_match;
 use crate::harness::claude::Account;
 use crate::harness::diag;
@@ -59,6 +62,8 @@ pub struct Scored {
     pub usable: bool,
     /// Why this profile is unusable; always `None` for a candidate.
     pub reason: Option<String>,
+    /// `reason` as a type: set exactly when `reason` is.
+    pub out: Option<Out>,
     /// Things worth knowing about a profile that is a candidate, in the order
     /// they were found: the scoring pass it came from, then why it is in tier
     /// 2. Always empty for an unusable profile.
@@ -96,15 +101,27 @@ impl Scored {
     }
 }
 
-/// The selected account, with the table behind the decision.
-#[derive(Debug, Clone)]
-pub struct Choice {
-    pub account: Account,
-    pub scored: Vec<Scored>,
-    /// Set when the choice fell back to preference order instead of a score.
-    pub degraded: Option<String>,
-    /// Profiles dropped before scoring, and why.
-    pub warnings: Vec<String>,
+/// Why a scored profile is unusable, as a type: the key rule
+/// (`lets_key_spend`) reads this and never the text of `reason`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Out {
+    /// The login is not `Ok`.
+    Auth,
+    /// The daemon carried the reading forward.
+    CarriedForward,
+    /// The reading is older than `stale_grace_s`.
+    Stale,
+    /// No snapshot is published for the profile.
+    NoSnapshot,
+    /// The broker could not be read, or the daemon reports itself offline.
+    NoData,
+    /// The 5-hour window is at or below its floor.
+    FiveHourFloor,
+    /// No window matched `general_windows`.
+    NoGeneralWindow,
+    /// No window matched `fable_windows`, for a Fable model.
+    NoFableWindow,
 }
 
 impl Choice {
@@ -120,6 +137,9 @@ impl Choice {
         }
         if let Some(note) = self.tier_note() {
             diag(note);
+        }
+        for note in &self.key_notes {
+            diag(format_args!("note: {note}"));
         }
     }
 
@@ -150,14 +170,90 @@ struct Features {
     fable: Option<Bucket>,
 }
 
+/// The API keys a selection may overflow to.
+#[derive(Clone, Copy)]
+pub struct Keys<'a> {
+    /// False for a turn at the terminal: no key is considered.
+    pub eligible: bool,
+    /// Every configured key's budget view; called at most once per selection,
+    /// and only when a key passes the gates that need no budget.
+    pub budget: &'a dyn Fn() -> BTreeMap<String, BudgetView>,
+}
+
+/// What selection made of the API keys.
+#[derive(Debug, Clone, PartialEq)]
+pub enum KeyDecision {
+    /// No key is configured, or keys are not eligible for this turn.
+    Ineligible,
+    /// A profile with a positive score won; keys were not looked at.
+    ProfileWon,
+    /// No profile is out of quota.
+    NoProfileOut,
+    /// A profile may still have quota: `<profile>: <reason>`, joined.
+    HeldBack(String),
+    /// The keys were looked at: the one taken, or why each was passed over.
+    Looked {
+        took: Option<String>,
+        passed: Vec<(String, String)>,
+    },
+}
+
+/// The selected account, with the table behind the decision.
+#[derive(Debug, Clone)]
+pub struct Choice {
+    pub account: Account,
+    pub scored: Vec<Scored>,
+    /// Set when the choice fell back to preference order instead of a score.
+    pub degraded: Option<String>,
+    /// Profiles dropped before scoring, and why.
+    pub warnings: Vec<String>,
+    pub keys: KeyDecision,
+    /// What the key rule has to say about this choice, one line each.
+    pub key_notes: Vec<String>,
+}
+
+/// One profile's answer to "does this profile let a key spend?".
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Lets {
+    Yes,
+    No,
+}
+
+/// A scored profile's answer to "does this profile let a key spend?", one
+/// arm per row of the rule.
+fn lets_key_spend(s: &Scored) -> Lets {
+    match s.out {
+        // Usable. It scores zero only when a bucket the model draws on is
+        // spent; otherwise it wins.
+        None if s.score > 0.0 => Lets::No,
+        None => Lets::Yes,
+        // The floor is a margin the operator set, and the window refills
+        // within five hours.
+        Some(Out::FiveHourFloor) => Lets::No,
+        // The snapshot cannot tell an account without Fable from a Fable
+        // bucket that went unread.
+        Some(Out::NoFableWindow) => Lets::No,
+        // Absent or doubtful data never spends money.
+        Some(
+            Out::Auth
+            | Out::CarriedForward
+            | Out::Stale
+            | Out::NoSnapshot
+            | Out::NoData
+            | Out::NoGeneralWindow,
+        ) => Lets::No,
+    }
+}
+
 /// Pick the account for a Claude run: drop profiles with no local credential,
-/// score the rest against the retained usage, and fall back to preference
+/// score the rest against the retained usage, overflow to an API key when
+/// every profile is out of quota, and otherwise fall back to preference
 /// order whenever the data cannot support a decision.
 ///
-/// Profiles named in `exclude` are not considered at all.
+/// Profiles and keys named in `exclude` are not considered at all.
 ///
-/// The only error is having no credentialed profile at all — there is nothing
-/// left to run as. Not called with empty `profiles`: that is the ambient
+/// The only error is having nothing to run as: no credentialed profile left
+/// and no key taken. Not called with empty `profiles`: that is the ambient
 /// login, which has no account to choose.
 pub fn choose(
     claude: &ClaudeConfig,
@@ -166,10 +262,16 @@ pub fn choose(
     now: Timestamp,
     usage: &UsageSource,
     exclude: &[String],
+    keys: Keys<'_>,
 ) -> Result<Choice> {
     let mut candidates: Vec<Account> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut looked_for: Vec<String> = Vec::new();
+    let excluded: Vec<&String> = claude
+        .profiles
+        .iter()
+        .filter(|p| exclude.contains(p))
+        .collect();
     for profile in claude.profiles.iter().filter(|p| !exclude.contains(p)) {
         let account = Account::from_config(claude, profile, env);
         match account.require_credential() {
@@ -179,18 +281,6 @@ pub fn choose(
                 looked_for.push(account.credential_path().display().to_string());
             }
         }
-    }
-    if candidates.is_empty() {
-        if looked_for.is_empty() {
-            bail!(
-                "no configured Claude profile is left once {} is set aside",
-                exclude.join(", ")
-            );
-        }
-        bail!(
-            "no configured Claude profile has a local credential; looked for {}",
-            looked_for.join(", ")
-        );
     }
 
     let names: Vec<String> = candidates.iter().map(|a| a.profile.clone()).collect();
@@ -205,24 +295,125 @@ pub fn choose(
         UsageSource::Report(r) => (Some(r), None),
     };
 
-    let scored = match report {
-        Some(r) => score_all(&claude.selection, &names, r, model, now),
-        None => {
-            let reason = degraded.clone().unwrap_or_default();
-            names
-                .iter()
-                .map(|p| unscored(&claude.selection, p, reason.clone()))
-                .collect::<Vec<_>>()
+    let scored = if names.is_empty() {
+        Vec::new()
+    } else {
+        match report {
+            Some(r) => score_all(&claude.selection, &names, r, model, now),
+            None => {
+                let reason = degraded.clone().unwrap_or_default();
+                names
+                    .iter()
+                    .map(|p| unscored(&claude.selection, p, Out::NoData, reason.clone()))
+                    .collect::<Vec<_>>()
+            }
         }
     };
 
     let best = best_of(&scored);
-    let account = match best {
-        Some(profile) => candidates
+    let winner = |profile: &str| {
+        candidates
             .iter()
             .find(|a| a.profile == profile)
             .cloned()
-            .expect("the scored profiles are the candidate profiles"),
+            .expect("the scored profiles are the candidate profiles")
+    };
+    let wins_outright = best.as_deref().and_then(|profile| {
+        scored
+            .iter()
+            .find(|s| s.profile == profile && s.score > 0.0)
+            .map(|_| profile)
+    });
+    let mut key_notes = Vec::new();
+    let decision = if !keys.eligible || claude.api_keys.is_empty() {
+        KeyDecision::Ineligible
+    } else if wins_outright.is_some() {
+        KeyDecision::ProfileWon
+    } else {
+        let held: Vec<String> = scored
+            .iter()
+            .filter(|s| lets_key_spend(s) == Lets::No)
+            .map(|s| format!("{}: {}", s.profile, profile_state(s)))
+            .collect();
+        let out_of_quota: Vec<String> = excluded
+            .iter()
+            .map(|p| format!("{p}: set aside"))
+            .chain(
+                scored
+                    .iter()
+                    .filter(|s| lets_key_spend(s) == Lets::Yes)
+                    .map(|s| format!("{}: {}", s.profile, profile_state(s))),
+            )
+            .collect();
+        if !held.is_empty() {
+            let held = held.join("; ");
+            key_notes.push(format!("API key not considered: {held}"));
+            KeyDecision::HeldBack(held)
+        } else if out_of_quota.is_empty() {
+            KeyDecision::NoProfileOut
+        } else {
+            let (took, passed) = pick_key(claude, env, model, exclude, keys.budget);
+            if let Some((name, view)) = &took {
+                key_notes.push(format!(
+                    "no profile can take {model} ({}); using API key {name}: ${:.2} of ${:.2} spent this month{}",
+                    out_of_quota.join("; "),
+                    view.spent_usd,
+                    view.budget_usd,
+                    if view.remote {
+                        String::new()
+                    } else {
+                        format!(" ({})", crate::budget::THIS_HOST_ONLY)
+                    },
+                ));
+            } else {
+                key_notes.extend(
+                    passed
+                        .iter()
+                        .map(|(name, why)| format!("API key {name} passed over: {why}")),
+                );
+            }
+            KeyDecision::Looked {
+                took: took.map(|(name, _)| name),
+                passed,
+            }
+        }
+    };
+
+    if let KeyDecision::Looked {
+        took: Some(name), ..
+    } = &decision
+    {
+        let account = Account::for_key(claude, name, env).expect("a taken key is a configured key");
+        return Ok(Choice {
+            account,
+            scored,
+            degraded: None,
+            warnings,
+            keys: decision,
+            key_notes,
+        });
+    }
+
+    if candidates.is_empty() {
+        let suffix = if key_notes.is_empty() {
+            String::new()
+        } else {
+            format!("; {}", key_notes.join("; "))
+        };
+        if looked_for.is_empty() {
+            bail!(
+                "no configured Claude profile is left once {} is set aside{suffix}",
+                exclude.join(", ")
+            );
+        }
+        bail!(
+            "no configured Claude profile has a local credential; looked for {}{suffix}",
+            looked_for.join(", ")
+        );
+    }
+
+    let account = match best {
+        Some(profile) => winner(&profile),
         None => {
             if degraded.is_none() {
                 degraded = Some(format!(
@@ -247,7 +438,144 @@ pub fn choose(
         scored,
         degraded,
         warnings,
+        keys: decision,
+        key_notes,
     })
+}
+
+/// A scored profile's state in one phrase: its unusable reason, or why a
+/// usable one scores zero.
+fn profile_state(s: &Scored) -> String {
+    match &s.reason {
+        Some(reason) => reason.clone(),
+        None => "weekly score is zero".to_string(),
+    }
+}
+
+/// Each key passed over, by name, with why.
+type Passed = Vec<(String, String)>;
+
+/// The first key, in name order, that is not excluded, has a key file,
+/// matches `model` and is in budget; and why every other key was passed
+/// over. `budget` is called once, and not at all when no key passes the
+/// gates that need no budget.
+fn pick_key(
+    claude: &ClaudeConfig,
+    env: &dyn EnvSource,
+    model: &str,
+    exclude: &[String],
+    budget: &dyn Fn() -> BTreeMap<String, BudgetView>,
+) -> (Option<(String, BudgetView)>, Passed) {
+    let mut passed = Vec::new();
+    let mut open = Vec::new();
+    for (name, key) in &claude.api_keys {
+        if let Some(why) = key_gate(claude, env, model, exclude, name, key) {
+            passed.push((name.clone(), why));
+        } else {
+            open.push(name.clone());
+        }
+    }
+    if open.is_empty() {
+        return (None, passed);
+    }
+    let views = budget();
+    let mut took = None;
+    for name in open {
+        match views.get(&name) {
+            Some(view) if took.is_none() && view.in_budget() => {
+                took = Some((name, view.clone()));
+            }
+            Some(_) if took.is_some() => {}
+            Some(view) => passed.push((name, budget_reason(view))),
+            None => passed.push((name, "no budget view".to_string())),
+        }
+    }
+    passed.sort();
+    (took, passed)
+}
+
+/// Why `name` cannot take this turn whatever its budget, or `None`.
+fn key_gate(
+    claude: &ClaudeConfig,
+    env: &dyn EnvSource,
+    model: &str,
+    exclude: &[String],
+    name: &str,
+    key: &ApiKeyConfig,
+) -> Option<String> {
+    if exclude.iter().any(|e| e == name) {
+        return Some("set aside".to_string());
+    }
+    let account = Account::for_key(claude, name, env)?;
+    if !account.has_credential() {
+        return Some(format!(
+            "no key file at {}",
+            account.credential_path().display()
+        ));
+    }
+    if !any_match(&key.models, model) {
+        return Some("models do not match".to_string());
+    }
+    None
+}
+
+/// Why a key with this view is not in budget.
+pub fn budget_reason(view: &BudgetView) -> String {
+    if let Some(e) = &view.ledger_error {
+        return format!("ledger unreadable: {e}");
+    }
+    match &view.exhausted {
+        Some(flag) => format!("exhausted since {}", flag.at),
+        None => format!(
+            "${:.2} of ${:.2} spent, reserve ${:.2}",
+            view.spent_usd, view.budget_usd, view.reserve_usd
+        ),
+    }
+}
+
+/// One configured key as `ccc which` shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyRow {
+    pub name: String,
+    pub view: Option<BudgetView>,
+    pub models_match: bool,
+    pub used: bool,
+    /// Why the key would not be used; `None` when it would.
+    pub why_not: Option<String>,
+}
+
+/// Every configured key, in name order, against `choice`.
+pub fn key_rows(
+    claude: &ClaudeConfig,
+    model: &str,
+    choice: &Choice,
+    views: &BTreeMap<String, BudgetView>,
+) -> Vec<KeyRow> {
+    claude
+        .api_keys
+        .iter()
+        .map(|(name, key)| {
+            let used = choice.account.profile == *name && choice.account.key_file().is_some();
+            let why_not = (!used).then(|| match &choice.keys {
+                KeyDecision::Ineligible => "keys are not eligible for this turn".to_string(),
+                KeyDecision::ProfileWon => "a profile can take the work".to_string(),
+                KeyDecision::NoProfileOut => "no profile is out of quota".to_string(),
+                KeyDecision::HeldBack(held) => format!("not considered: {held}"),
+                KeyDecision::Looked { passed, .. } => passed
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, why)| why.clone())
+                    .unwrap_or_else(|| "an earlier key was taken".to_string()),
+            });
+            KeyRow {
+                name: name.clone(),
+                view: views.get(name).cloned(),
+                models_match: any_match(&key.models, model),
+                used,
+                why_not,
+            }
+        })
+        .collect()
 }
 
 /// Score every candidate, applying the Fable reserve's all-zero fallback, then
@@ -306,14 +634,19 @@ fn score_pass(
     profiles
         .iter()
         .map(|profile| match report.profile(profile) {
-            None => unscored(sel, profile, "no usage snapshot published".to_string()),
+            None => unscored(
+                sel,
+                profile,
+                Out::NoSnapshot,
+                "no usage snapshot published".to_string(),
+            ),
             Some(usage) => score_one(sel, usage, fable, now, reserve),
         })
         .collect()
 }
 
 /// A candidate with no numbers behind it: unusable, and the table says why.
-fn unscored(sel: &SelectionConfig, profile: &str, reason: String) -> Scored {
+fn unscored(sel: &SelectionConfig, profile: &str, out: Out, reason: String) -> Scored {
     let (floor, knee) = sel.effective(profile);
     Scored {
         profile: profile.to_string(),
@@ -326,6 +659,7 @@ fn unscored(sel: &SelectionConfig, profile: &str, reason: String) -> Scored {
         score: 0.0,
         usable: false,
         reason: Some(reason),
+        out: Some(out),
         notes: Vec::new(),
     }
 }
@@ -349,13 +683,15 @@ fn score_one(
         score: 0.0,
         usable: false,
         reason: None,
+        out: None,
         notes: Vec::new(),
     };
 
     let spend = match eligible(sel, usage, now, &f, fable) {
         Ok(spend) => spend,
-        Err(reason) => {
+        Err((why, reason)) => {
             out.reason = Some(reason);
+            out.out = Some(why);
             return out;
         }
     };
@@ -412,36 +748,45 @@ fn eligible(
     now: Timestamp,
     f: &Features,
     fable: bool,
-) -> Result<Spend, String> {
+) -> Result<Spend, (Out, String)> {
     if usage.auth != AuthState::Ok {
-        return Err(format!("auth is {}", usage.auth.as_str()));
+        return Err((Out::Auth, format!("auth is {}", usage.auth.as_str())));
     }
     if let Some(why) = &usage.stale_reason {
         // The daemon's text, which can quote an upstream error body, reaches
         // the terminal through `ccc which` and the fallback diagnostic.
-        return Err(format!(
-            "the reading is carried forward ({})",
-            sanitize(why)
+        return Err((
+            Out::CarriedForward,
+            format!("the reading is carried forward ({})", sanitize(why)),
         ));
     }
     let age = now.duration_since(usage.updated_at).as_secs_f64();
     if age > sel.stale_grace_s as f64 {
-        return Err(format!(
-            "the reading is {:.0} min old (grace {} s)",
-            age / 60.0,
-            sel.stale_grace_s
+        return Err((
+            Out::Stale,
+            format!(
+                "the reading is {:.0} min old (grace {} s)",
+                age / 60.0,
+                sel.stale_grace_s
+            ),
         ));
     }
     if f.gate5 <= 0.0 {
-        return Err(format!(
-            "the 5-hour window is at or below its floor ({:.0} % left, floor {} %)",
-            100.0 - f.util5,
-            f.floor
+        return Err((
+            Out::FiveHourFloor,
+            format!(
+                "the 5-hour window is at or below its floor ({:.0} % left, floor {} %)",
+                100.0 - f.util5,
+                f.floor
+            ),
         ));
     }
     // Every model spends the general bucket.
     let Some(general) = f.general else {
-        return Err("no general weekly window in the snapshot".to_string());
+        return Err((
+            Out::NoGeneralWindow,
+            "no general weekly window in the snapshot".to_string(),
+        ));
     };
     if !fable {
         return Ok(Spend::General {
@@ -450,7 +795,10 @@ fn eligible(
         });
     }
     let Some(fable) = f.fable else {
-        return Err("no Fable weekly window in the snapshot".to_string());
+        return Err((
+            Out::NoFableWindow,
+            "no Fable weekly window in the snapshot".to_string(),
+        ));
     };
     Ok(Spend::Fable { general, fable })
 }
@@ -1076,6 +1424,7 @@ mod tests {
             score,
             usable: true,
             reason: None,
+            out: None,
             notes: Vec::new(),
         };
         note_tier(&mut s);
@@ -1301,6 +1650,33 @@ mod tests {
         std::collections::BTreeMap::new()
     }
 
+    fn no_views() -> BTreeMap<String, BudgetView> {
+        BTreeMap::new()
+    }
+
+    /// `choose` with no API key configured.
+    fn choose_nk(
+        claude: &ClaudeConfig,
+        env: &dyn EnvSource,
+        model: &str,
+        now: Timestamp,
+        usage: &UsageSource,
+        exclude: &[String],
+    ) -> Result<Choice> {
+        choose(
+            claude,
+            env,
+            model,
+            now,
+            usage,
+            exclude,
+            Keys {
+                eligible: true,
+                budget: &no_views,
+            },
+        )
+    }
+
     #[test]
     fn choose_scores_the_credentialed_profiles_and_warns_about_the_rest() {
         let dir = crate::testutil::TempDir::new("select-choose");
@@ -1308,7 +1684,7 @@ mod tests {
         dir.write_file("personal.token", "t\n", 0o600);
         let cfg = claude_config(dir.path(), &["team03", "team04", "personal"]);
 
-        let choice = choose(
+        let choice = choose_nk(
             &cfg,
             &empty_env(),
             "claude-opus-5[1M]",
@@ -1342,7 +1718,7 @@ mod tests {
             profile("spent", 0.0, 100.0, None),
         ]);
         let pick = |cfg: &ClaudeConfig, r: &UsageReport| {
-            choose(
+            choose_nk(
                 cfg,
                 &empty_env(),
                 "claude-opus-5[1M]",
@@ -1413,7 +1789,7 @@ mod tests {
         let cfg = claude_config(dir.path(), &["team03", "team04"]);
 
         let unreachable = UsageSource::Unavailable("connection refused".into());
-        let choice = choose(&cfg, &empty_env(), "m", now(), &unreachable, &[]).unwrap();
+        let choice = choose_nk(&cfg, &empty_env(), "m", now(), &unreachable, &[]).unwrap();
         assert_eq!(choice.account.profile, "team03");
         assert!(choice.degraded.unwrap().contains("connection refused"));
 
@@ -1421,7 +1797,7 @@ mod tests {
             daemon_status: Some("offline".into()),
             ..live()
         });
-        let choice = choose(&cfg, &empty_env(), "m", now(), &offline, &[]).unwrap();
+        let choice = choose_nk(&cfg, &empty_env(), "m", now(), &offline, &[]).unwrap();
         assert_eq!(choice.account.profile, "team03");
         assert!(choice.degraded.unwrap().contains("offline"));
         assert!(choice.scored.iter().all(|s| !s.usable));
@@ -1434,7 +1810,7 @@ mod tests {
             },
             profile("team04", 99.9, 0.0, None),
         ]));
-        let choice = choose(&cfg, &empty_env(), "m", now(), &all_bad, &[]).unwrap();
+        let choice = choose_nk(&cfg, &empty_env(), "m", now(), &all_bad, &[]).unwrap();
         assert_eq!(choice.account.profile, "team03");
         let degraded = choice.degraded.unwrap();
         assert!(degraded.contains("auth is rejected"), "{degraded}");
@@ -1445,7 +1821,7 @@ mod tests {
     fn choose_fails_when_nothing_has_a_credential() {
         let dir = crate::testutil::TempDir::new("select-nocreds");
         let cfg = claude_config(dir.path(), &["team03", "team04"]);
-        let err = choose(
+        let err = choose_nk(
             &cfg,
             &empty_env(),
             "m",
@@ -1461,7 +1837,7 @@ mod tests {
         // With every profile set aside there is no credential to look for.
         dir.write_file("team03.token", "t\n", 0o600);
         let only = claude_config(dir.path(), &["team03"]);
-        let err = choose(
+        let err = choose_nk(
             &only,
             &empty_env(),
             "m",
@@ -1484,7 +1860,7 @@ mod tests {
         dir.write_file("personal.token", "t\n", 0o600);
         let cfg = claude_config(dir.path(), &["team03", "team04", "personal"]);
         let pick = |exclude: &[String]| {
-            choose(
+            choose_nk(
                 &cfg,
                 &empty_env(),
                 "claude-opus-5[1M]",
@@ -1501,5 +1877,450 @@ mod tests {
 
         // team04 has no credential, so excluding both others leaves nothing.
         assert!(pick(&["personal".to_string(), "team03".to_string()]).is_err());
+    }
+
+    const OPUS: &str = "claude-opus-5[1M]";
+    const FABLE: &str = "claude-fable-5-1[1m]";
+
+    /// A token-auth config over `dir` with `profiles` credentialed and one
+    /// key, `team`, whose 0600 key file exists and whose models are `*`.
+    fn keyed(dir: &crate::testutil::TempDir, profiles: &[&str]) -> ClaudeConfig {
+        for p in profiles {
+            dir.write_file(&format!("{p}.token"), "t\n", 0o600);
+        }
+        let mut cfg = claude_config(dir.path(), profiles);
+        add_key(dir, &mut cfg, "team", &["*"]);
+        cfg
+    }
+
+    fn add_key(
+        dir: &crate::testutil::TempDir,
+        cfg: &mut ClaudeConfig,
+        name: &str,
+        models: &[&str],
+    ) {
+        let path = dir.write_file(&format!("{name}.key"), "sk-ant-api\n", 0o600);
+        cfg.api_keys.insert(
+            name.to_string(),
+            ApiKeyConfig {
+                key_file: path.display().to_string(),
+                budget_usd: 420.0,
+                models: names(models),
+                reserve_usd: 20.0,
+                reset_tz: "UTC".to_string(),
+                exhausted_patterns: names(&["*credit balance is too low*"]),
+            },
+        );
+    }
+
+    fn budget_view(spent: f64) -> BudgetView {
+        BudgetView {
+            month: "2026-09".to_string(),
+            spent_usd: spent,
+            local_usd: spent,
+            budget_usd: 420.0,
+            reserve_usd: 20.0,
+            turns: 3,
+            unmeasured_turns: 0,
+            exhausted: None,
+            remote: true,
+            ledger_error: None,
+            ignored: Vec::new(),
+        }
+    }
+
+    /// `choose` with keys eligible, every key's view at `spent`, and how often
+    /// the budget closure ran.
+    fn pick_with(
+        cfg: &ClaudeConfig,
+        model: &str,
+        usage: &UsageSource,
+        exclude: &[&str],
+        views: BTreeMap<String, BudgetView>,
+        eligible: bool,
+    ) -> (Result<Choice>, usize) {
+        let calls = std::cell::Cell::new(0);
+        let budget = || {
+            calls.set(calls.get() + 1);
+            views.clone()
+        };
+        let choice = choose(
+            cfg,
+            &empty_env(),
+            model,
+            now(),
+            usage,
+            &names(exclude),
+            Keys {
+                eligible,
+                budget: &budget,
+            },
+        );
+        (choice, calls.get())
+    }
+
+    fn all_at(cfg: &ClaudeConfig, spent: f64) -> BTreeMap<String, BudgetView> {
+        cfg.api_keys
+            .keys()
+            .map(|k| (k.clone(), budget_view(spent)))
+            .collect()
+    }
+
+    fn pick(
+        cfg: &ClaudeConfig,
+        model: &str,
+        usage: UsageSource,
+        exclude: &[&str],
+    ) -> (Result<Choice>, usize) {
+        pick_with(cfg, model, &usage, exclude, all_at(cfg, 10.0), true)
+    }
+
+    fn reported(profiles: Vec<ProfileUsage>) -> UsageSource {
+        UsageSource::Report(report(profiles))
+    }
+
+    /// A profile whose general bucket is spent: usable, score zero.
+    fn spent(name: &str) -> ProfileUsage {
+        profile(name, 0.0, 100.0, Some(0.0))
+    }
+
+    fn fresh(name: &str) -> ProfileUsage {
+        profile(name, 0.0, 10.0, Some(10.0))
+    }
+
+    fn took_key(choice: &Choice, name: &str) {
+        assert_eq!(choice.account.profile, name, "{choice:?}");
+        assert_eq!(choice.account.auth, ClaudeAuth::ApiKey);
+        assert!(choice.degraded.is_none());
+    }
+
+    #[test]
+    fn a_profile_with_a_positive_score_wins_and_the_budget_is_not_read() {
+        let dir = crate::testutil::TempDir::new("select-key-profile-wins");
+        let cfg = keyed(&dir, &["a", "b"]);
+        let (choice, calls) = pick(&cfg, OPUS, reported(vec![spent("a"), fresh("b")]), &[]);
+        let choice = choice.unwrap();
+        assert_eq!(choice.account.profile, "b");
+        assert_eq!(choice.keys, KeyDecision::ProfileWon);
+        assert!(choice.key_notes.is_empty());
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn every_profile_out_of_quota_overflows_to_the_key_with_a_note() {
+        let dir = crate::testutil::TempDir::new("select-key-overflow");
+        let cfg = keyed(&dir, &["a", "b", "nocred"]);
+        std::fs::remove_file(dir.path().join("nocred.token")).unwrap();
+        let usage = || reported(vec![spent("a"), spent("b"), fresh("nocred")]);
+
+        // Every usable profile zero-scored; a credential-less one is no
+        // statement either way.
+        let (choice, calls) = pick(&cfg, OPUS, usage(), &[]);
+        let choice = choice.unwrap();
+        took_key(&choice, "team");
+        assert_eq!(calls, 1);
+        assert_eq!(
+            choice.key_notes,
+            vec![format!(
+                "no profile can take {OPUS} (a: weekly score is zero; b: weekly score is zero); \
+                 using API key team: $10.00 of $420.00 spent this month"
+            )]
+        );
+
+        // One excluded, the other zero-scored.
+        let (choice, _) = pick(&cfg, OPUS, usage(), &["a"]);
+        took_key(&choice.unwrap(), "team");
+
+        // The only profile excluded: no usage report is needed.
+        let one = keyed(&dir, &["a"]);
+        for usage in [
+            UsageSource::Unavailable("connection refused".into()),
+            reported(vec![fresh("a")]),
+        ] {
+            let (choice, calls) = pick(&one, OPUS, usage, &["a"]);
+            let choice = choice.unwrap();
+            took_key(&choice, "team");
+            assert_eq!(calls, 1);
+            assert!(choice.key_notes[0].contains("(a: set aside)"), "{choice:?}");
+        }
+
+        // A spend read from this host alone says so.
+        let mut local = all_at(&cfg, 10.0);
+        local.get_mut("team").unwrap().remote = false;
+        let (choice, _) = pick_with(&cfg, OPUS, &usage(), &[], local, true);
+        assert!(choice.unwrap().key_notes[0].ends_with("(spend: this host only)"));
+
+        // A model that does not draw on a missing Fable window ignores it.
+        let usage = reported(vec![spent("a"), profile("b", 0.0, 100.0, None)]);
+        let (choice, _) = pick(&cfg, OPUS, usage, &[]);
+        took_key(&choice.unwrap(), "team");
+    }
+
+    #[test]
+    fn doubtful_data_or_the_five_hour_floor_holds_the_key_back() {
+        let dir = crate::testutil::TempDir::new("select-key-held");
+        let cfg = keyed(&dir, &["a", "b"]);
+        let b = fresh("b");
+        let cases: Vec<(Option<ProfileUsage>, &str, Out)> = vec![
+            (
+                Some(ProfileUsage {
+                    stale_reason: Some("rate limited".into()),
+                    ..b.clone()
+                }),
+                FABLE,
+                Out::CarriedForward,
+            ),
+            (
+                Some(ProfileUsage {
+                    updated_at: now().checked_sub(SignedDuration::from_hours(2)).unwrap(),
+                    ..b.clone()
+                }),
+                FABLE,
+                Out::Stale,
+            ),
+            (
+                Some(ProfileUsage {
+                    auth: AuthState::Rejected,
+                    ..b.clone()
+                }),
+                FABLE,
+                Out::Auth,
+            ),
+            (None, FABLE, Out::NoSnapshot),
+            (
+                Some(ProfileUsage {
+                    windows: vec![window(FIVE_HOUR, 0.0, 3), window("7-day_fable", 10.0, 100)],
+                    ..b.clone()
+                }),
+                OPUS,
+                Out::NoGeneralWindow,
+            ),
+            (
+                Some(profile("b", 0.0, 10.0, None)),
+                FABLE,
+                Out::NoFableWindow,
+            ),
+            (
+                Some(profile("b", 99.5, 10.0, Some(10.0))),
+                FABLE,
+                Out::FiveHourFloor,
+            ),
+        ];
+        for (b, model, out) in cases {
+            let mut profiles = vec![spent("a")];
+            profiles.extend(b.clone());
+            let (choice, calls) = pick(&cfg, model, reported(profiles.clone()), &[]);
+            let choice = choice.unwrap();
+            assert_eq!(calls, 0, "{out:?}");
+            // The zero-scored profile wins from tier 2.
+            assert_eq!(choice.account.profile, "a", "{out:?}");
+            let scored_b = choice.scored.iter().find(|s| s.profile == "b").unwrap();
+            assert_eq!(scored_b.out, Some(out));
+            assert_eq!(
+                choice.key_notes,
+                vec![format!(
+                    "API key not considered: b: {}",
+                    scored_b.reason.as_deref().unwrap()
+                )]
+            );
+            assert!(matches!(choice.keys, KeyDecision::HeldBack(_)), "{out:?}");
+
+            // With `a` excluded instead, the same profile still holds it back.
+            if matches!(out, Out::NoGeneralWindow | Out::NoFableWindow) {
+                let (choice, calls) = pick(&cfg, model, reported(profiles), &["a"]);
+                let choice = choice.unwrap();
+                assert_eq!(calls, 0);
+                assert_eq!(choice.account.profile, "b");
+                assert!(choice.degraded.is_some());
+            }
+        }
+
+        // Stale throughout, or floored throughout: nobody is out of quota by
+        // its own numbers, so no key.
+        for each in [
+            |n: &str| ProfileUsage {
+                stale_reason: Some("x".into()),
+                ..fresh(n)
+            },
+            |n: &str| profile(n, 99.5, 10.0, Some(10.0)),
+        ] {
+            let (choice, calls) = pick(&cfg, OPUS, reported(vec![each("a"), each("b")]), &[]);
+            let choice = choice.unwrap();
+            assert_eq!(calls, 0);
+            assert_eq!(choice.account.profile, "a");
+            assert!(choice.degraded.is_some());
+        }
+
+        // Usage missing with a candidate: no key.
+        let offline = UsageSource::Report(UsageReport {
+            daemon_status: Some("offline".into()),
+            ..report(vec![spent("a"), spent("b")])
+        });
+        for usage in [UsageSource::Unavailable("refused".into()), offline] {
+            let (choice, calls) = pick(&cfg, OPUS, usage, &[]);
+            let choice = choice.unwrap();
+            assert_eq!(calls, 0);
+            assert!(choice.scored.iter().all(|s| s.out == Some(Out::NoData)));
+            assert_eq!(choice.account.profile, "a");
+        }
+    }
+
+    #[test]
+    fn out_is_set_exactly_where_reason_is() {
+        let r = report(vec![
+            spent("a"),
+            fresh("b"),
+            profile("c", 99.5, 10.0, Some(10.0)),
+            profile("d", 0.0, 10.0, None),
+        ]);
+        let sel = SelectionConfig::default();
+        for model in [OPUS, FABLE] {
+            for s in score_all(&sel, &names(&["a", "b", "c", "d", "e"]), &r, model, now()) {
+                assert_eq!(s.reason.is_some(), s.out.is_some(), "{s:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_setup_with_no_credential_keeps_todays_refusal() {
+        let dir = crate::testutil::TempDir::new("select-key-nocred");
+        let mut cfg = claude_config(dir.path(), &["a", "b"]);
+        add_key(&dir, &mut cfg, "team", &["*"]);
+        let (choice, calls) = pick(&cfg, OPUS, reported(vec![spent("a"), spent("b")]), &[]);
+        let err = choice.unwrap_err().to_string();
+        assert!(
+            err.starts_with("no configured Claude profile has a local credential"),
+            "{err}"
+        );
+        assert_eq!(calls, 0);
+
+        // One credential-less beside one zero-scored: the key.
+        dir.write_file("a.token", "t\n", 0o600);
+        let (choice, _) = pick(&cfg, OPUS, reported(vec![spent("a"), spent("b")]), &[]);
+        took_key(&choice.unwrap(), "team");
+    }
+
+    #[test]
+    fn a_key_is_passed_over_for_its_own_reasons_and_todays_result_stands() {
+        let dir = crate::testutil::TempDir::new("select-key-gates");
+        let base = keyed(&dir, &["a"]);
+        let usage = || reported(vec![spent("a")]);
+        let flagged = || {
+            let mut v = budget_view(10.0);
+            v.exhausted = Some(claude_usage_mqtt_core::Exhausted::new(
+                now(),
+                Some("inv".into()),
+                Some("credit balance is too low".into()),
+            ));
+            BTreeMap::from([("team".to_string(), v)])
+        };
+        let unreadable = || {
+            let mut v = budget_view(0.0);
+            v.ledger_error = Some("budget ledger /l/team.json is damaged".into());
+            BTreeMap::from([("team".to_string(), v)])
+        };
+        let mut fable_only = base.clone();
+        fable_only.api_keys.get_mut("team").unwrap().models = names(&["*fable*"]);
+        let mut no_file = base.clone();
+        no_file.api_keys.get_mut("team").unwrap().key_file =
+            dir.path().join("gone.key").display().to_string();
+        let gone = dir.path().join("gone.key").display().to_string();
+        let cases: Vec<(&ClaudeConfig, BTreeMap<String, BudgetView>, String, usize)> = vec![
+            (
+                &fable_only,
+                all_at(&base, 0.0),
+                "models do not match".into(),
+                0,
+            ),
+            (
+                &no_file,
+                all_at(&base, 0.0),
+                format!("no key file at {gone}"),
+                0,
+            ),
+            (
+                &base,
+                all_at(&base, 400.0),
+                "$400.00 of $420.00 spent, reserve $20.00".into(),
+                1,
+            ),
+            (&base, flagged(), format!("exhausted since {}", now()), 1),
+            (
+                &base,
+                unreadable(),
+                "ledger unreadable: budget ledger /l/team.json is damaged".into(),
+                1,
+            ),
+        ];
+        for (cfg, views, why, expected_calls) in cases {
+            let (choice, calls) = pick_with(cfg, OPUS, &usage(), &[], views.clone(), true);
+            let choice = choice.unwrap();
+            assert_eq!(calls, expected_calls, "{why}");
+            assert_eq!(choice.account.profile, "a", "{why}");
+            assert_eq!(
+                choice.key_notes,
+                vec![format!("API key team passed over: {why}")]
+            );
+
+            // With no profile left, the reasons join the refusal.
+            let (choice, _) = pick_with(cfg, OPUS, &usage(), &["a"], views, true);
+            let err = choice.unwrap_err().to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "no configured Claude profile is left once a is set aside; \
+                     API key team passed over: {why}"
+                )
+            );
+        }
+
+        // Not eligible (a launch), or the key itself set aside: no key.
+        let (choice, calls) = pick_with(&base, OPUS, &usage(), &[], all_at(&base, 0.0), false);
+        let choice = choice.unwrap();
+        assert_eq!((choice.account.profile.as_str(), calls), ("a", 0));
+        assert_eq!(choice.keys, KeyDecision::Ineligible);
+        assert!(choice.key_notes.is_empty());
+        let (choice, calls) = pick(&base, OPUS, usage(), &["team"]);
+        assert_eq!((choice.unwrap().account.profile.as_str(), calls), ("a", 0));
+    }
+
+    #[test]
+    fn keys_are_tried_in_name_order_on_one_budget_read() {
+        let dir = crate::testutil::TempDir::new("select-key-order");
+        let mut cfg = keyed(&dir, &["a"]);
+        add_key(&dir, &mut cfg, "alpha", &["*"]);
+        add_key(&dir, &mut cfg, "zulu", &["*"]);
+        let usage = || reported(vec![spent("a")]);
+        let (choice, calls) = pick(&cfg, OPUS, usage(), &[]);
+        took_key(&choice.unwrap(), "alpha");
+        assert_eq!(calls, 1);
+
+        let mut views = all_at(&cfg, 10.0);
+        views.get_mut("alpha").unwrap().spent_usd = 410.0;
+        let (choice, calls) = pick_with(&cfg, OPUS, &usage(), &[], views.clone(), true);
+        let choice = choice.unwrap();
+        took_key(&choice, "team");
+        assert_eq!(calls, 1);
+        let rows = key_rows(&cfg, OPUS, &choice, &views);
+        let summary: Vec<(&str, bool, Option<&str>)> = rows
+            .iter()
+            .map(|r| (r.name.as_str(), r.used, r.why_not.as_deref()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    "alpha",
+                    false,
+                    Some("$410.00 of $420.00 spent, reserve $20.00")
+                ),
+                ("team", true, None),
+                ("zulu", false, Some("an earlier key was taken")),
+            ]
+        );
+
+        // The excluded key is skipped and the next one taken.
+        let (choice, _) = pick(&cfg, OPUS, usage(), &["alpha"]);
+        took_key(&choice.unwrap(), "team");
     }
 }

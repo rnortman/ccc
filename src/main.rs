@@ -4,6 +4,8 @@
 mod agents;
 mod audit;
 mod audit_view;
+mod budget;
+mod bus;
 mod config;
 mod exec;
 mod fsutil;
@@ -62,6 +64,8 @@ enum Command {
     Which(WhichArgs),
     /// Start an interactive session as an agent type.
     Launch(LaunchArgs),
+    /// Show, reconcile or clear the month's spend on each API key account.
+    Budget(BudgetArgs),
     #[command(hide = true)]
     Hook(HookArgs),
     /// The MCP tool servers a Goose run uses as its extensions.
@@ -172,6 +176,28 @@ struct ResumeArgs {
     json: bool,
     /// The prompt; `-` reads it from stdin, as does omitting it.
     prompt: Option<String>,
+}
+
+#[derive(Debug, Args)]
+#[command(args_conflicts_with_subcommands = true)]
+struct BudgetArgs {
+    #[command(subcommand)]
+    action: Option<BudgetAction>,
+    /// Emit the machine-readable report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum BudgetAction {
+    /// Correct the month's spend: make the total for NAME equal USD.
+    Set {
+        name: String,
+        #[arg(long, value_name = "USD", allow_negative_numbers = true)]
+        spent: f64,
+    },
+    /// Clear NAME's exhausted flag.
+    Clear { name: String },
 }
 
 #[derive(Debug, Args)]
@@ -328,6 +354,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
         Command::Status(args) => status(args),
         Command::Kill(args) => kill(args),
         Command::Which(args) => which(args),
+        Command::Budget(args) => budget(args),
         Command::Run(args) => exec::run(
             &args.agent,
             args.cwd.as_deref(),
@@ -391,6 +418,32 @@ fn status(args: StatusArgs) -> Result<i32> {
         &mut std::io::stdout(),
         &mut std::io::stderr(),
     )
+}
+
+fn budget(args: BudgetArgs) -> Result<i32> {
+    let cfg = Config::load()?;
+    let cmd = match args.action {
+        None => budget::BudgetCommand::Show { json: args.json },
+        Some(BudgetAction::Set { name, spent }) => budget::BudgetCommand::Set { name, spent },
+        Some(BudgetAction::Clear { name }) => budget::BudgetCommand::Clear { name },
+    };
+    let open_bus = || bus::open(&cfg, &ProcessEnv, bus_client_id());
+    budget::budget_with(
+        &budget::BudgetCtx {
+            cfg: &cfg,
+            ledgers: &budget::Ledgers::in_env(&ProcessEnv),
+            now: Timestamp::now(),
+            open_bus: &open_bus,
+        },
+        &cmd,
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
+    )
+}
+
+/// A broker client id for a `ccc` process that is not an invocation.
+fn bus_client_id() -> String {
+    format!("ccc-{}", uuid::Uuid::new_v4())
 }
 
 fn kill(args: KillArgs) -> Result<i32> {
@@ -496,6 +549,15 @@ fn log(args: LogArgs) -> Result<i32> {
 fn which(args: WhichArgs) -> Result<i32> {
     let (cfg, sources) = Config::load_with_sources_in(&ProcessEnv)?;
     let usage = || usage::fetch(&cfg.mqtt, &cfg.claude.selection, &ProcessEnv);
+    // A short-lived bus for the one budget read; its notes go to stderr.
+    let budget = || {
+        let bus = bus::open(&cfg, &ProcessEnv, bus_client_id());
+        let views = budget::bus_views(&cfg, &ProcessEnv, Timestamp::now(), bus.as_ref());
+        for note in bus.close() {
+            harness::diag(format_args!("note: {note}"));
+        }
+        views
+    };
     which_with(
         &WhichCtx {
             cfg: &cfg,
@@ -503,6 +565,7 @@ fn which(args: WhichArgs) -> Result<i32> {
             env: &ProcessEnv,
             now: Timestamp::now(),
             usage: &usage,
+            budget: &budget,
         },
         &args.agent,
         args.harness,
@@ -519,6 +582,7 @@ struct WhichCtx<'a> {
     env: &'a dyn config::EnvSource,
     now: Timestamp,
     usage: &'a dyn Fn() -> usage::UsageSource,
+    budget: &'a dyn Fn() -> std::collections::BTreeMap<String, budget::BudgetView>,
 }
 
 /// [`which`] against an explicit context and output sinks. `err` receives the
@@ -560,7 +624,10 @@ fn which_with(
     };
 
     // Only a Claude resolution with configured profiles has an account to
-    // choose, so only that one reads usage.
+    // choose, so only that one reads usage. The budget views are read once,
+    // whether selection needed them or not, so the key rows can show them.
+    let views = std::cell::OnceCell::new();
+    let budget = || views.get_or_init(|| (ctx.budget)()).clone();
     let choice = match r.harness {
         Harness::Claude if ctx.cfg.claude.ambient() => None,
         Harness::Claude => {
@@ -572,6 +639,10 @@ fn which_with(
                 ctx.now,
                 &source,
                 &[],
+                select::Keys {
+                    eligible: true,
+                    budget: &budget,
+                },
             )?)
         }
         Harness::Codex | Harness::Goose => None,
@@ -579,11 +650,17 @@ fn which_with(
     if let Some(c) = &choice {
         c.report();
     }
+    let keys = match &choice {
+        Some(c) if !ctx.cfg.claude.api_keys.is_empty() => {
+            select::key_rows(&ctx.cfg.claude, &r.model, c, &budget())
+        }
+        _ => Vec::new(),
+    };
 
     writeln!(
         out,
         "{}",
-        which_output(&r, choice.as_ref(), &prompt, ctx.sources, as_json)?
+        which_output(&r, choice.as_ref(), &keys, &prompt, ctx.sources, as_json)?
     )?;
     Ok(0)
 }
@@ -606,6 +683,7 @@ const AMBIENT_LINE: &str = "ambient login ([claude] profiles is empty)";
 fn which_output(
     r: &resolve::Resolved,
     choice: Option<&Choice>,
+    keys: &[select::KeyRow],
     prompt: &str,
     sources: &config::ConfigSources,
     as_json: bool,
@@ -625,6 +703,7 @@ fn which_output(
             "profile": choice.map(|c| c.account.profile.clone()),
             "degraded": choice.and_then(|c| c.degraded.clone()),
             "candidates": candidates,
+            "api_keys": keys.iter().map(key_json).collect::<Vec<_>>(),
             "goose_policy": r.goose,
             "config": sources.site.path.path.to_string_lossy(),
             "agents_config": sources.agents.path.path.to_string_lossy(),
@@ -683,8 +762,58 @@ fn which_output(
                 ));
             }
         }
+        for k in keys {
+            out.push('\n');
+            out.push_str(&key_line(k));
+        }
         Ok(out)
     }
+}
+
+/// One configured API key under the candidate table.
+fn key_line(k: &select::KeyRow) -> String {
+    let budget = match &k.view {
+        Some(v) => format!(
+            "month {} spent ${:.2} of ${:.2} reserve ${:.2} exhausted {}{}",
+            v.month,
+            v.spent_usd,
+            v.budget_usd,
+            v.reserve_usd,
+            v.exhausted
+                .as_ref()
+                .map_or("-".to_string(), |e| format!("since {}", e.at)),
+            if v.remote {
+                String::new()
+            } else {
+                format!(" ({})", budget::THIS_HOST_ONLY)
+            },
+        ),
+        None => "no budget view".to_string(),
+    };
+    let used = match &k.why_not {
+        None => "yes".to_string(),
+        Some(why) => format!("no ({why})"),
+    };
+    format!(
+        "api-key {}: {budget}; models match: {}; would be used: {used}",
+        k.name,
+        if k.models_match { "yes" } else { "no" },
+    )
+}
+
+fn key_json(k: &select::KeyRow) -> serde_json::Value {
+    serde_json::json!({
+        "name": k.name,
+        "month": k.view.as_ref().map(|v| v.month.clone()),
+        "spent_usd": k.view.as_ref().map(|v| v.spent_usd),
+        "budget_usd": k.view.as_ref().map(|v| v.budget_usd),
+        "reserve_usd": k.view.as_ref().map(|v| v.reserve_usd),
+        "exhausted": k.view.as_ref().and_then(|v| v.exhausted.clone()),
+        "remote": k.view.as_ref().map(|v| v.remote),
+        "models_match": k.models_match,
+        "would_be_used": k.used,
+        "reason": k.why_not,
+    })
 }
 
 /// The Goose policy as one line: tools, allowlisted agents and each root set,
@@ -733,6 +862,7 @@ fn scored_json(s: &select::Scored) -> serde_json::Value {
         "score": s.score,
         "usable": s.usable,
         "reason": s.reason,
+        "out": s.out,
         "note": s.note(),
     })
 }
@@ -740,6 +870,10 @@ fn scored_json(s: &select::Scored) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn no_budget() -> std::collections::BTreeMap<String, budget::BudgetView> {
+        std::collections::BTreeMap::new()
+    }
     use crate::agents::Sandbox;
     use crate::config::Effort;
     use crate::testutil::TempDir;
@@ -990,6 +1124,38 @@ mod tests {
         }
         assert!(Cli::try_parse_from(["ccc", "status", "--latest"]).is_err());
         assert!(Cli::command().render_help().to_string().contains("status"));
+    }
+
+    #[test]
+    fn budget_parses_its_three_forms() {
+        match Cli::try_parse_from(["ccc", "budget", "--json"])
+            .unwrap()
+            .command
+        {
+            Command::Budget(a) => assert!(a.json && a.action.is_none()),
+            other => panic!("parsed as {other:?}"),
+        }
+        match Cli::try_parse_from(["ccc", "budget", "set", "team", "--spent", "-1.5"])
+            .unwrap()
+            .command
+        {
+            Command::Budget(BudgetArgs {
+                action: Some(BudgetAction::Set { name, spent }),
+                ..
+            }) => assert_eq!((name.as_str(), spent), ("team", -1.5)),
+            other => panic!("parsed as {other:?}"),
+        }
+        match Cli::try_parse_from(["ccc", "budget", "clear", "team"])
+            .unwrap()
+            .command
+        {
+            Command::Budget(BudgetArgs {
+                action: Some(BudgetAction::Clear { name }),
+                ..
+            }) => assert_eq!(name, "team"),
+            other => panic!("parsed as {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["ccc", "budget", "set", "team"]).is_err());
     }
 
     #[test]
@@ -1490,14 +1656,22 @@ mod tests {
 
     #[test]
     fn which_renders_both_ways() {
-        let text = which_output(&resolved(), None, "explorer.md", &test_sources(), false).unwrap();
+        let text = which_output(
+            &resolved(),
+            None,
+            &[],
+            "explorer.md",
+            &test_sources(),
+            false,
+        )
+        .unwrap();
         assert_eq!(
             text,
             "agent=explorer harness=claude model=claude-opus-5[1M] effort=low sandbox=read-only prompt=explorer.md profile=-\nambient login ([claude] profiles is empty)"
         );
 
         let v: serde_json::Value = serde_json::from_str(
-            &which_output(&resolved(), None, "explorer.md", &test_sources(), true).unwrap(),
+            &which_output(&resolved(), None, &[], "explorer.md", &test_sources(), true).unwrap(),
         )
         .unwrap();
         assert_eq!(v["agent"], "explorer");
@@ -1516,12 +1690,12 @@ mod tests {
         r.effort = None;
         r.tools = None;
         assert!(
-            which_output(&r, None, "explorer.md", &test_sources(), false)
+            which_output(&r, None, &[], "explorer.md", &test_sources(), false)
                 .unwrap()
                 .contains("effort=-")
         );
         let v: serde_json::Value = serde_json::from_str(
-            &which_output(&r, None, "explorer.md", &test_sources(), true).unwrap(),
+            &which_output(&r, None, &[], "explorer.md", &test_sources(), true).unwrap(),
         )
         .unwrap();
         assert!(v["effort"].is_null());
@@ -1542,13 +1716,13 @@ mod tests {
             write_roots: vec![],
             exec_roots: vec!["/e".into()],
         });
-        let text = which_output(&r, None, "explorer.md", &test_sources(), false).unwrap();
+        let text = which_output(&r, None, &[], "explorer.md", &test_sources(), false).unwrap();
         assert_eq!(
             text.lines().nth(1),
             Some("goose_tools=read,ccc goose_agents=explorer,reviewer read_roots=/w,/r write_roots=- exec_roots=/e")
         );
         let v: serde_json::Value = serde_json::from_str(
-            &which_output(&r, None, "explorer.md", &test_sources(), true).unwrap(),
+            &which_output(&r, None, &[], "explorer.md", &test_sources(), true).unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -1561,7 +1735,7 @@ mod tests {
             serde_json::json!(["read", "ccc"])
         );
         assert!(serde_json::from_str::<serde_json::Value>(
-            &which_output(&resolved(), None, "explorer.md", &test_sources(), true).unwrap()
+            &which_output(&resolved(), None, &[], "explorer.md", &test_sources(), true).unwrap()
         )
         .unwrap()["goose_policy"]
             .is_null());
@@ -1608,6 +1782,7 @@ mod tests {
             env: &env,
             now: Timestamp::now(),
             usage: &usage,
+            budget: &no_budget,
         };
         let given = std::env::current_dir().unwrap();
         let cwd = std::fs::canonicalize(&given).unwrap();
@@ -1743,6 +1918,7 @@ mod tests {
             env: &env,
             now,
             usage: &usage,
+            budget: &no_budget,
         };
         let mut out: Vec<u8> = Vec::new();
         let mut err: Vec<u8> = Vec::new();
@@ -1772,6 +1948,7 @@ mod tests {
             env: &env,
             now,
             usage: &boom,
+            budget: &no_budget,
         };
         let mut out: Vec<u8> = Vec::new();
         which_with(
@@ -1842,6 +2019,7 @@ mod tests {
                 env: &env,
                 now,
                 usage: &usage,
+                budget: &no_budget,
             };
             let mut out = Vec::new();
             let mut err = Vec::new();
@@ -1867,6 +2045,7 @@ mod tests {
             env: &env,
             now,
             usage: &usage,
+            budget: &no_budget,
         };
         let err = which_with(
             &skipped_ctx,
@@ -1909,6 +2088,7 @@ mod tests {
             env: &env,
             now: Timestamp::now(),
             usage: &boom,
+            budget: &no_budget,
         };
 
         let mut out: Vec<u8> = Vec::new();
@@ -1952,12 +2132,16 @@ mod tests {
     #[test]
     fn which_prints_the_candidate_table_when_an_account_was_chosen() {
         let choice = Choice {
-            account: crate::harness::claude::Account {
-                profile: "team03".into(),
-                auth: crate::config::ClaudeAuth::Token,
-                token_dir: "/t".into(),
-                profiles_dir: "/p".into(),
-            },
+            account: crate::harness::claude::Account::from_config(
+                &crate::config::ClaudeConfig {
+                    auth: crate::config::ClaudeAuth::Token,
+                    token_dir: "/t".into(),
+                    profiles_dir: "/p".into(),
+                    ..crate::config::ClaudeConfig::default()
+                },
+                "team03",
+                &std::collections::BTreeMap::new(),
+            ),
             scored: vec![
                 select::Scored {
                     profile: "team03".into(),
@@ -1976,6 +2160,7 @@ mod tests {
                     score: 0.03,
                     usable: true,
                     reason: None,
+                    out: None,
                     notes: vec!["scored without the Fable reserve".into()],
                 },
                 select::Scored {
@@ -1997,6 +2182,7 @@ mod tests {
                     reason: Some(
                         "the 5-hour window is at or below its floor (0 % left, floor 1 %)".into(),
                     ),
+                    out: Some(select::Out::FiveHourFloor),
                     notes: Vec::new(),
                 },
                 select::Scored {
@@ -2013,6 +2199,7 @@ mod tests {
                     score: 0.0,
                     usable: false,
                     reason: Some("no Fable weekly window in the snapshot".into()),
+                    out: Some(select::Out::NoFableWindow),
                     notes: Vec::new(),
                 },
                 select::Scored {
@@ -2029,6 +2216,7 @@ mod tests {
                     score: 0.8,
                     usable: true,
                     reason: None,
+                    out: None,
                     notes: vec!["in the 5-hour ramp".into()],
                 },
                 select::Scored {
@@ -2045,6 +2233,7 @@ mod tests {
                     score: 0.0,
                     usable: true,
                     reason: None,
+                    out: None,
                     notes: vec![
                         "scored without the Fable reserve".into(),
                         "weekly score is zero".into(),
@@ -2053,11 +2242,42 @@ mod tests {
             ],
             degraded: None,
             warnings: vec!["profile personal has no credential".into()],
+            keys: select::KeyDecision::ProfileWon,
+            key_notes: Vec::new(),
         };
+        let keys = vec![
+            select::KeyRow {
+                name: "team".into(),
+                view: Some(budget::BudgetView {
+                    month: "2026-11".into(),
+                    spent_usd: 137.42,
+                    local_usd: 137.42,
+                    budget_usd: 420.0,
+                    reserve_usd: 20.0,
+                    turns: 3,
+                    unmeasured_turns: 0,
+                    exhausted: None,
+                    remote: false,
+                    ledger_error: None,
+                    ignored: Vec::new(),
+                }),
+                models_match: true,
+                used: false,
+                why_not: Some("a profile can take the work".into()),
+            },
+            select::KeyRow {
+                name: "other".into(),
+                view: None,
+                models_match: false,
+                used: false,
+                why_not: Some("models do not match".into()),
+            },
+        ];
 
         let text = which_output(
             &resolved(),
             Some(&choice),
+            &keys,
             "explorer.md",
             &test_sources(),
             false,
@@ -2094,11 +2314,21 @@ mod tests {
         );
         // The warning is a stderr diagnostic, never part of the table.
         assert!(!text.contains("personal"), "{text}");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            &lines[lines.len() - 2..],
+            &[
+                "api-key team: month 2026-11 spent $137.42 of $420.00 reserve $20.00 exhausted - \
+                 (spend: this host only); models match: yes; would be used: no (a profile can take the work)",
+                "api-key other: no budget view; models match: no; would be used: no (models do not match)",
+            ]
+        );
 
         let v: serde_json::Value = serde_json::from_str(
             &which_output(
                 &resolved(),
                 Some(&choice),
+                &keys,
                 "explorer.md",
                 &test_sources(),
                 true,
@@ -2128,5 +2358,14 @@ mod tests {
         assert!(v["candidates"][2]["util_f"].is_null());
         assert!(v["candidates"][2]["hours_f"].is_null());
         assert_eq!(v["candidates"][2]["util_g"], 7.0);
+        assert_eq!(v["candidates"][1]["out"], "five-hour-floor");
+        assert!(v["candidates"][0]["out"].is_null());
+        assert_eq!(v["api_keys"][0]["name"], "team");
+        assert_eq!(v["api_keys"][0]["spent_usd"], 137.42);
+        assert_eq!(v["api_keys"][0]["remote"], false);
+        assert_eq!(v["api_keys"][0]["would_be_used"], false);
+        assert_eq!(v["api_keys"][0]["reason"], "a profile can take the work");
+        assert!(v["api_keys"][1]["month"].is_null());
+        assert_eq!(v["api_keys"][1]["models_match"], false);
     }
 }

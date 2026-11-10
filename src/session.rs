@@ -6,7 +6,6 @@
 //! `thread_id`), so it is also usable directly with `claude --resume` and
 //! `codex exec resume`.
 
-use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -58,61 +57,15 @@ pub struct SessionRecord {
     pub opened_at_terminal: bool,
 }
 
-/// An advisory per-session exclusion lock. The file is deliberately retained
-/// so its existence does not imply ownership.
-#[derive(Debug)]
-pub struct SessionLock {
-    file: File,
-}
-
-impl SessionLock {
-    fn new(file: File) -> Self {
-        Self { file }
-    }
-}
-
-impl Drop for SessionLock {
-    /// Unlocks explicitly rather than by closing: a child forked while the
-    /// lock was held shares its open file description until it execs, and
-    /// closing only our descriptor would leave the lock held by that copy.
-    fn drop(&mut self) {
-        // `flock(LOCK_UN)` on a descriptor we own and hold the lock through
-        // does not block and has no failure mode on a local filesystem. If it
-        // ever failed, closing the descriptor still releases the lock once
-        // any forked copy execs or exits, so there is nothing to report.
-        let _ = self.file.unlock();
-    }
-}
+/// An advisory per-session exclusion lock.
+pub type SessionLock = crate::fsutil::FileLock;
 
 /// Attempts to own the lock for `id` without waiting for another owner.
 pub fn try_lock_in(dir: &Path, id: &str) -> Result<Option<SessionLock>> {
     let path = path_in(dir, id)?.with_extension("lock");
     std::fs::create_dir_all(dir)
         .with_context(|| format!("creating session directory {}", dir.display()))?;
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let file = options
-        .open(&path)
-        .with_context(|| format!("opening session lock {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if file.metadata()?.mode() & 0o777 != 0o600 {
-            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
-        }
-    }
-    match file.try_lock() {
-        Ok(()) => Ok(Some(SessionLock::new(file))),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-        Err(std::fs::TryLockError::Error(e)) => {
-            Err(e).with_context(|| format!("locking session {}", path.display()))
-        }
-    }
+    SessionLock::try_lock(&path, "session lock")
 }
 
 impl SessionRecord {

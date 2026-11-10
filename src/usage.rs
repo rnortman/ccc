@@ -127,7 +127,7 @@ fn try_fetch(mqtt: &MqttConfig, sel: &SelectionConfig, env: &dyn EnvSource) -> R
 /// Broker connection settings: the usage client's own config discovery (or the
 /// path named in `[mqtt] config`), with the password taken from the environment
 /// or the file it names — never from an argument, which `ps` would show.
-fn broker_config(mqtt: &MqttConfig, env: &dyn EnvSource) -> Result<ClientConfig> {
+pub fn broker_config(mqtt: &MqttConfig, env: &dyn EnvSource) -> Result<ClientConfig> {
     let explicit = mqtt.config.as_deref().map(|p| expand_tilde_in(env, p));
     let mut cfg = ClientConfig::default();
     match load_client_config(explicit.as_deref())? {

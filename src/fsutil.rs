@@ -1,5 +1,6 @@
 //! Filesystem helpers shared by the modules that persist state.
 
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -83,6 +84,73 @@ pub fn ensure_private_dir(dir: &Path) -> Result<()> {
             .with_context(|| format!("securing {}", dir.display()))?;
     }
     Ok(())
+}
+
+/// An advisory exclusive lock on a lock file, held until dropped. The file is
+/// deliberately retained, so its existence does not imply ownership.
+#[derive(Debug)]
+pub struct FileLock {
+    file: File,
+}
+
+impl Drop for FileLock {
+    /// Unlocks explicitly rather than by closing: a child forked while the
+    /// lock was held shares its open file description until it execs, and
+    /// closing only our descriptor would leave the lock held by that copy.
+    fn drop(&mut self) {
+        // `flock(LOCK_UN)` on a descriptor we own and hold the lock through
+        // does not block and has no failure mode on a local filesystem. If it
+        // ever failed, closing the descriptor still releases the lock once
+        // any forked copy execs or exits, so there is nothing to report.
+        let _ = self.file.unlock();
+    }
+}
+
+impl FileLock {
+    /// Waits for, then owns, the lock on `path`. `what` names the lock in
+    /// errors.
+    pub fn lock(path: &Path, what: &str) -> Result<FileLock> {
+        let file = open_lock_file(path, what)?;
+        file.lock()
+            .with_context(|| format!("locking {what} {}", path.display()))?;
+        Ok(FileLock { file })
+    }
+
+    /// Owns the lock on `path`, or `None` when another owner holds it.
+    /// `what` names the lock in errors.
+    pub fn try_lock(path: &Path, what: &str) -> Result<Option<FileLock>> {
+        let file = open_lock_file(path, what)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(FileLock { file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => {
+                Err(e).with_context(|| format!("locking {what} {}", path.display()))
+            }
+        }
+    }
+}
+
+/// Opens `path` as a lock file, creating it 0600 and narrowing an existing
+/// one to 0600.
+fn open_lock_file(path: &Path, what: &str) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("opening {what} {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if file.metadata()?.mode() & 0o777 != 0o600 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(file)
 }
 
 #[cfg(test)]
