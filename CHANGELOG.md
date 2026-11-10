@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.4.0 — 2026-11-10
+
 - **New harness: Goose, for self-hosted models.** ccc can now run agents
   through [Goose](https://github.com/aaif-goose/goose) against an
   OpenAI-compatible server you host (llama-server, vLLM, ollama). Because such
