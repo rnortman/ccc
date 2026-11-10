@@ -11246,10 +11246,8 @@ mod tests {
             .unwrap()
             .find_map(|e| {
                 e.ok().and_then(|e| {
-                    e.path()
-                        .extension()
-                        .filter(|x| *x == "jsonl")
-                        .map(|_| e.path())
+                    let p = e.path();
+                    (p.is_file() && p.extension().is_some_and(|x| x == "jsonl")).then_some(p)
                 })
             })
             .unwrap();
