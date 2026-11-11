@@ -720,14 +720,10 @@ mod tests {
     use std::sync::Arc;
 
     fn key(tz: &str) -> ApiKeyConfig {
-        ApiKeyConfig {
-            key_file: "/k".to_string(),
-            budget_usd: 420.0,
-            models: vec!["*fable*".to_string()],
-            reserve_usd: 20.0,
-            reset_tz: tz.to_string(),
-            exhausted_patterns: vec!["*credit balance is too low*".to_string()],
-        }
+        let mut key = ApiKeyConfig::new("/k", 420.0, &["*fable*"]);
+        key.reserve_usd = 20.0;
+        key.reset_tz = tz.to_string();
+        key
     }
 
     fn ts(s: &str) -> Timestamp {

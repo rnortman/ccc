@@ -25,19 +25,21 @@ use crate::config::{ApiKeyConfig, ClaudeConfig, EnvSource, SelectionConfig};
 use crate::glob::any_match;
 use crate::harness::claude::Account;
 use crate::harness::diag;
+use crate::tuning::{
+    rule_suffix, weight_note, AccountPriority, NotApplied, ResetApplied, Tuning, WEEK_HOURS,
+};
 use crate::usage::{ProfileUsage, UsageReport, UsageSource};
-
-/// A fresh weekly bucket's assumed length, used when a weekly window the
-/// profile does have carries no reset time.
-const WEEK_HOURS: i64 = 168;
 
 /// One weekly bucket the account actually has.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Bucket {
     /// Percent of the tightest matching window spent.
     pub util: f64,
-    /// Hours until that window resets, floored by `min_time_left_h`.
+    /// Hours until `resets_at`, floored by `min_time_left_h`.
     pub hours: f64,
+    /// The reset `hours` counts to: the window's reset, or its fallback, after
+    /// any weekly-reset override and before the floor.
+    pub resets_at: Timestamp,
 }
 
 /// One profile's scoring inputs and its computed score.
@@ -57,6 +59,9 @@ pub struct Scored {
     /// per-profile overrides.
     pub five_hour_floor_pct: f64,
     pub five_hour_knee_pct: f64,
+    /// The weight this profile's score is multiplied by for the model; 1 when
+    /// no knob sets one.
+    pub weight: f64,
     pub gate5: f64,
     pub score: f64,
     pub usable: bool,
@@ -64,9 +69,9 @@ pub struct Scored {
     pub reason: Option<String>,
     /// `reason` as a type: set exactly when `reason` is.
     pub out: Option<Out>,
-    /// Things worth knowing about a profile that is a candidate, in the order
-    /// they were found: the scoring pass it came from, then why it is in tier
-    /// 2. Always empty for an unusable profile.
+    /// Things worth knowing about a profile that is a candidate: its weight
+    /// and weekly-reset override, then the scoring pass it came from, then why
+    /// it is in tier 2. Always empty for an unusable profile.
     pub notes: Vec<String>,
 }
 
@@ -168,6 +173,12 @@ struct Features {
     /// `None`: no window matched `fable_windows`; the account is not entitled
     /// to Fable.
     fable: Option<Bucket>,
+    /// The account's priority knobs for the model being scored.
+    priority: AccountPriority,
+    /// The weekly-reset override against each bucket; `None` without an
+    /// override or without the bucket.
+    moved_g: Option<ResetApplied>,
+    moved_f: Option<ResetApplied>,
 }
 
 /// The API keys a selection may overflow to.
@@ -219,6 +230,7 @@ enum Lets {
     No,
 }
 
+// TODO(api-key-priority-over-quota): keys never outrank a profile with quota; see TODO.md.
 /// A scored profile's answer to "does this profile let a key spend?", one
 /// arm per row of the rule.
 fn lets_key_spend(s: &Scored) -> Lets {
@@ -255,8 +267,10 @@ fn lets_key_spend(s: &Scored) -> Lets {
 /// The only error is having nothing to run as: no credentialed profile left
 /// and no key taken. Not called with empty `profiles`: that is the ambient
 /// login, which has no account to choose.
+#[allow(clippy::too_many_arguments)]
 pub fn choose(
     claude: &ClaudeConfig,
+    tuning: &Tuning,
     env: &dyn EnvSource,
     model: &str,
     now: Timestamp,
@@ -299,12 +313,12 @@ pub fn choose(
         Vec::new()
     } else {
         match report {
-            Some(r) => score_all(&claude.selection, &names, r, model, now),
+            Some(r) => score_all(&claude.selection, tuning, &names, r, model, now),
             None => {
                 let reason = degraded.clone().unwrap_or_default();
                 names
                     .iter()
-                    .map(|p| unscored(&claude.selection, p, Out::NoData, reason.clone()))
+                    .map(|p| unscored(tuning, p, model, Out::NoData, reason.clone()))
                     .collect::<Vec<_>>()
             }
         }
@@ -352,7 +366,7 @@ pub fn choose(
         } else if out_of_quota.is_empty() {
             KeyDecision::NoProfileOut
         } else {
-            let (took, passed) = pick_key(claude, env, model, exclude, keys.budget);
+            let (took, passed) = pick_key(claude, tuning, env, model, exclude, keys.budget);
             if let Some((name, view)) = &took {
                 key_notes.push(format!(
                     "no profile can take {model} ({}); using API key {name}: ${:.2} of ${:.2} spent this month{}",
@@ -455,12 +469,13 @@ fn profile_state(s: &Scored) -> String {
 /// Each key passed over, by name, with why.
 type Passed = Vec<(String, String)>;
 
-/// The first key, in name order, that is not excluded, has a key file,
-/// matches `model` and is in budget; and why every other key was passed
-/// over. `budget` is called once, and not at all when no key passes the
-/// gates that need no budget.
+/// The first key that is not excluded, has a key file, matches `model` and
+/// is in budget, trying keys by descending weight for `model` and then in name
+/// order; and why every other key was passed over. `budget` is called once,
+/// and not at all when no key passes the gates that need no budget.
 fn pick_key(
     claude: &ClaudeConfig,
+    tuning: &Tuning,
     env: &dyn EnvSource,
     model: &str,
     exclude: &[String],
@@ -478,6 +493,11 @@ fn pick_key(
     if open.is_empty() {
         return (None, passed);
     }
+    // A stable sort keeps name order among equal weights.
+    open.sort_by(|a, b| {
+        let weight = |name: &str| tuning.priority(name, model).weight;
+        weight(b).total_cmp(&weight(a))
+    });
     let views = budget();
     let mut took = None;
     for name in open {
@@ -542,11 +562,16 @@ pub struct KeyRow {
     pub used: bool,
     /// Why the key would not be used; `None` when it would.
     pub why_not: Option<String>,
+    /// The weight keys are tried by for the model; 1 when no knob sets one.
+    pub weight: f64,
+    /// The 0-based `by_model` rule `weight` came from, if any.
+    pub weight_rule: Option<usize>,
 }
 
 /// Every configured key, in name order, against `choice`.
 pub fn key_rows(
     claude: &ClaudeConfig,
+    tuning: &Tuning,
     model: &str,
     choice: &Choice,
     views: &BTreeMap<String, BudgetView>,
@@ -561,18 +586,24 @@ pub fn key_rows(
                 KeyDecision::ProfileWon => "a profile can take the work".to_string(),
                 KeyDecision::NoProfileOut => "no profile is out of quota".to_string(),
                 KeyDecision::HeldBack(held) => format!("not considered: {held}"),
-                KeyDecision::Looked { passed, .. } => passed
+                KeyDecision::Looked { took, passed } => passed
                     .iter()
                     .find(|(n, _)| n == name)
                     .map(|(_, why)| why.clone())
-                    .unwrap_or_else(|| "an earlier key was taken".to_string()),
+                    .unwrap_or_else(|| match took {
+                        Some(took) => format!("key {took} was taken first"),
+                        None => "not tried".to_string(),
+                    }),
             });
+            let priority = tuning.priority(name, model);
             KeyRow {
                 name: name.clone(),
                 view: views.get(name).cloned(),
                 models_match: any_match(&key.models, model),
                 used,
                 why_not,
+                weight: priority.weight,
+                weight_rule: priority.weight_rule,
             }
         })
         .collect()
@@ -582,6 +613,7 @@ pub fn key_rows(
 /// note why each usable one below tier 1 is there.
 pub fn score_all(
     sel: &SelectionConfig,
+    tuning: &Tuning,
     profiles: &[String],
     report: &UsageReport,
     model: &str,
@@ -590,9 +622,10 @@ pub fn score_all(
     let fable = any_match(&sel.fable_models, model);
     let mut scored = score_pass(
         sel,
+        tuning,
         profiles,
         report,
-        fable,
+        model,
         now,
         sel.reserve_general_for_fable,
     );
@@ -603,7 +636,7 @@ pub fn score_all(
     let mut usable = scored.iter().filter(|s| s.usable).peekable();
     let all_zero = usable.peek().is_some() && usable.all(|s| s.score <= 0.0);
     if !fable && sel.reserve_general_for_fable && all_zero {
-        scored = score_pass(sel, profiles, report, fable, now, false);
+        scored = score_pass(sel, tuning, profiles, report, model, now, false);
         for s in scored.iter_mut().filter(|s| s.usable) {
             s.notes
                 .push("scored without the Fable reserve (it zeroed every candidate)".into());
@@ -625,9 +658,10 @@ fn note_tier(s: &mut Scored) {
 
 fn score_pass(
     sel: &SelectionConfig,
+    tuning: &Tuning,
     profiles: &[String],
     report: &UsageReport,
-    fable: bool,
+    model: &str,
     now: Timestamp,
     reserve: bool,
 ) -> Vec<Scored> {
@@ -635,19 +669,20 @@ fn score_pass(
         .iter()
         .map(|profile| match report.profile(profile) {
             None => unscored(
-                sel,
+                tuning,
                 profile,
+                model,
                 Out::NoSnapshot,
                 "no usage snapshot published".to_string(),
             ),
-            Some(usage) => score_one(sel, usage, fable, now, reserve),
+            Some(usage) => score_one(sel, tuning, model, usage, now, reserve),
         })
         .collect()
 }
 
 /// A candidate with no numbers behind it: unusable, and the table says why.
-fn unscored(sel: &SelectionConfig, profile: &str, out: Out, reason: String) -> Scored {
-    let (floor, knee) = sel.effective(profile);
+fn unscored(tuning: &Tuning, profile: &str, model: &str, out: Out, reason: String) -> Scored {
+    let (floor, knee) = tuning.ramp(profile);
     Scored {
         profile: profile.to_string(),
         util5: 0.0,
@@ -655,6 +690,7 @@ fn unscored(sel: &SelectionConfig, profile: &str, out: Out, reason: String) -> S
         fable: None,
         five_hour_floor_pct: floor,
         five_hour_knee_pct: knee,
+        weight: tuning.priority(profile, model).weight,
         gate5: 0.0,
         score: 0.0,
         usable: false,
@@ -666,12 +702,14 @@ fn unscored(sel: &SelectionConfig, profile: &str, out: Out, reason: String) -> S
 
 fn score_one(
     sel: &SelectionConfig,
+    tuning: &Tuning,
+    model: &str,
     usage: &ProfileUsage,
-    fable: bool,
     now: Timestamp,
     reserve: bool,
 ) -> Scored {
-    let f = features(sel, usage, now);
+    let fable = any_match(&sel.fable_models, model);
+    let f = features(sel, tuning, model, usage, now);
     let mut out = Scored {
         profile: usage.profile.clone(),
         util5: f.util5,
@@ -679,6 +717,7 @@ fn score_one(
         fable: f.fable,
         five_hour_floor_pct: f.floor,
         five_hour_knee_pct: f.knee,
+        weight: f.priority.weight,
         gate5: f.gate5,
         score: 0.0,
         usable: false,
@@ -697,7 +736,7 @@ fn score_one(
     };
 
     let ratio = sel.fable_general_ratio;
-    out.score = match spend {
+    let unweighted = match spend {
         Spend::Fable { general, fable } => {
             let rate_g = (100.0 - general.util) / general.hours;
             let rate_f = (100.0 - fable.util) / fable.hours;
@@ -723,8 +762,41 @@ fn score_one(
             f.gate5 * effective.max(0.0) / general.hours
         }
     };
+    out.score = f.priority.weight * unweighted;
     out.usable = true;
+    out.notes = knob_notes(&f);
     out
+}
+
+/// What the account's knobs did to its score, for a usable candidate: its
+/// weight when not 1, then per bucket an override that moved its reset or was
+/// not applied.
+fn knob_notes(f: &Features) -> Vec<String> {
+    let p = &f.priority;
+    let mut notes: Vec<String> = weight_note(p.weight, p.weight_rule).into_iter().collect();
+    let at = match p.weekly_reset {
+        Some(crate::tuning::WeeklyReset::At(t)) => t.to_string(),
+        _ => String::new(),
+    };
+    for (bucket, applied) in [("general", f.moved_g), ("Fable", f.moved_f)] {
+        let note = match applied {
+            None => continue,
+            Some(ResetApplied::Moved { from, to }) if from == to => continue,
+            Some(ResetApplied::Moved { from, to }) => format!(
+                "{bucket} reset moved {} h earlier, to {to}",
+                from.duration_since(to).as_secs_f64() / 3600.0
+            ),
+            Some(ResetApplied::NotApplied { reset, why }) => {
+                let why = match why {
+                    NotApplied::AfterReset => format!("after its reset {reset}"),
+                    NotApplied::EarlierWeek => format!("its reset {reset} is in a later week"),
+                };
+                format!("weekly_reset_at {at} not applied to the {bucket} bucket: {why}")
+            }
+        };
+        notes.push(format!("{note}{}", rule_suffix(p.reset_rule)));
+    }
+    notes
 }
 
 /// The buckets one model draws on, in the shape that model requires.
@@ -803,7 +875,13 @@ fn eligible(
     Ok(Spend::Fable { general, fable })
 }
 
-fn features(sel: &SelectionConfig, usage: &ProfileUsage, now: Timestamp) -> Features {
+fn features(
+    sel: &SelectionConfig,
+    tuning: &Tuning,
+    model: &str,
+    usage: &ProfileUsage,
+    now: Timestamp,
+) -> Features {
     // An absent 5-hour window is a window nothing has been spent in yet.
     let util5 = usage
         .window(FIVE_HOUR)
@@ -814,23 +892,39 @@ fn features(sel: &SelectionConfig, usage: &ProfileUsage, now: Timestamp) -> Feat
         .checked_add(SignedDuration::from_hours(WEEK_HOURS))
         .unwrap_or(now);
 
+    let priority = tuning.priority(&usage.profile, model);
+    // The override moves each bucket's reset before the floor applies, so a
+    // moved reset already past counts as `min_time_left_h`.
+    let applied = |reset: Timestamp| priority.weekly_reset.map(|r| r.apply(reset));
+    let effective =
+        |reset: Timestamp, applied: Option<ResetApplied>| applied.map_or(reset, |a| a.effective());
+
     let window_g = tightest(usage, &sel.general_windows);
     // A weekly window the daemon published without a reset time still exists;
     // the fallback clock only stands in for that gap.
     let reset_g = window_g.and_then(|w| w.resets_at).unwrap_or(fresh_week);
-    let general = window_g.map(|w| Bucket {
-        util: w.utilization,
-        hours: hours_until(now, reset_g, sel.min_time_left_h),
-    });
-    let fable = tightest(usage, &sel.fable_windows).map(|w| {
-        let reset = w.resets_at.unwrap_or(reset_g);
+    let moved_g = window_g.and_then(|_| applied(reset_g));
+    let general = window_g.map(|w| {
+        let resets_at = effective(reset_g, moved_g);
         Bucket {
             util: w.utilization,
-            hours: hours_until(now, reset, sel.min_time_left_h),
+            hours: hours_until(now, resets_at, sel.min_time_left_h),
+            resets_at,
+        }
+    });
+    let window_f = tightest(usage, &sel.fable_windows);
+    let reset_f = window_f.map(|w| w.resets_at.unwrap_or(reset_g));
+    let moved_f = reset_f.and_then(applied);
+    let fable = window_f.zip(reset_f).map(|(w, reset)| {
+        let resets_at = effective(reset, moved_f);
+        Bucket {
+            util: w.utilization,
+            hours: hours_until(now, resets_at, sel.min_time_left_h),
+            resets_at,
         }
     });
 
-    let (floor, knee) = sel.effective(&usage.profile);
+    let (floor, knee) = tuning.ramp(&usage.profile);
     Features {
         util5,
         floor,
@@ -838,6 +932,9 @@ fn features(sel: &SelectionConfig, usage: &ProfileUsage, now: Timestamp) -> Feat
         gate5: gate5(floor, knee, util5),
         general,
         fable,
+        priority,
+        moved_g,
+        moved_f,
     }
 }
 
@@ -897,7 +994,20 @@ fn best_of(scored: &[Scored]) -> Option<String> {
 mod tests {
     use super::*;
     use crate::config::ClaudeAuth;
+    use crate::tuning::{AccountLayer, Priority, TuningLayer, WeeklyReset};
     use crate::usage::UsageWindow;
+
+    fn tun() -> Tuning {
+        Tuning::default()
+    }
+
+    /// The default `Tuning` with `account`'s layer over it.
+    fn tuned(account: &str, layer: AccountLayer) -> Tuning {
+        Tuning::default().overlay(&TuningLayer {
+            accounts: BTreeMap::from([(account.to_string(), layer)]),
+            ..TuningLayer::default()
+        })
+    }
 
     fn now() -> Timestamp {
         "2026-09-18T12:00:00Z".parse().unwrap()
@@ -958,7 +1068,7 @@ mod tests {
 
     #[test]
     fn the_five_hour_gate_ramps_between_floor_and_knee() {
-        let (floor, knee) = SelectionConfig::default().effective("any");
+        let (floor, knee) = tun().ramp("any");
         assert_eq!(gate5(floor, knee, 99.0), 0.0);
         assert_eq!(gate5(floor, knee, 85.0), 1.0);
         assert_eq!(gate5(floor, knee, 0.0), 1.0);
@@ -985,18 +1095,16 @@ mod tests {
     fn a_zero_ratio_means_general_quota_never_binds_fable_work() {
         // With the ratio off, Fable work costs nothing from the general bucket,
         // so the Fable rate alone decides — and the score stays finite.
-        let sel = SelectionConfig {
-            fable_general_ratio: 0.0,
-            ..SelectionConfig::default()
-        };
+        let mut sel = SelectionConfig::default();
+        sel.fable_general_ratio = 0.0;
         let usage = profile("team03", 0.0, 99.0, Some(50.0));
-        let scored = score_one(&sel, &usage, true, now(), true);
+        let scored = score_one(&sel, &tun(), FABLE, &usage, now(), true);
         assert!(scored.usable);
         assert!(scored.score.is_finite(), "{}", scored.score);
         let expected = (100.0 - 50.0) / 100.0;
         assert!((scored.score - expected).abs() < 1e-9, "{}", scored.score);
 
-        let plain = score_one(&sel, &usage, false, now(), true);
+        let plain = score_one(&sel, &tun(), OPUS, &usage, now(), true);
         assert!(
             (plain.score - (100.0 - 99.0) / 100.0).abs() < 1e-9,
             "{}",
@@ -1008,10 +1116,8 @@ mod tests {
     fn a_reset_already_past_cannot_divide_by_zero() {
         // A daemon that carries an expired reset for a few minutes, under a
         // hand-built config with no floor, must still produce a finite score.
-        let sel = SelectionConfig {
-            min_time_left_h: 0.0,
-            ..SelectionConfig::default()
-        };
+        let mut sel = SelectionConfig::default();
+        sel.min_time_left_h = 0.0;
         let usage = ProfileUsage {
             profile: "team03".into(),
             auth: AuthState::Ok,
@@ -1023,9 +1129,9 @@ mod tests {
                 window("7-day_fable", 100.0, -1),
             ],
         };
-        let scored = score_one(&sel, &usage, false, now(), true);
+        let scored = score_one(&sel, &tun(), OPUS, &usage, now(), true);
         assert!(scored.score.is_finite(), "{}", scored.score);
-        let fable = score_one(&sel, &usage, true, now(), true);
+        let fable = score_one(&sel, &tun(), FABLE, &usage, now(), true);
         assert!(fable.score.is_finite(), "{}", fable.score);
     }
 
@@ -1044,7 +1150,7 @@ mod tests {
                 window("7-day_fable", 77.0, 100),
             ],
         };
-        let f = features(&sel, &usage, now());
+        let f = features(&sel, &tun(), "m", &usage, now());
         let g = f.general.unwrap();
         assert_eq!(g.util, 70.0);
         assert!((g.hours - 50.0).abs() < 1e-9);
@@ -1063,7 +1169,7 @@ mod tests {
             updated_at: now(),
             windows: vec![window(FIVE_HOUR, 0.0, 3), window("seven_day", 7.0, 24)],
         };
-        let f = features(&sel, &usage, now());
+        let f = features(&sel, &tun(), "m", &usage, now());
         assert_eq!(f.fable, None);
         let g = f.general.unwrap();
         assert_eq!(g.util, 7.0);
@@ -1073,7 +1179,7 @@ mod tests {
             windows: vec![window(FIVE_HOUR, 0.0, 3)],
             ..usage
         };
-        let f = features(&sel, &bare, now());
+        let f = features(&sel, &tun(), "m", &bare, now());
         assert_eq!(f.general, None);
         assert_eq!(f.fable, None);
     }
@@ -1098,7 +1204,7 @@ mod tests {
                 },
             ],
         };
-        let f = features(&sel, &usage, now());
+        let f = features(&sel, &tun(), "m", &usage, now());
         assert!((f.general.unwrap().hours - WEEK_HOURS as f64).abs() < 1e-9);
         assert!((f.fable.unwrap().hours - WEEK_HOURS as f64).abs() < 1e-9);
     }
@@ -1120,7 +1226,7 @@ mod tests {
                 },
             ],
         };
-        let f = features(&sel, &usage, now());
+        let f = features(&sel, &tun(), "m", &usage, now());
         assert!((f.general.unwrap().hours - 50.0).abs() < 1e-9);
         assert!(
             (f.fable.unwrap().hours - 50.0).abs() < 1e-9,
@@ -1139,22 +1245,22 @@ mod tests {
             updated_at: now(),
             windows: vec![window("seven_day", 40.0, 100)],
         };
-        let f = features(&sel, &usage, now());
+        let f = features(&sel, &tun(), "m", &usage, now());
         assert_eq!(f.util5, 0.0);
         assert_eq!(f.gate5, 1.0);
-        assert!(score_one(&sel, &usage, false, now(), true).usable);
+        assert!(score_one(&sel, &tun(), OPUS, &usage, now(), true).usable);
     }
 
     #[test]
     fn a_fable_model_cannot_use_an_account_without_a_fable_window() {
         let sel = SelectionConfig::default();
         let usage = profile("personal", 0.0, 7.0, None);
-        let s = score_one(&sel, &usage, true, now(), true);
+        let s = score_one(&sel, &tun(), FABLE, &usage, now(), true);
         assert!(!s.usable);
         assert!(s.reason.as_deref().unwrap().contains("Fable"), "{s:?}");
         assert_eq!(s.score, 0.0);
 
-        assert!(score_one(&sel, &usage, false, now(), true).usable);
+        assert!(score_one(&sel, &tun(), OPUS, &usage, now(), true).usable);
     }
 
     #[test]
@@ -1168,7 +1274,14 @@ mod tests {
             windows: vec![window(FIVE_HOUR, 0.0, 3), window("7-day_fable", 10.0, 100)],
         };
         for fable in [false, true] {
-            let s = score_one(&sel, &usage, fable, now(), true);
+            let s = score_one(
+                &sel,
+                &tun(),
+                if fable { FABLE } else { OPUS },
+                &usage,
+                now(),
+                true,
+            );
             assert!(!s.usable, "{fable}");
             assert!(
                 s.reason.as_deref().unwrap().contains("general weekly"),
@@ -1182,15 +1295,23 @@ mod tests {
         let sel = SelectionConfig::default();
         // 60% of the general bucket left over 100h, and no Fable bucket to
         // reserve any of it for.
-        let s = score_one(&sel, &profile("a", 0.0, 40.0, None), false, now(), true);
+        let s = score_one(
+            &sel,
+            &tun(),
+            OPUS,
+            &profile("a", 0.0, 40.0, None),
+            now(),
+            true,
+        );
         assert!((s.score - 0.6).abs() < 1e-9, "{s:?}");
     }
 
     #[test]
     fn scoring_knows_which_buckets_the_model_spends() {
         let sel = SelectionConfig::default();
-        let usable =
-            |model: &str| score_all(&sel, &names(&["personal"]), &live(), model, now()).remove(0);
+        let usable = |model: &str| {
+            score_all(&sel, &tun(), &names(&["personal"]), &live(), model, now()).remove(0)
+        };
         assert!(usable("claude-opus-5[1M]").usable);
         let fable = usable("claude-fable-5-1[1m]");
         assert!(!fable.usable);
@@ -1207,7 +1328,7 @@ mod tests {
             windows: vec![window(FIVE_HOUR, 0.0, 1), window("seven_day", 50.0, 0)],
             ..profile("team03", 0.0, 50.0, None)
         };
-        let f = features(&sel, &usage, now());
+        let f = features(&sel, &tun(), "m", &usage, now());
         assert_eq!(f.general.unwrap().hours, sel.min_time_left_h);
     }
 
@@ -1249,7 +1370,7 @@ mod tests {
             ),
         ];
         for (usage, expected) in cases {
-            let s = score_one(&sel, &usage, false, now(), true);
+            let s = score_one(&sel, &tun(), OPUS, &usage, now(), true);
             assert!(!s.usable, "{expected}");
             assert_eq!(s.score, 0.0);
             let reason = s.reason.unwrap();
@@ -1263,14 +1384,23 @@ mod tests {
             stale_reason: Some("rate\nlimited\r\x1b[2J".to_string()),
             ..profile("a", 0.0, 0.0, None)
         };
-        let reason = score_one(&sel, &usage, false, now(), true).reason.unwrap();
+        let reason = score_one(&sel, &tun(), OPUS, &usage, now(), true)
+            .reason
+            .unwrap();
         assert_eq!(
             reason,
             "the reading is carried forward (rate\\nlimited\\r\\x1b[2J)"
         );
 
         // The Fable bucket only excludes a profile from Fable work.
-        let s = score_one(&sel, &profile("a", 0.0, 0.0, None), true, now(), true);
+        let s = score_one(
+            &sel,
+            &tun(),
+            FABLE,
+            &profile("a", 0.0, 0.0, None),
+            now(),
+            true,
+        );
         assert!(!s.usable);
         assert_eq!(s.score, 0.0);
         let reason = s.reason.unwrap();
@@ -1284,8 +1414,9 @@ mod tests {
         // 20% left over 100h = 0.2%/h, so Fable binds.
         let fable_binds = score_one(
             &sel,
+            &tun(),
+            FABLE,
             &profile("a", 0.0, 40.0, Some(80.0)),
-            true,
             now(),
             true,
         );
@@ -1295,8 +1426,9 @@ mod tests {
         // 0.2%/h of Fable, which binds instead.
         let general_binds = score_one(
             &sel,
+            &tun(),
+            FABLE,
             &profile("a", 0.0, 90.0, Some(10.0)),
-            true,
             now(),
             true,
         );
@@ -1305,8 +1437,9 @@ mod tests {
         // The gate damps the whole score.
         let gated = score_one(
             &sel,
+            &tun(),
+            FABLE,
             &profile("a", 92.0, 40.0, Some(80.0)),
-            true,
             now(),
             true,
         );
@@ -1317,8 +1450,15 @@ mod tests {
     fn a_fable_model_is_recognised_by_the_model_globs() {
         let sel = SelectionConfig::default();
         let r = report(vec![profile("a", 0.0, 40.0, Some(80.0))]);
-        let fable = &score_all(&sel, &names(&["a"]), &r, "claude-fable-5-1[1m]", now())[0];
-        let general = &score_all(&sel, &names(&["a"]), &r, "claude-opus-5[1M]", now())[0];
+        let fable = &score_all(
+            &sel,
+            &tun(),
+            &names(&["a"]),
+            &r,
+            "claude-fable-5-1[1m]",
+            now(),
+        )[0];
+        let general = &score_all(&sel, &tun(), &names(&["a"]), &r, "claude-opus-5[1M]", now())[0];
         assert!((fable.score - 0.2).abs() < 1e-9);
         // Non-Fable sees 60% general less the 0.5 × 20% Fable reserve = 50%.
         assert!((general.score - 0.5).abs() < 1e-9);
@@ -1333,7 +1473,14 @@ mod tests {
             profile("a", 0.0, 80.0, Some(10.0)),
             profile("b", 0.0, 90.0, Some(10.0)),
         ]);
-        let scored = score_all(&sel, &names(&["a", "b"]), &r, "claude-opus-5[1M]", now());
+        let scored = score_all(
+            &sel,
+            &tun(),
+            &names(&["a", "b"]),
+            &r,
+            "claude-opus-5[1M]",
+            now(),
+        );
         assert!((scored[0].score - 0.2).abs() < 1e-9, "{:?}", scored[0]);
         assert!((scored[1].score - 0.1).abs() < 1e-9);
         assert!(scored[0]
@@ -1347,11 +1494,16 @@ mod tests {
         assert_eq!(best_of(&scored).as_deref(), Some("a"));
 
         // With the reserve off in config there is no second pass and no note.
-        let sel = SelectionConfig {
-            reserve_general_for_fable: false,
-            ..sel
-        };
-        let scored = score_all(&sel, &names(&["a", "b"]), &r, "claude-opus-5[1M]", now());
+        let mut sel = sel;
+        sel.reserve_general_for_fable = false;
+        let scored = score_all(
+            &sel,
+            &tun(),
+            &names(&["a", "b"]),
+            &r,
+            "claude-opus-5[1M]",
+            now(),
+        );
         assert!((scored[0].score - 0.2).abs() < 1e-9);
         assert_eq!(scored[0].note(), None);
     }
@@ -1361,6 +1513,7 @@ mod tests {
         let sel = SelectionConfig::default();
         let scored = score_all(
             &sel,
+            &tun(),
             &names(&["team03", "team04", "personal"]),
             &live(),
             "claude-opus-5[1M]",
@@ -1372,6 +1525,7 @@ mod tests {
         // On a Fable model personal is out: it has no Fable bucket to spend.
         let scored = score_all(
             &sel,
+            &tun(),
             &names(&["team03", "team04", "personal"]),
             &live(),
             "claude-fable-5-1[1m]",
@@ -1397,11 +1551,25 @@ mod tests {
             profile("b", 10.0, 50.0, Some(0.0)),
             profile("a", 10.0, 50.0, Some(0.0)),
         ]);
-        let scored = score_all(&sel, &names(&["a", "b"]), &r, "claude-opus-5[1M]", now());
+        let scored = score_all(
+            &sel,
+            &tun(),
+            &names(&["a", "b"]),
+            &r,
+            "claude-opus-5[1M]",
+            now(),
+        );
         assert_eq!(scored[0].score, scored[1].score);
         assert_eq!(best_of(&scored).as_deref(), Some("a"));
 
-        let none_usable = score_all(&sel, &names(&["missing"]), &r, "claude-opus-5[1M]", now());
+        let none_usable = score_all(
+            &sel,
+            &tun(),
+            &names(&["missing"]),
+            &r,
+            "claude-opus-5[1M]",
+            now(),
+        );
         assert_eq!(best_of(&none_usable), None);
         assert!(none_usable[0]
             .reason
@@ -1420,6 +1588,7 @@ mod tests {
             fable: None,
             five_hour_floor_pct: 1.0,
             five_hour_knee_pct: 15.0,
+            weight: 1.0,
             gate5,
             score,
             usable: true,
@@ -1477,16 +1646,16 @@ mod tests {
         assert_eq!(best_of(&[gone, zero]).as_deref(), Some("zero"));
     }
 
-    fn with_override(floor: Option<f64>, knee: Option<f64>) -> SelectionConfig {
-        let mut sel = SelectionConfig::default();
-        sel.profile.insert(
-            "personal".into(),
-            crate::config::ProfileSelection {
+    /// A `Tuning` whose `personal` profile sets its own floor and knee.
+    fn with_override(floor: Option<f64>, knee: Option<f64>) -> Tuning {
+        tuned(
+            "personal",
+            AccountLayer {
                 five_hour_floor_pct: floor,
                 five_hour_knee_pct: knee,
+                ..AccountLayer::default()
             },
-        );
-        sel
+        )
     }
 
     #[test]
@@ -1503,13 +1672,13 @@ mod tests {
         // Global knee only: 50% remaining is above the 15% knee, so personal is
         // tier 1 and its weekly lead wins.
         let sel = SelectionConfig::default();
-        let scored = score_all(&sel, &all, &r, "claude-opus-5[1M]", now());
+        let scored = score_all(&sel, &tun(), &all, &r, "claude-opus-5[1M]", now());
         assert_eq!(best_of(&scored).as_deref(), Some("personal"));
 
         // Its own knee at 60% remaining puts it in its ramp, and a team seat
         // with headroom takes the work despite a far lower score.
-        let sel = with_override(None, Some(60.0));
-        let scored = score_all(&sel, &all, &r, "claude-opus-5[1M]", now());
+        let tuning = with_override(None, Some(60.0));
+        let scored = score_all(&sel, &tuning, &all, &r, "claude-opus-5[1M]", now());
         let personal = scored.iter().find(|s| s.profile == "personal").unwrap();
         let team03 = scored.iter().find(|s| s.profile == "team03").unwrap();
         assert_eq!(personal.tier(), Some(2), "{personal:?}");
@@ -1519,11 +1688,12 @@ mod tests {
 
     #[test]
     fn per_profile_floor_and_knee_apply_to_that_profile_only() {
-        let sel = with_override(Some(20.0), Some(60.0));
+        let tuning = with_override(Some(20.0), Some(60.0));
         let personal = score_one(
-            &sel,
+            &SelectionConfig::default(),
+            &tuning,
+            OPUS,
             &profile("personal", 60.0, 7.0, None),
-            false,
             now(),
             true,
         );
@@ -1534,9 +1704,10 @@ mod tests {
         // 40% remaining, half way between floor 20 and knee 60.
         assert!((personal.gate5 - 0.5).abs() < 1e-9, "{personal:?}");
         let team = score_one(
-            &sel,
+            &SelectionConfig::default(),
+            &tuning,
+            OPUS,
             &profile("team03", 60.0, 7.0, None),
-            false,
             now(),
             true,
         );
@@ -1549,9 +1720,10 @@ mod tests {
         // At util5 85 personal is below its own floor and excluded; a team seat
         // at the same reading is still usable.
         let personal = score_one(
-            &sel,
+            &SelectionConfig::default(),
+            &tuning,
+            OPUS,
             &profile("personal", 85.0, 7.0, None),
-            false,
             now(),
             true,
         );
@@ -1562,20 +1734,22 @@ mod tests {
             "{personal:?}"
         );
         let team = score_one(
-            &sel,
+            &SelectionConfig::default(),
+            &tuning,
+            OPUS,
             &profile("team03", 85.0, 7.0, None),
-            false,
             now(),
             true,
         );
         assert!(team.usable, "{team:?}");
 
         // Overriding the floor alone keeps the global knee.
-        let sel = with_override(Some(10.0), None);
+        let tuning = with_override(Some(10.0), None);
         let personal = score_one(
-            &sel,
+            &SelectionConfig::default(),
+            &tuning,
+            OPUS,
             &profile("personal", 87.5, 7.0, None),
-            false,
             now(),
             true,
         );
@@ -1583,7 +1757,14 @@ mod tests {
 
         // A profile with no snapshot still reports its resolved knobs.
         let r = report(vec![]);
-        let missing = &score_all(&sel, &names(&["personal"]), &r, "m", now())[0];
+        let missing = &score_all(
+            &SelectionConfig::default(),
+            &tuning,
+            &names(&["personal"]),
+            &r,
+            "m",
+            now(),
+        )[0];
         assert_eq!(missing.five_hour_floor_pct, 10.0);
         assert_eq!(missing.five_hour_knee_pct, 15.0);
         assert_eq!(missing.tier(), None);
@@ -1600,7 +1781,14 @@ mod tests {
             profile("spent", 0.0, 100.0, None),
             profile("fine", 0.0, 40.0, None),
         ]);
-        let scored = score_all(&sel, &names(&["ramp", "spent", "fine"]), &r, model, now());
+        let scored = score_all(
+            &sel,
+            &tun(),
+            &names(&["ramp", "spent", "fine"]),
+            &r,
+            model,
+            now(),
+        );
         assert_eq!(scored[0].notes, vec!["in the 5-hour ramp"]);
         assert_eq!(scored[1].notes, vec!["weekly score is zero"]);
         assert_eq!(scored[2].notes, Vec::<String>::new());
@@ -1613,7 +1801,14 @@ mod tests {
             profile("spent", 0.0, 100.0, Some(10.0)),
             profile("fine", 0.0, 90.0, Some(10.0)),
         ]);
-        let scored = score_all(&sel, &names(&["ramp", "spent", "fine"]), &r, model, now());
+        let scored = score_all(
+            &sel,
+            &tun(),
+            &names(&["ramp", "spent", "fine"]),
+            &r,
+            model,
+            now(),
+        );
         let reserve = "scored without the Fable reserve (it zeroed every candidate)";
         assert_eq!(
             scored[0].note().unwrap(),
@@ -1631,9 +1826,343 @@ mod tests {
 
         // Unusable profiles carry a reason and no tier note.
         let r = report(vec![profile("gone", 99.5, 40.0, None)]);
-        let gone = &score_all(&sel, &names(&["gone"]), &r, model, now())[0];
+        let gone = &score_all(&sel, &tun(), &names(&["gone"]), &r, model, now())[0];
         assert!(gone.notes.is_empty());
         assert_eq!(gone.tier(), None);
+    }
+
+    fn priority(weight: Option<f64>, reset: Option<WeeklyReset>) -> Priority {
+        Priority {
+            weight,
+            weekly_reset: reset,
+        }
+    }
+
+    #[test]
+    fn a_weight_scales_the_score_within_its_tier_only() {
+        let sel = SelectionConfig::default();
+        let r = report(vec![
+            profile("a", 0.0, 40.0, Some(80.0)),
+            profile("b", 0.0, 50.0, Some(80.0)),
+            profile("ramp", 92.0, 0.0, None),
+        ]);
+        let all = names(&["a", "b", "ramp"]);
+        let plain = score_all(&sel, &tun(), &all, &r, OPUS, now());
+        assert_eq!(best_of(&plain).as_deref(), Some("a"));
+        let heavy = |name: &str, w: f64| {
+            let layer = AccountLayer {
+                priority: priority(Some(w), None),
+                ..AccountLayer::default()
+            };
+            tuned(name, layer)
+        };
+        for model in [OPUS, FABLE] {
+            let base = score_all(&sel, &tun(), &all, &r, model, now());
+            let scored = score_all(&sel, &heavy("b", 2.0), &all, &r, model, now());
+            assert!(
+                (scored[1].score - 2.0 * base[1].score).abs() < 1e-12,
+                "{model}"
+            );
+            assert_eq!(scored[1].notes, vec!["weight 2"], "{model}");
+            assert!(scored[0].notes.is_empty());
+        }
+        let scored = score_all(&sel, &heavy("b", 2.0), &all, &r, OPUS, now());
+        assert_eq!(best_of(&scored).as_deref(), Some("b"));
+        // A tier-2 profile weighted far above the rest stays in tier 2.
+        let scored = score_all(&sel, &heavy("ramp", 1000.0), &all, &r, OPUS, now());
+        assert_eq!(scored[2].tier(), Some(2));
+        assert_eq!(scored[2].notes, vec!["weight 1000", "in the 5-hour ramp"]);
+        assert_eq!(best_of(&scored).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn a_weekly_reset_override_shortens_hours_and_says_so() {
+        let sel = SelectionConfig::default();
+        let usage = profile("p", 0.0, 40.0, Some(80.0));
+        let with = |reset: WeeklyReset, rule: bool| {
+            let p = priority(None, Some(reset));
+            let layer = if rule {
+                AccountLayer {
+                    by_model: Some(vec![crate::tuning::ModelRule {
+                        models: names(&["*fable*"]),
+                        priority: p,
+                    }]),
+                    ..AccountLayer::default()
+                }
+            } else {
+                AccountLayer {
+                    priority: p,
+                    ..AccountLayer::default()
+                }
+            };
+            tuned("p", layer)
+        };
+        let early = WeeklyReset::EarlierBy(SignedDuration::from_hours(60));
+        let s = score_one(&sel, &with(early, false), OPUS, &usage, now(), true);
+        assert!((s.general.unwrap().hours - 40.0).abs() < 1e-9);
+        assert!((s.fable.unwrap().hours - 40.0).abs() < 1e-9);
+        // 60% general less the 10% reserve, over 40 hours instead of 100.
+        assert!((s.score - 50.0 / 40.0).abs() < 1e-9, "{s:?}");
+        let to = at(40).unwrap();
+        assert_eq!(s.general.unwrap().resets_at, to);
+        assert_eq!(s.fable.unwrap().resets_at, to);
+        assert_eq!(
+            s.notes,
+            vec![
+                format!("general reset moved 60 h earlier, to {to}"),
+                format!("Fable reset moved 60 h earlier, to {to}"),
+            ]
+        );
+
+        // A zero offset, or an absolute time at the reset, moves nothing and
+        // says nothing.
+        for none in [
+            WeeklyReset::EarlierBy(SignedDuration::ZERO),
+            WeeklyReset::At(at(100).unwrap()),
+        ] {
+            let s = score_one(&sel, &with(none, false), OPUS, &usage, now(), true);
+            assert!((s.general.unwrap().hours - 100.0).abs() < 1e-9);
+            assert!((s.fable.unwrap().hours - 100.0).abs() < 1e-9);
+            assert!(s.notes.is_empty(), "{s:?}");
+        }
+
+        // A moved reset already past sits at the floor.
+        let past = WeeklyReset::At(at(-1).unwrap());
+        let s = score_one(&sel, &with(past, false), OPUS, &usage, now(), true);
+        assert_eq!(s.general.unwrap().hours, sel.min_time_left_h);
+        assert_eq!(s.general.unwrap().resets_at, at(-1).unwrap());
+
+        // A window published without a reset falls back to a week from now,
+        // and that fallback is what an override is tested against.
+        let mut bare = usage.clone();
+        for w in &mut bare.windows {
+            w.resets_at = None;
+        }
+        let s = score_one(&sel, &with(early, false), OPUS, &bare, now(), true);
+        assert!((s.general.unwrap().hours - 108.0).abs() < 1e-9);
+        assert_eq!(s.general.unwrap().resets_at, at(108).unwrap());
+        let s = score_one(&sel, &with(past, false), OPUS, &bare, now(), true);
+        assert!((s.general.unwrap().hours - WEEK_HOURS as f64).abs() < 1e-9);
+        let week = at(WEEK_HOURS).unwrap();
+        assert_eq!(
+            s.notes,
+            ["general", "Fable"].map(|b| format!(
+                "weekly_reset_at {} not applied to the {b} bucket: its reset {week} is in a later week",
+                at(-1).unwrap()
+            ))
+        );
+
+        // An absolute time after the reset, or a week before it.
+        let reset = at(100).unwrap();
+        for (t, why) in [
+            (at(101).unwrap(), format!("after its reset {reset}")),
+            (
+                at(-68).unwrap(),
+                format!("its reset {reset} is in a later week"),
+            ),
+        ] {
+            let s = score_one(
+                &sel,
+                &with(WeeklyReset::At(t), true),
+                FABLE,
+                &usage,
+                now(),
+                true,
+            );
+            assert!((s.general.unwrap().hours - 100.0).abs() < 1e-9);
+            assert_eq!(
+                s.notes,
+                ["general", "Fable"].map(|b| format!(
+                    "weekly_reset_at {t} not applied to the {b} bucket: {why} (by_model rule 1)"
+                ))
+            );
+            // The rule is for Fable models only.
+            let s = score_one(
+                &sel,
+                &with(WeeklyReset::At(t), true),
+                OPUS,
+                &usage,
+                now(),
+                true,
+            );
+            assert!(s.notes.is_empty(), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn each_bucket_is_moved_against_its_own_reset_and_notes_keep_their_order() {
+        let sel = SelectionConfig::default();
+        // General resets in 100 h, Fable in 20 h; 92% of the 5-hour window
+        // spent puts the profile in the ramp.
+        let mut usage = profile("p", 92.0, 40.0, Some(80.0));
+        usage.windows[2] = window("7-day_fable", 80.0, 20);
+        let layer = |reset: WeeklyReset, by_model| AccountLayer {
+            priority: priority(None, Some(reset)),
+            by_model,
+            ..AccountLayer::default()
+        };
+
+        // An absolute time inside the general week but after the Fable reset.
+        let t = at(50).unwrap();
+        let s = score_one(
+            &sel,
+            &tuned("p", layer(WeeklyReset::At(t), None)),
+            OPUS,
+            &usage,
+            now(),
+            true,
+        );
+        let (g, f) = (s.general.unwrap(), s.fable.unwrap());
+        assert!((g.hours - 50.0).abs() < 1e-9);
+        assert_eq!(g.resets_at, t);
+        assert!((f.hours - 20.0).abs() < 1e-9);
+        assert_eq!(f.resets_at, at(20).unwrap());
+        assert_eq!(
+            s.notes,
+            vec![
+                format!("general reset moved 50 h earlier, to {t}"),
+                format!(
+                    "weekly_reset_at {t} not applied to the Fable bucket: after its reset {}",
+                    at(20).unwrap()
+                ),
+            ]
+        );
+
+        // An offset moves each bucket back from its own reset; a rule's
+        // weight comes first, the reset notes next, the tier note last.
+        let rules = vec![crate::tuning::ModelRule {
+            models: names(&["*opus*"]),
+            priority: priority(Some(2.0), None),
+        }];
+        let early = WeeklyReset::EarlierBy(SignedDuration::from_hours(10));
+        let tuning = tuned("p", layer(early, Some(rules)));
+        let s = &score_all(
+            &sel,
+            &tuning,
+            &names(&["p"]),
+            &report(vec![usage]),
+            OPUS,
+            now(),
+        )[0];
+        let (g, f) = (s.general.unwrap(), s.fable.unwrap());
+        assert!((g.hours - 90.0).abs() < 1e-9);
+        assert!((f.hours - 10.0).abs() < 1e-9);
+        assert_eq!(s.tier(), Some(2));
+        assert_eq!(
+            s.notes,
+            vec![
+                "weight 2 (by_model rule 1)".to_string(),
+                format!("general reset moved 10 h earlier, to {}", at(90).unwrap()),
+                format!("Fable reset moved 10 h earlier, to {}", at(10).unwrap()),
+                "in the 5-hour ramp".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn keys_are_tried_by_weight_then_name() {
+        let dir = crate::testutil::TempDir::new("select-key-weight");
+        let mut cfg = keyed(&dir, &["a"]);
+        add_key(&dir, &mut cfg, "alpha", &["*"]);
+        add_key(&dir, &mut cfg, "zulu", &["*"]);
+        let usage = reported(vec![spent("a")]);
+        let zulu = |rules: Option<Vec<crate::tuning::ModelRule>>| {
+            tuned(
+                "zulu",
+                AccountLayer {
+                    priority: priority(Some(2.0), None),
+                    by_model: rules,
+                    ..AccountLayer::default()
+                },
+            )
+        };
+        let views = all_at(&cfg, 10.0);
+        let (choice, _) = pick_tuned(&cfg, &zulu(None), OPUS, &usage, &[], views.clone(), true);
+        let choice = choice.unwrap();
+        took_key(&choice, "zulu");
+        let rows = key_rows(&cfg, &zulu(None), OPUS, &choice, &views);
+        assert_eq!(rows[0].why_not.as_deref(), Some("key zulu was taken first"));
+        let weights: Vec<(&str, f64, Option<usize>)> = rows
+            .iter()
+            .map(|r| (r.name.as_str(), r.weight, r.weight_rule))
+            .collect();
+        assert_eq!(
+            weights,
+            vec![
+                ("alpha", 1.0, None),
+                ("team", 1.0, None),
+                ("zulu", 2.0, None)
+            ]
+        );
+
+        // Out of budget, the heavier key is passed over for name order.
+        let mut low = views.clone();
+        low.get_mut("zulu").unwrap().spent_usd = 410.0;
+        let (choice, _) = pick_tuned(&cfg, &zulu(None), OPUS, &usage, &[], low, true);
+        took_key(&choice.unwrap(), "alpha");
+
+        // A rule takes zulu's weight back down for Opus only.
+        let rule = crate::tuning::ModelRule {
+            models: names(&["*opus*"]),
+            priority: priority(Some(0.5), None),
+        };
+        let t = zulu(Some(vec![rule]));
+        let (choice, _) = pick_tuned(&cfg, &t, OPUS, &usage, &[], views.clone(), true);
+        let choice = choice.unwrap();
+        took_key(&choice, "alpha");
+        let rows = key_rows(&cfg, &t, OPUS, &choice, &views);
+        assert_eq!((rows[2].weight, rows[2].weight_rule), (0.5, Some(0)));
+        let (choice, _) = pick_tuned(&cfg, &t, FABLE, &usage, &[], views.clone(), true);
+        let choice = choice.unwrap();
+        took_key(&choice, "zulu");
+        let rows = key_rows(&cfg, &t, FABLE, &choice, &views);
+        assert_eq!((rows[2].weight, rows[2].weight_rule), (2.0, None));
+    }
+
+    #[test]
+    fn a_weighted_profile_with_a_zero_score_still_lets_a_key_spend() {
+        let dir = crate::testutil::TempDir::new("select-key-weighted-zero");
+        let cfg = keyed(&dir, &["a"]);
+        let t = tuned(
+            "a",
+            AccountLayer {
+                priority: priority(Some(1000.0), None),
+                ..AccountLayer::default()
+            },
+        );
+        let usage = reported(vec![spent("a")]);
+        let (choice, calls) = pick_tuned(&cfg, &t, OPUS, &usage, &[], all_at(&cfg, 10.0), true);
+        let choice = choice.unwrap();
+        took_key(&choice, "team");
+        assert_eq!(calls, 1);
+        let a = &choice.scored[0];
+        assert_eq!((a.score, a.weight, a.tier()), (0.0, 1000.0, Some(2)));
+    }
+
+    #[test]
+    fn unscored_profiles_carry_their_resolved_weight() {
+        let sel = SelectionConfig::default();
+        let t = tuned(
+            "missing",
+            AccountLayer {
+                priority: priority(Some(3.0), None),
+                by_model: Some(vec![crate::tuning::ModelRule {
+                    models: names(&["*fable*"]),
+                    priority: priority(Some(0.25), None),
+                }]),
+                ..AccountLayer::default()
+            },
+        );
+        let r = report(vec![profile("gone", 99.5, 40.0, None)]);
+        let all = names(&["missing", "gone"]);
+        let scored = score_all(&sel, &t, &all, &r, OPUS, now());
+        assert_eq!(scored[0].out, Some(Out::NoSnapshot));
+        assert_eq!(scored[0].weight, 3.0);
+        assert!(scored[0].notes.is_empty());
+        assert_eq!(scored[1].out, Some(Out::FiveHourFloor));
+        assert_eq!(scored[1].weight, 1.0);
+        let scored = score_all(&sel, &t, &all, &r, FABLE, now());
+        assert_eq!(scored[0].weight, 0.25);
     }
 
     /// A config whose token dir holds credentials for `profiles`.
@@ -1665,6 +2194,7 @@ mod tests {
     ) -> Result<Choice> {
         choose(
             claude,
+            &tun(),
             env,
             model,
             now,
@@ -1900,17 +2430,9 @@ mod tests {
         models: &[&str],
     ) {
         let path = dir.write_file(&format!("{name}.key"), "sk-ant-api\n", 0o600);
-        cfg.api_keys.insert(
-            name.to_string(),
-            ApiKeyConfig {
-                key_file: path.display().to_string(),
-                budget_usd: 420.0,
-                models: names(models),
-                reserve_usd: 20.0,
-                reset_tz: "UTC".to_string(),
-                exhausted_patterns: names(&["*credit balance is too low*"]),
-            },
-        );
+        let mut key = ApiKeyConfig::new(&path.display().to_string(), 420.0, models);
+        key.reserve_usd = 20.0;
+        cfg.api_keys.insert(name.to_string(), key);
     }
 
     fn budget_view(spent: f64) -> BudgetView {
@@ -1929,10 +2451,22 @@ mod tests {
         }
     }
 
-    /// `choose` with keys eligible, every key's view at `spent`, and how often
-    /// the budget closure ran.
+    /// `choose` with the default tuning, keys `eligible`, the given budget
+    /// views, and how often the budget closure ran.
     fn pick_with(
         cfg: &ClaudeConfig,
+        model: &str,
+        usage: &UsageSource,
+        exclude: &[&str],
+        views: BTreeMap<String, BudgetView>,
+        eligible: bool,
+    ) -> (Result<Choice>, usize) {
+        pick_tuned(cfg, &tun(), model, usage, exclude, views, eligible)
+    }
+
+    fn pick_tuned(
+        cfg: &ClaudeConfig,
+        tuning: &Tuning,
         model: &str,
         usage: &UsageSource,
         exclude: &[&str],
@@ -1946,6 +2480,7 @@ mod tests {
         };
         let choice = choose(
             cfg,
+            tuning,
             &empty_env(),
             model,
             now(),
@@ -2175,7 +2710,14 @@ mod tests {
         ]);
         let sel = SelectionConfig::default();
         for model in [OPUS, FABLE] {
-            for s in score_all(&sel, &names(&["a", "b", "c", "d", "e"]), &r, model, now()) {
+            for s in score_all(
+                &sel,
+                &tun(),
+                &names(&["a", "b", "c", "d", "e"]),
+                &r,
+                model,
+                now(),
+            ) {
                 assert_eq!(s.reason.is_some(), s.out.is_some(), "{s:?}");
             }
         }
@@ -2301,7 +2843,7 @@ mod tests {
         let choice = choice.unwrap();
         took_key(&choice, "team");
         assert_eq!(calls, 1);
-        let rows = key_rows(&cfg, OPUS, &choice, &views);
+        let rows = key_rows(&cfg, &tun(), OPUS, &choice, &views);
         let summary: Vec<(&str, bool, Option<&str>)> = rows
             .iter()
             .map(|r| (r.name.as_str(), r.used, r.why_not.as_deref()))
@@ -2315,7 +2857,7 @@ mod tests {
                     Some("$410.00 of $420.00 spent, reserve $20.00")
                 ),
                 ("team", true, None),
-                ("zulu", false, Some("an earlier key was taken")),
+                ("zulu", false, Some("key team was taken first")),
             ]
         );
 

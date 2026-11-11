@@ -332,11 +332,9 @@ mod tests {
         let mqtt = MqttConfig {
             config: Some("/nonexistent/client.toml".to_string()),
         };
-        let sel = SelectionConfig {
-            mqtt_quiesce_ms: 10,
-            mqtt_timeout_ms: 50,
-            ..SelectionConfig::default()
-        };
+        let mut sel = SelectionConfig::default();
+        sel.mqtt_quiesce_ms = 10;
+        sel.mqtt_timeout_ms = 50;
         match fetch(&mqtt, &sel, &env) {
             UsageSource::Unavailable(reason) => {
                 assert!(reason.contains("does not exist"), "{reason}")

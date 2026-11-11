@@ -895,17 +895,13 @@ mod tests {
             auth: ClaudeAuth::Token,
             ..ClaudeConfig::default()
         };
-        cfg.api_keys.insert(
-            "team".into(),
-            crate::config::ApiKeyConfig {
-                key_file: dir.path().join("team.key").display().to_string(),
-                budget_usd: 420.0,
-                models: vec!["*fable*".into()],
-                reserve_usd: 0.0,
-                reset_tz: "UTC".into(),
-                exhausted_patterns: vec!["*credit*".into()],
-            },
+        let mut key = crate::config::ApiKeyConfig::new(
+            &dir.path().join("team.key").display().to_string(),
+            420.0,
+            &["*fable*"],
         );
+        key.exhausted_patterns = vec!["*credit*".into()];
+        cfg.api_keys.insert("team".into(), key);
         cfg
     }
 

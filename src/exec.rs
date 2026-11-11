@@ -607,6 +607,7 @@ fn retry_on_limit(
     // aside; the first turn already ran, so it is not a configuration error.
     let Ok(choice) = crate::select::choose(
         &ctx.cfg.claude,
+        &ctx.cfg.tuning,
         ctx.env,
         &r.model,
         ctx.now,
@@ -2623,6 +2624,7 @@ fn fresh_account(ctx: &Ctx, r: &Resolved, profile: Option<&str>) -> Result<Selec
 fn select_account(ctx: &Ctx, r: &Resolved, source: &UsageSource) -> Result<Selected> {
     let choice = crate::select::choose(
         &ctx.cfg.claude,
+        &ctx.cfg.tuning,
         ctx.env,
         &r.model,
         ctx.now,
@@ -3597,14 +3599,7 @@ mod tests {
         }
         f.cfg.claude.api_keys.insert(
             name.into(),
-            crate::config::ApiKeyConfig {
-                key_file: path.display().to_string(),
-                budget_usd: 420.0,
-                models: vec!["*".into()],
-                reserve_usd: 0.0,
-                reset_tz: "UTC".into(),
-                exhausted_patterns: vec!["*credit balance is too low*".into()],
-            },
+            crate::config::ApiKeyConfig::new(&path.display().to_string(), 420.0, &["*"]),
         );
     }
 
@@ -6758,6 +6753,55 @@ mod tests {
         );
         let record = session::load_from(&f.sessions_dir(), "9f22dd1b-aaaa").unwrap();
         assert_eq!(record.profile.as_deref(), Some("team04"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fresh_selection_and_its_limit_continuation_follow_the_configured_weights() {
+        use crate::tuning::{AccountLayer, Priority, Tuning, TuningLayer};
+        let _lock = test_io_lock();
+        let mut f = Fixture::new("run-weighted");
+        f.cfg.claude.profiles = vec!["team03".into(), "team04".into(), "team05".into()];
+        for p in ["team03", "team04", "team05"] {
+            f.token(p);
+        }
+        let weight = |w: f64| AccountLayer {
+            priority: Priority {
+                weight: Some(w),
+                weekly_reset: None,
+            },
+            ..AccountLayer::default()
+        };
+        // Unweighted, team03 scores highest and team04 beats team05 on order.
+        f.cfg.tuning = Tuning::default().overlay(&TuningLayer {
+            accounts: BTreeMap::from([
+                ("team04".to_string(), weight(3.0)),
+                ("team05".to_string(), weight(10.0)),
+            ]),
+            ..TuningLayer::default()
+        });
+        claude_turns(
+            &mut f,
+            &[limited_turn("9f22dd1b-aaaa"), OK_RESULT.to_string()],
+        );
+        let usage = || {
+            report(vec![
+                snapshot(Timestamp::now(), "team03", 0.0, 10.0),
+                snapshot(Timestamp::now(), "team05", 0.0, 50.0),
+                snapshot(Timestamp::now(), "team04", 0.0, 50.0),
+            ])
+        };
+
+        let (completion, _) = limited_run(&f, &usage, None);
+        assert_eq!(completion, 0);
+        let inv = f.audit.lineage().invocation_id.clone();
+        assert_eq!(
+            spawned_profiles(&f),
+            vec![
+                (inv.clone(), Some("team05".to_string())),
+                (inv, Some("team04".to_string())),
+            ]
+        );
     }
 
     #[cfg(unix)]

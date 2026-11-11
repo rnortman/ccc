@@ -22,6 +22,7 @@ mod status;
 mod supervise;
 #[cfg(test)]
 mod testutil;
+mod tuning;
 mod usage;
 
 use anyhow::Result;
@@ -634,6 +635,7 @@ fn which_with(
             let source = (ctx.usage)();
             Some(select::choose(
                 &ctx.cfg.claude,
+                &ctx.cfg.tuning,
                 ctx.env,
                 &r.model,
                 ctx.now,
@@ -652,7 +654,7 @@ fn which_with(
     }
     let keys = match &choice {
         Some(c) if !ctx.cfg.claude.api_keys.is_empty() => {
-            select::key_rows(&ctx.cfg.claude, &r.model, c, &budget())
+            select::key_rows(&ctx.cfg.claude, &ctx.cfg.tuning, &r.model, c, &budget())
         }
         _ => Vec::new(),
     };
@@ -794,8 +796,10 @@ fn key_line(k: &select::KeyRow) -> String {
         None => "yes".to_string(),
         Some(why) => format!("no ({why})"),
     };
+    let weight = tuning::weight_note(k.weight, k.weight_rule)
+        .map_or(String::new(), |note| format!(" {note}"));
     format!(
-        "api-key {}: {budget}; models match: {}; would be used: {used}",
+        "api-key {}{weight}: {budget}; models match: {}; would be used: {used}",
         k.name,
         if k.models_match { "yes" } else { "no" },
     )
@@ -813,6 +817,7 @@ fn key_json(k: &select::KeyRow) -> serde_json::Value {
         "models_match": k.models_match,
         "would_be_used": k.used,
         "reason": k.why_not,
+        "weight": k.weight,
     })
 }
 
@@ -855,6 +860,9 @@ fn scored_json(s: &select::Scored) -> serde_json::Value {
         "util_f": s.fable.map(|b| b.util),
         "hours_g": s.general.map(|b| b.hours),
         "hours_f": s.fable.map(|b| b.hours),
+        "resets_g": s.general.map(|b| b.resets_at.to_string()),
+        "resets_f": s.fable.map(|b| b.resets_at.to_string()),
+        "weight": s.weight,
         "five_hour_floor_pct": s.five_hour_floor_pct,
         "five_hour_knee_pct": s.five_hour_knee_pct,
         "gate5": s.gate5,
@@ -2062,6 +2070,121 @@ mod tests {
     }
 
     #[test]
+    fn which_picks_and_lists_keys_with_the_configured_tuning() {
+        use crate::tuning::{AccountLayer, Priority, Tuning, TuningLayer};
+        use crate::usage::{ProfileUsage, UsageReport, UsageSource, UsageWindow};
+        use claude_usage_mqtt_core::{AuthState, FIVE_HOUR};
+
+        let dir = TempDir::new("which-tuning");
+        std::fs::create_dir_all(dir.path().join("agents")).unwrap();
+        std::fs::create_dir_all(dir.path().join("tokens")).unwrap();
+        std::fs::write(
+            dir.path().join("agents/explorer.md"),
+            "---\nname: explorer\ndescription: Investigates\nharness: claude\nmodel: claude-haiku-4-5\n---\nbody\n",
+        )
+        .unwrap();
+        for name in ["team03", "team04"] {
+            let token = dir.path().join(format!("tokens/{name}.token"));
+            std::fs::write(&token, "sk-ant-oat-x\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
+        let mut cfg = Config {
+            agents_dir: Some(dir.path().join("agents").display().to_string()),
+            ..Config::default()
+        };
+        cfg.claude.auth = config::ClaudeAuth::Token;
+        cfg.claude.token_dir = dir.path().join("tokens").display().to_string();
+        cfg.claude.profiles = vec!["team03".into(), "team04".into()];
+        cfg.claude.api_keys.insert(
+            "team".into(),
+            config::ApiKeyConfig::new("/k", 100.0, &["*"]),
+        );
+        let env = BTreeMap::from([(
+            "XDG_CONFIG_HOME".to_string(),
+            dir.path().join("xdg").display().to_string(),
+        )]);
+        let sources = sources_in(&env);
+        let now = Timestamp::now();
+        let resets = now
+            .checked_add(jiff::SignedDuration::from_hours(100))
+            .unwrap();
+        // team03 has more weekly headroom, so it wins unweighted.
+        let usage = || {
+            UsageSource::Report(UsageReport {
+                profiles: [("team03", 40.0), ("team04", 50.0)]
+                    .map(|(name, util_g)| ProfileUsage {
+                        profile: name.into(),
+                        auth: AuthState::Ok,
+                        stale_reason: None,
+                        updated_at: now,
+                        windows: vec![
+                            UsageWindow {
+                                key: FIVE_HOUR.to_string(),
+                                utilization: 10.0,
+                                resets_at: None,
+                            },
+                            UsageWindow {
+                                key: "seven_day".to_string(),
+                                utilization: util_g,
+                                resets_at: Some(resets),
+                            },
+                        ],
+                    })
+                    .to_vec(),
+                daemon_status: Some("online".into()),
+            })
+        };
+        let run = |cfg: &Config| {
+            let ctx = WhichCtx {
+                cfg,
+                sources: &sources,
+                env: &env,
+                now,
+                usage: &usage,
+                budget: &no_budget,
+            };
+            let mut out = Vec::new();
+            which_with(
+                &ctx,
+                "explorer",
+                None,
+                false,
+                &mut out,
+                &mut std::io::sink(),
+            )
+            .unwrap();
+            String::from_utf8(out).unwrap()
+        };
+
+        let text = run(&cfg);
+        assert!(text.contains("profile=team03"), "{text}");
+        assert!(!text.contains("weight"), "{text}");
+
+        let weighted = |w: f64| AccountLayer {
+            priority: Priority {
+                weight: Some(w),
+                weekly_reset: None,
+            },
+            ..AccountLayer::default()
+        };
+        cfg.tuning = Tuning::default().overlay(&TuningLayer {
+            accounts: BTreeMap::from([
+                ("team04".to_string(), weighted(2.0)),
+                ("team".to_string(), weighted(3.0)),
+            ]),
+            ..TuningLayer::default()
+        });
+        let text = run(&cfg);
+        assert!(text.contains("profile=team04"), "{text}");
+        assert!(text.contains("weight 2"), "{text}");
+        assert!(text.contains("api-key team weight 3: "), "{text}");
+    }
+
+    #[test]
     fn which_under_the_ambient_login_prints_the_ambient_line_and_reads_no_usage() {
         use crate::testutil::TempDir;
 
@@ -2131,6 +2254,7 @@ mod tests {
 
     #[test]
     fn which_prints_the_candidate_table_when_an_account_was_chosen() {
+        let reset: jiff::Timestamp = "2026-11-14T08:00:00Z".parse().unwrap();
         let choice = Choice {
             account: crate::harness::claude::Account::from_config(
                 &crate::config::ClaudeConfig {
@@ -2149,13 +2273,16 @@ mod tests {
                     general: Some(select::Bucket {
                         util: 86.0,
                         hours: 84.0,
+                        resets_at: reset,
                     }),
                     fable: Some(select::Bucket {
                         util: 77.0,
                         hours: 84.0,
+                        resets_at: reset,
                     }),
                     five_hour_floor_pct: 1.0,
                     five_hour_knee_pct: 15.0,
+                    weight: 2.0,
                     gate5: 1.0,
                     score: 0.03,
                     usable: true,
@@ -2169,13 +2296,16 @@ mod tests {
                     general: Some(select::Bucket {
                         util: 90.0,
                         hours: 84.0,
+                        resets_at: reset,
                     }),
                     fable: Some(select::Bucket {
                         util: 83.0,
                         hours: 84.0,
+                        resets_at: reset,
                     }),
                     five_hour_floor_pct: 1.0,
                     five_hour_knee_pct: 15.0,
+                    weight: 1.0,
                     gate5: 0.0,
                     score: 0.0,
                     usable: false,
@@ -2191,10 +2321,12 @@ mod tests {
                     general: Some(select::Bucket {
                         util: 7.0,
                         hours: 84.0,
+                        resets_at: reset,
                     }),
                     fable: None,
                     five_hour_floor_pct: 1.0,
                     five_hour_knee_pct: 15.0,
+                    weight: 1.0,
                     gate5: 1.0,
                     score: 0.0,
                     usable: false,
@@ -2208,10 +2340,12 @@ mod tests {
                     general: Some(select::Bucket {
                         util: 10.0,
                         hours: 84.0,
+                        resets_at: reset,
                     }),
                     fable: None,
                     five_hour_floor_pct: 20.0,
                     five_hour_knee_pct: 60.0,
+                    weight: 1.0,
                     gate5: 0.75,
                     score: 0.8,
                     usable: true,
@@ -2225,10 +2359,12 @@ mod tests {
                     general: Some(select::Bucket {
                         util: 100.0,
                         hours: 84.0,
+                        resets_at: reset,
                     }),
                     fable: None,
                     five_hour_floor_pct: 1.0,
                     five_hour_knee_pct: 15.0,
+                    weight: 1.0,
                     gate5: 1.0,
                     score: 0.0,
                     usable: true,
@@ -2264,6 +2400,8 @@ mod tests {
                 models_match: true,
                 used: false,
                 why_not: Some("a profile can take the work".into()),
+                weight: 1.0,
+                weight_rule: None,
             },
             select::KeyRow {
                 name: "other".into(),
@@ -2271,6 +2409,17 @@ mod tests {
                 models_match: false,
                 used: false,
                 why_not: Some("models do not match".into()),
+                weight: 0.5,
+                weight_rule: Some(0),
+            },
+            select::KeyRow {
+                name: "zulu".into(),
+                view: None,
+                models_match: true,
+                used: false,
+                why_not: Some("a profile can take the work".into()),
+                weight: 2.0,
+                weight_rule: None,
             },
         ];
 
@@ -2316,11 +2465,14 @@ mod tests {
         assert!(!text.contains("personal"), "{text}");
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
-            &lines[lines.len() - 2..],
+            &lines[lines.len() - 3..],
             &[
                 "api-key team: month 2026-11 spent $137.42 of $420.00 reserve $20.00 exhausted - \
                  (spend: this host only); models match: yes; would be used: no (a profile can take the work)",
-                "api-key other: no budget view; models match: no; would be used: no (models do not match)",
+                "api-key other weight 0.5 (by_model rule 1): no budget view; models match: no; \
+                 would be used: no (models do not match)",
+                "api-key zulu weight 2: no budget view; models match: yes; \
+                 would be used: no (a profile can take the work)",
             ]
         );
 
@@ -2367,5 +2519,13 @@ mod tests {
         assert_eq!(v["api_keys"][0]["reason"], "a profile can take the work");
         assert!(v["api_keys"][1]["month"].is_null());
         assert_eq!(v["api_keys"][1]["models_match"], false);
+        assert_eq!(v["api_keys"][0]["weight"], 1.0);
+        assert_eq!(v["api_keys"][1]["weight"], 0.5);
+        assert_eq!(v["api_keys"][2]["weight"], 2.0);
+        assert_eq!(v["candidates"][0]["weight"], 2.0);
+        assert_eq!(v["candidates"][1]["weight"], 1.0);
+        assert_eq!(v["candidates"][0]["resets_g"], "2026-11-14T08:00:00Z");
+        assert_eq!(v["candidates"][0]["resets_f"], "2026-11-14T08:00:00Z");
+        assert!(v["candidates"][2]["resets_f"].is_null());
     }
 }

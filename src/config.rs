@@ -10,6 +10,8 @@ use anyhow::{Context, Result};
 use claude_usage_mqtt_core::SEVEN_DAY;
 use serde::Deserialize;
 
+use crate::tuning::{self, AccountLayer, ModelRule, Priority, Tuning, TuningLayer, WeeklyReset};
+
 /// Which harness runs an agent.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, serde::Serialize,
@@ -237,6 +239,8 @@ pub struct Config {
     pub bus: BusConfig,
     pub process: ProcessConfig,
     pub launch: LaunchConfig,
+    /// The account-tuning knobs selection reads, resolved from the site config.
+    pub tuning: Tuning,
 }
 
 /// The site config file: accounts, Codex policy, the usage broker, kill grace
@@ -390,6 +394,22 @@ pub struct ApiKeyConfig {
     /// Globs over a failed turn's message that mean the key is out of credit.
     #[serde(default = "default_exhausted_patterns")]
     pub exhausted_patterns: Vec<String>,
+    /// Orders this key among the keys eligible at overflow. Private, like
+    /// every knob: it is read into [`Config::tuning`] at load, and selection
+    /// reads only that.
+    #[serde(default)]
+    weight: Option<f64>,
+    /// Per-model weights, first match wins; read into [`Config::tuning`].
+    #[serde(default)]
+    by_model: Vec<KeyModelPriorityToml>,
+}
+
+/// One `[[claude.api_keys.<name>.by_model]]` entry.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyModelPriorityToml {
+    models: Vec<String>,
+    weight: f64,
 }
 
 fn default_reset_tz() -> String {
@@ -404,6 +424,22 @@ fn default_exhausted_patterns() -> Vec<String> {
 }
 
 impl ApiKeyConfig {
+    /// A key with the given required fields, the defaults for the rest, and
+    /// no knobs.
+    #[cfg(test)]
+    pub fn new(key_file: &str, budget_usd: f64, models: &[&str]) -> ApiKeyConfig {
+        ApiKeyConfig {
+            key_file: key_file.to_string(),
+            budget_usd,
+            models: models.iter().map(|m| m.to_string()).collect(),
+            reserve_usd: 0.0,
+            reset_tz: default_reset_tz(),
+            exhausted_patterns: default_exhausted_patterns(),
+            weight: None,
+            by_model: Vec::new(),
+        }
+    }
+
     /// Refuses a key table no budget can be kept against; `name` is the
     /// table's key.
     fn validate(&self, name: &str, profiles: &[String]) -> Result<()> {
@@ -453,14 +489,95 @@ impl ClaudeConfig {
     pub fn ambient(&self) -> bool {
         self.profiles.is_empty()
     }
+
+    /// The site config's account-tuning knobs as one layer, each value
+    /// checked and refused with its table's name.
+    fn tuning_layer(&self) -> Result<TuningLayer> {
+        let sel = &self.selection;
+        let mut accounts = BTreeMap::new();
+        for (name, ps) in &sel.profile {
+            let table = format!("[claude.selection.profile.{name}]");
+            let priority = Priority {
+                weight: checked_weight(&table, ps.weight)?,
+                weekly_reset: weekly_reset(
+                    &table,
+                    ps.weekly_reset_at.as_ref(),
+                    ps.weekly_reset_earlier_h,
+                )?,
+            };
+            let mut rules = Vec::new();
+            for (i, r) in ps.by_model.iter().enumerate() {
+                let table = format!(
+                    "[[claude.selection.profile.{name}.by_model]] entry {}",
+                    i + 1
+                );
+                checked_models(&table, &r.models)?;
+                let priority = Priority {
+                    weight: checked_weight(&table, r.weight)?,
+                    weekly_reset: weekly_reset(
+                        &table,
+                        r.weekly_reset_at.as_ref(),
+                        r.weekly_reset_earlier_h,
+                    )?,
+                };
+                tuning::check_rule_sets(&priority).map_err(|e| anyhow::anyhow!("{table} {e}"))?;
+                rules.push(ModelRule {
+                    models: r.models.clone(),
+                    priority,
+                });
+            }
+            accounts.insert(
+                name.clone(),
+                AccountLayer {
+                    five_hour_floor_pct: ps.five_hour_floor_pct,
+                    five_hour_knee_pct: ps.five_hour_knee_pct,
+                    priority,
+                    by_model: Some(rules),
+                },
+            );
+        }
+        for (name, key) in &self.api_keys {
+            let table = format!("[claude.api_keys.{name}]");
+            let mut rules = Vec::new();
+            for (i, r) in key.by_model.iter().enumerate() {
+                let table = format!("[[claude.api_keys.{name}.by_model]] entry {}", i + 1);
+                checked_models(&table, &r.models)?;
+                rules.push(ModelRule {
+                    models: r.models.clone(),
+                    priority: Priority {
+                        weight: checked_weight(&table, Some(r.weight))?,
+                        weekly_reset: None,
+                    },
+                });
+            }
+            accounts.insert(
+                name.clone(),
+                AccountLayer {
+                    priority: Priority {
+                        weight: checked_weight(&table, key.weight)?,
+                        weekly_reset: None,
+                    },
+                    by_model: Some(rules),
+                    ..AccountLayer::default()
+                },
+            );
+        }
+        Ok(TuningLayer {
+            five_hour_floor_pct: Some(sel.five_hour_floor_pct),
+            five_hour_knee_pct: Some(sel.five_hour_knee_pct),
+            accounts,
+        })
+    }
 }
 
-/// Knobs for the account scorer.
+/// Knobs for the account scorer. The 5-hour floor and knee and the
+/// `profile` tables are private: they are read into [`Config::tuning`] at
+/// load, and selection reads only that.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct SelectionConfig {
-    pub five_hour_floor_pct: f64,
-    pub five_hour_knee_pct: f64,
+    five_hour_floor_pct: f64,
+    five_hour_knee_pct: f64,
     pub min_time_left_h: f64,
     pub stale_grace_s: u64,
     pub fable_models: Vec<String>,
@@ -471,25 +588,92 @@ pub struct SelectionConfig {
     pub mqtt_quiesce_ms: u64,
     pub mqtt_timeout_ms: u64,
     /// `[claude.selection.profile.<name>]`: per-profile overrides of the
-    /// 5-hour floor and knee.
-    pub profile: BTreeMap<String, ProfileSelection>,
+    /// 5-hour floor and knee, and the profile's priority knobs.
+    profile: BTreeMap<String, ProfileSelection>,
 }
 
 /// One profile's overrides of the global 5-hour floor and knee, in remaining
-/// percent; an absent key falls back to the global value.
+/// percent (an absent key falls back to the global value), and its priority
+/// knobs. Read into [`Tuning`] at load.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
-pub struct ProfileSelection {
-    pub five_hour_floor_pct: Option<f64>,
-    pub five_hour_knee_pct: Option<f64>,
+struct ProfileSelection {
+    five_hour_floor_pct: Option<f64>,
+    five_hour_knee_pct: Option<f64>,
+    weight: Option<f64>,
+    weekly_reset_at: Option<TomlTime>,
+    weekly_reset_earlier_h: Option<f64>,
+    by_model: Vec<ModelPriorityToml>,
+}
+
+/// One `[[claude.selection.profile.<name>.by_model]]` entry.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelPriorityToml {
+    models: Vec<String>,
+    weight: Option<f64>,
+    weekly_reset_at: Option<TomlTime>,
+    weekly_reset_earlier_h: Option<f64>,
+}
+
+/// A TOML offset date-time, unquoted or as an RFC 3339 string.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(untagged)]
+enum TomlTime {
+    Datetime(toml::value::Datetime),
+    Text(String),
+}
+
+impl TomlTime {
+    fn timestamp(&self, table: &str) -> Result<jiff::Timestamp> {
+        let text = match self {
+            TomlTime::Datetime(d) => d.to_string(),
+            TomlTime::Text(s) => s.clone(),
+        };
+        text.parse().map_err(|_| {
+            anyhow::anyhow!(
+                "{table} weekly_reset_at must be a date and time with an offset, such as 2026-11-14T08:00:00Z (got {text})"
+            )
+        })
+    }
+}
+
+/// The weekly-reset override one table sets, refusing both forms at once.
+fn weekly_reset(
+    table: &str,
+    at: Option<&TomlTime>,
+    earlier_h: Option<f64>,
+) -> Result<Option<WeeklyReset>> {
+    match (at, earlier_h) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("{table} sets both weekly_reset_at and weekly_reset_earlier_h; set one")
+        }
+        (Some(t), None) => Ok(Some(WeeklyReset::At(t.timestamp(table)?))),
+        (None, Some(h)) => {
+            tuning::check_earlier_h(h).map_err(|e| anyhow::anyhow!("{table} {e}"))?;
+            Ok(Some(WeeklyReset::EarlierBy(
+                jiff::SignedDuration::from_secs_f64(h * 3600.0),
+            )))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+/// `table`'s weight, refused unless it is a finite number above 0.
+fn checked_weight(table: &str, weight: Option<f64>) -> Result<Option<f64>> {
+    if let Some(w) = weight {
+        tuning::check_weight(w).map_err(|e| anyhow::anyhow!("{table} {e}"))?;
+    }
+    Ok(weight)
+}
+
+fn checked_models(table: &str, models: &[String]) -> Result<()> {
+    tuning::check_rule_models(models).map_err(|e| anyhow::anyhow!("{table} {e}"))
 }
 
 impl Default for SelectionConfig {
     fn default() -> Self {
-        /// Below this much of the 5-hour window remaining, a profile is unusable.
-        const FIVE_HOUR_FLOOR_PCT: f64 = 1.0;
-        /// Above this much remaining, the 5-hour gate no longer damps the score.
-        const FIVE_HOUR_KNEE_PCT: f64 = 15.0;
+        use crate::tuning::{FIVE_HOUR_FLOOR_PCT, FIVE_HOUR_KNEE_PCT};
         /// Floor on hours-until-reset, so an imminent reset cannot explode a rate.
         const MIN_TIME_LEFT_H: f64 = 1.0;
         /// Snapshots older than this are not trusted.
@@ -517,18 +701,6 @@ impl Default for SelectionConfig {
 }
 
 impl SelectionConfig {
-    /// `profile`'s 5-hour `(floor, knee)` in remaining percent: its override
-    /// where it has one, else the global value.
-    pub fn effective(&self, profile: &str) -> (f64, f64) {
-        let over = self.profile.get(profile);
-        (
-            over.and_then(|o| o.five_hour_floor_pct)
-                .unwrap_or(self.five_hour_floor_pct),
-            over.and_then(|o| o.five_hour_knee_pct)
-                .unwrap_or(self.five_hour_knee_pct),
-        )
-    }
-
     /// Rejects knobs that would make a score meaningless. Every rate is
     /// divided by an hours-until-reset, and a score that comes out `NaN` or
     /// infinite silently collapses selection into configured order, so the
@@ -555,11 +727,6 @@ impl SelectionConfig {
                 self.fable_general_ratio
             );
         }
-        check_ramp(
-            "[claude.selection]",
-            self.five_hour_floor_pct,
-            self.five_hour_knee_pct,
-        )?;
         if self.mqtt_quiesce_ms == 0 || self.mqtt_timeout_ms == 0 {
             anyhow::bail!(
                 "[claude.selection] mqtt_quiesce_ms and mqtt_timeout_ms must be greater than 0 (got {} and {})",
@@ -567,30 +734,8 @@ impl SelectionConfig {
                 self.mqtt_timeout_ms
             );
         }
-        for name in self.profile.keys() {
-            let (floor, knee) = self.effective(name);
-            check_ramp(
-                &format!(
-                    "[claude.selection.profile.{name}] (unset keys fall back to [claude.selection])"
-                ),
-                floor,
-                knee,
-            )?;
-        }
         Ok(())
     }
-}
-
-/// Refuses a 5-hour floor/knee pair the gate cannot use: each must be a number
-/// in 0-100 (which also rules out NaN and infinities) and the floor must not
-/// exceed the knee.
-fn check_ramp(table: &str, floor: f64, knee: f64) -> Result<()> {
-    if !(0.0..=100.0).contains(&floor) || !(0.0..=100.0).contains(&knee) || floor > knee {
-        anyhow::bail!(
-            "{table} needs 0 <= five_hour_floor_pct <= five_hour_knee_pct <= 100 (got floor {floor}, knee {knee})"
-        );
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -895,8 +1040,9 @@ impl Config {
             Some(text) => parse_file(text, ConfigFile::Agents, paths)?,
             None => AgentsFile::default(),
         };
-        let cfg = Config::compose(site_file, agents_file);
-        cfg.validate()
+        let mut cfg = Config::compose(site_file, agents_file);
+        cfg.tuning = cfg
+            .validate()
             .with_context(|| format!("parsing config {}", paths.site))?;
         Ok(cfg)
     }
@@ -913,10 +1059,13 @@ impl Config {
             bus: site.bus,
             process: site.process,
             launch: site.launch,
+            tuning: Tuning::default(),
         }
     }
 
-    fn validate(&self) -> Result<()> {
+    /// Refuses a config that cannot be run, and resolves its account-tuning
+    /// knobs.
+    fn validate(&self) -> Result<Tuning> {
         if self.claude.auth == ClaudeAuth::ApiKey {
             anyhow::bail!(
                 "[claude] auth = \"api-key\" is not a way to authenticate profiles; configure API keys under [claude.api_keys.<name>]"
@@ -948,7 +1097,16 @@ impl Config {
         }
         self.goose.validate()?;
         self.bus.validate()?;
-        Ok(())
+        let tuning = Tuning::default().overlay(&self.claude.tuning_layer()?);
+        if let Err(fault) = tuning.check_ramps() {
+            match &fault.account {
+                None => anyhow::bail!("[claude.selection] {fault}"),
+                Some(name) => anyhow::bail!(
+                    "[claude.selection.profile.{name}] (unset keys fall back to [claude.selection]) {fault}"
+                ),
+            }
+        }
+        Ok(tuning)
     }
 
     /// Where `<type>.md` definitions live.
@@ -1444,6 +1602,23 @@ fable_windows = ["7-day_fable*", "weekly_fable"]
 [claude.selection.profile.personal]
 five_hour_knee_pct = 50.0
 five_hour_floor_pct = 20.0
+weight = 1.5
+weekly_reset_earlier_h = 36.0
+
+[[claude.selection.profile.personal.by_model]]
+models = ["*fable*"]
+weight = 3.0
+weekly_reset_at = 2026-11-14T08:00:00Z
+
+[claude.api_keys.team]
+key_file = "~/.config/ccc/team.key"
+budget_usd = 420.0
+models = ["*"]
+weight = 2.0
+
+[[claude.api_keys.team.by_model]]
+models = ["*opus*"]
+weight = 0.5
 
 [codex]
 approval = "on-failure"
@@ -1470,7 +1645,29 @@ effort = "low"
         assert_eq!(c.claude.extra_args, vec!["--add-dir", "/srv"]);
         assert_eq!(c.claude.selection.five_hour_knee_pct, 20.0);
         assert_eq!(c.claude.selection.five_hour_floor_pct, 1.0);
-        assert_eq!(c.claude.selection.effective("personal"), (20.0, 50.0));
+        assert_eq!(c.tuning.ramp("personal"), (20.0, 50.0));
+        assert_eq!(c.tuning.ramp("team03"), (1.0, 20.0));
+        let personal = c.tuning.priority("personal", "claude-opus-5[1M]");
+        assert_eq!(personal.weight, 1.5);
+        assert_eq!(
+            personal.weekly_reset,
+            Some(WeeklyReset::EarlierBy(jiff::SignedDuration::from_hours(36)))
+        );
+        let fable = c.tuning.priority("personal", "claude-fable-5-1[1m]");
+        assert_eq!((fable.weight, fable.weight_rule), (3.0, Some(0)));
+        assert_eq!(
+            (fable.weekly_reset, fable.reset_rule),
+            (
+                Some(WeeklyReset::At("2026-11-14T08:00:00Z".parse().unwrap())),
+                Some(0)
+            )
+        );
+        assert_eq!(
+            c.tuning.priority("team", "claude-fable-5-1[1m]").weight,
+            2.0
+        );
+        let opus = c.tuning.priority("team", "claude-opus-5[1M]");
+        assert_eq!((opus.weight, opus.weight_rule), (0.5, Some(0)));
         assert_eq!(c.claude.selection.fable_windows.len(), 2);
         assert_eq!(c.codex.approval, Approval::OnFailure);
         assert_eq!(
@@ -2286,13 +2483,14 @@ box_ro = [\"{entry}\"]
             ProfileSelection {
                 five_hour_floor_pct: Some(20.0),
                 five_hour_knee_pct: Some(60.0),
+                ..ProfileSelection::default()
             }
         );
-        assert_eq!(sel.effective("personal"), (20.0, 60.0));
+        assert_eq!(c.tuning.ramp("personal"), (20.0, 60.0));
         // Only the floor is overridden; the knee is the global one.
-        assert_eq!(sel.effective("team01"), (5.0, 20.0));
+        assert_eq!(c.tuning.ramp("team01"), (5.0, 20.0));
         // No override at all: both globals.
-        assert_eq!(sel.effective("team02"), (1.0, 20.0));
+        assert_eq!(c.tuning.ramp("team02"), (1.0, 20.0));
 
         let err = site_cfg("[claude.selection.profile.personal]\nknee = 60.0\n")
             .unwrap_err()
@@ -2333,7 +2531,9 @@ box_ro = [\"{entry}\"]
                 "five_hour_floor_pct <= five_hour_knee_pct",
             ),
         ] {
-            let text = format!("[claude.selection.profile.personal]\n{lines}\n");
+            let text = format!(
+                "[claude]\nprofiles = [\"personal\"]\n\n[claude.selection.profile.personal]\n{lines}\n"
+            );
             let err = site_cfg(&text).unwrap_err().root_cause().to_string();
             assert!(err.contains(key), "{lines} gave {err}");
             assert!(
@@ -2343,10 +2543,13 @@ box_ro = [\"{entry}\"]
         }
 
         // The message shows the resolved pair, so the bad value is visible.
-        let err = site_cfg("[claude.selection.profile.personal]\nfive_hour_knee_pct = 160.0\n")
-            .unwrap_err()
-            .root_cause()
-            .to_string();
+        let err = site_cfg(
+            "[claude]\nprofiles = [\"personal\"]\n\n\
+             [claude.selection.profile.personal]\nfive_hour_knee_pct = 160.0\n",
+        )
+        .unwrap_err()
+        .root_cause()
+        .to_string();
         assert_eq!(
             err,
             "[claude.selection.profile.personal] (unset keys fall back to [claude.selection]) \
@@ -2359,6 +2562,88 @@ box_ro = [\"{entry}\"]
              [claude.selection.profile.personal]\nfive_hour_floor_pct = 20.0\nfive_hour_knee_pct = 60.0\n",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn priority_knobs_parse_both_time_forms_and_refuse_bad_values_by_table() {
+        let head = "[claude]\nprofiles = [\"p\"]\n\n[claude.selection.profile.p]\n";
+        let at = |v: &str| site_cfg(&format!("{head}weekly_reset_at = {v}\n"));
+        let want = Some(WeeklyReset::At("2026-11-14T08:00:00Z".parse().unwrap()));
+        for v in [
+            "2026-11-14T08:00:00Z",
+            "\"2026-11-14T08:00:00Z\"",
+            "2026-11-14T09:00:00+01:00",
+        ] {
+            assert_eq!(
+                at(v).unwrap().tuning.priority("p", "m").weekly_reset,
+                want,
+                "{v}"
+            );
+        }
+        for v in ["2026-11-14T08:00:00", "2026-11-14", "\"soon\""] {
+            let err = at(v).unwrap_err().root_cause().to_string();
+            assert!(
+                err.starts_with(
+                    "[claude.selection.profile.p] weekly_reset_at must be a date and time with an offset, such as 2026-11-14T08:00:00Z (got "
+                ),
+                "{v} gave {err}"
+            );
+        }
+
+        let key = "[claude.api_keys.k]\nkey_file = \"/k\"\nbudget_usd = 1.0\nmodels = [\"*\"]\n";
+        let rule = "[[claude.selection.profile.p.by_model]]\n";
+        let key_rule = "[[claude.api_keys.k.by_model]]\n";
+        let cases = [
+            (format!("{head}weight = 0.0\n"), "[claude.selection.profile.p] weight must be from 0.000001 to 1000000 (got 0)"),
+            (format!("{head}weekly_reset_earlier_h = 168.0\n"), "[claude.selection.profile.p] weekly_reset_earlier_h must be a finite number, at least 0 and below 168 (got 168)"),
+            (format!("{head}weekly_reset_earlier_h = 1.0\nweekly_reset_at = 2026-11-14T08:00:00Z\n"), "[claude.selection.profile.p] sets both weekly_reset_at and weekly_reset_earlier_h; set one"),
+            (format!("{head}\n{rule}models = [\"*\"]\nweight = 1.0\n\n{rule}models = []\nweight = 1.0\n"), "[[claude.selection.profile.p.by_model]] entry 2 models must name at least one model glob"),
+            (format!("{head}\n{rule}models = [\"*\"]\n"), "[[claude.selection.profile.p.by_model]] entry 1 sets neither weight nor a weekly reset; a rule that sets nothing still stops later rules from matching"),
+            (format!("{head}\n{rule}models = [\"*\"]\nweight = -1.0\n"), "[[claude.selection.profile.p.by_model]] entry 1 weight must be from 0.000001 to 1000000 (got -1)"),
+            (format!("{key}weight = inf\n"), "[claude.api_keys.k] weight must be from 0.000001 to 1000000 (got inf)"),
+            (format!("{key}\n{key_rule}models = []\nweight = 1.0\n"), "[[claude.api_keys.k.by_model]] entry 1 models must name at least one model glob"),
+            (format!("{key}\n{key_rule}models = [\"*\"]\nweight = nan\n"), "[[claude.api_keys.k.by_model]] entry 1 weight must be from 0.000001 to 1000000 (got NaN)"),
+        ];
+        for (text, want) in cases {
+            let err = site_cfg(&text).unwrap_err().root_cause().to_string();
+            assert_eq!(err, want, "{text}");
+        }
+        // The smallest positive f64 would underflow any score to zero.
+        let err = site_cfg(&format!("{head}weight = 5e-324\n"))
+            .unwrap_err()
+            .root_cause()
+            .to_string();
+        assert_eq!(
+            err,
+            format!(
+                "[claude.selection.profile.p] weight must be from 0.000001 to 1000000 (got {})",
+                5e-324_f64
+            )
+        );
+
+        for (text, want) in [
+            (
+                format!("{head}\n{rule}models = [\"*\"]\nwieght = 1.0\n"),
+                "unknown field",
+            ),
+            (
+                format!("{key}weekly_reset_earlier_h = 1.0\n"),
+                "unknown field",
+            ),
+            (
+                format!(
+                    "{key}\n{key_rule}models = [\"*\"]\nweekly_reset_at = 2026-11-14T08:00:00Z\n"
+                ),
+                "unknown field",
+            ),
+            (
+                format!("{key}\n{key_rule}models = [\"*\"]\n"),
+                "missing field",
+            ),
+        ] {
+            let err = format!("{:#}", site_cfg(&text).unwrap_err());
+            assert!(err.contains(want), "{text} gave {err}");
+        }
     }
 
     #[test]

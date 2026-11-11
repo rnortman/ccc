@@ -317,14 +317,23 @@ reserve_general_for_fable = true
 mqtt_quiesce_ms = 1500
 mqtt_timeout_ms = 8000      # bounds the whole read: connect, fetch, disconnect
 
-[claude.selection.profile.work]   # per-profile override; either key, empty by default
+[claude.selection.profile.work]   # per-profile override; every key optional, empty by default
 five_hour_knee_pct = 60.0   # ramp from util5 40
 five_hour_floor_pct = 20.0  # excluded from util5 80
+weight = 1.5                # 1e-6 to 1e6; default 1; multiplies the score
+weekly_reset_earlier_h = 36.0   # 0 <= h < 168; or an absolute time:
+# weekly_reset_at = 2026-11-14T08:00:00Z   # a date-time with an offset, quoted or not
+
+[[claude.selection.profile.work.by_model]]   # first match wins
+models = ["*fable*"]        # required, non-empty; globs over the resolved model
+weight = 3.0                # weight and/or weekly_reset_*; at least one
+weekly_reset_at = "2026-11-14T08:00:00Z"
 
 [claude.api_keys.team]      # a Platform API key with a monthly budget; see "API key accounts"
 key_file = "~/.config/ccc/keys/team.key"
 budget_usd = 420.0
 models = ["*fable*"]
+weight = 2.0                # 1e-6 to 1e6; default 1; orders keys among themselves
 
 [mqtt]                      # absent: the usage client's own config discovery
 config = "~/.config/claude-usage-mqtt/config.toml"
@@ -461,10 +470,11 @@ local credential:
 
 ```
 gate5   = clamp(((100 - util5) - floor) / (knee - floor), 0, 1)
-rate_x  = (100 - util_x) / hours_until_reset_x
+hours_x = max(effective_reset_x - now, min_time_left_h)
+rate_x  = (100 - util_x) / hours_x
 
-fable model:  score = gate5 × min(rate_f, rate_g / ratio)
-otherwise:    score = gate5 × max(0, (100 - util_g) - ratio × (100 - util_f)) / hours_g
+fable model:  score = weight × gate5 × min(rate_f, rate_g / ratio)
+otherwise:    score = weight × gate5 × max(0, (100 - util_g) - ratio × (100 - util_f)) / hours_g
 
 tier    = 1 if gate5 == 1 and score > 0, else 2
 winner  = lowest tier, then highest score, then earliest in profiles
@@ -473,7 +483,9 @@ winner  = lowest tier, then highest score, then earliest in profiles
 `floor` and `knee` are percent of the 5-hour window *remaining*, so
 `util5 = 100 - remaining`; each profile uses its own
 `[claude.selection.profile.<name>]` values where set and the global ones
-otherwise.
+otherwise. `weight` and `effective_reset_x` come from the priority knobs
+below; with none set, the weight is 1 and the effective reset is the bucket's
+own.
 
 Fable work spends both weekly buckets, so it is scored by whichever runs out
 first; other work is scored against the general remainder net of what the Fable
@@ -493,6 +505,44 @@ sessions already started on it, so such an account wants a higher knee and
 floor than the global ones; the per-profile table above is where they go. A
 table naming a profile that is not in `profiles` is refused.
 
+### Priority knobs
+
+Two knobs steer selection toward an account, each set on the profile's
+`[claude.selection.profile.<name>]` table and, per model, in its
+`[[claude.selection.profile.<name>.by_model]]` rules (see "Configuration").
+Each knob resolves on its own: the first `by_model` rule whose `models` glob
+matches the resolved model (case-insensitive, the same string `fable_models`
+sees), if that rule sets the knob; else the profile table; else the default.
+Only the first matching rule is consulted — a knob it leaves unset falls back
+to the profile table, not to a later rule. A rule must set at least one knob,
+since a rule that set nothing would still stop every later rule from matching.
+
+- **`weight`** (default 1, from 0.000001 to 1000000) multiplies the score.
+- **The weekly-reset override** pretends the weekly buckets reset earlier,
+  so the `1 / hours_x` term pulls the account forward, harder as the pretend
+  reset nears. `weekly_reset_earlier_h = H` (0 to below 168) moves each
+  bucket's reset H hours earlier, every week. `weekly_reset_at = <time>` moves
+  it to that time, but only within the week the time falls in: it applies to
+  a bucket whose reset is at or after the time and less than 168 hours past
+  it, and is otherwise reported as not applied — once the real reset passes
+  and the bucket refills, an absolute time stops counting, and a time later
+  than the reset may be next week's intent. A table or rule sets one form or
+  the other. The general and the Fable bucket are each moved against their
+  own reset (or the fallback used for a window published without one).
+
+Once a moved reset has passed, `hours_x` sits at `min_time_left_h` until the
+snapshot reports the next real reset, so the account keeps its pull for as
+long as it has quota left; `min_time_left_h` therefore sets how strong that
+pull is. Neither knob can turn a zero score positive or a positive one zero,
+so they reorder candidates within a tier and never move one across tiers,
+and they do not change when an API key may spend. The fallback to `profiles`
+order has no scores and ignores them. `ccc which` notes each knob that did
+something on the candidate's row (`weight 1.5`, `general reset moved 36 h
+earlier, to <time>`, `weekly_reset_at <time> not applied to the Fable bucket:
+…`, each with ` (by_model rule <n>)` when a rule set it), and its `--json`
+adds each candidate's `weight` and effective resets `resets_g`/`resets_f`.
+`--profile` bypasses selection, and with it the knobs.
+
 A missing 5-hour window is an unspent one: every account has that window. A
 missing weekly window is a bucket the account does not have — an entitled
 account with an unspent bucket publishes it at 0% — so a model that spends
@@ -507,9 +557,11 @@ exclusion, or why a candidate is in tier 2 — and `--json` adds each profile's
 resolved floor and knee.
 
 The selection knobs are validated when the config is read: a floor above the
-knee, a percentage outside 0–100, a negative ratio, or a zero
-`min_time_left_h`/`mqtt_*_ms` is refused by name rather than quietly producing
-scores that cannot be compared.
+knee, a percentage outside 0–100, a negative ratio, a zero
+`min_time_left_h`/`mqtt_*_ms`, a weight outside 0.000001–1000000, an offset outside
+0–168 h, a `weekly_reset_at` without a time and an offset, both reset forms in
+one table, or a `by_model` rule with no `models` or setting nothing is refused
+by name rather than quietly producing scores that cannot be compared.
 
 Before every Claude spawn, `ccc` marks the working directory trusted in the
 account's Claude Code config — `<profiles_dir>/<profile>/.claude.json` under
@@ -586,6 +638,11 @@ models = ["*fable*"]                       # required; globs over the resolved m
 reserve_usd = 20.0                         # default 0; stop this far short of the budget
 reset_tz = "UTC"                           # default "UTC"; IANA zone of the monthly refill
 exhausted_patterns = ["*credit balance is too low*"]   # default as shown; globs over a failed turn's message
+weight = 2.0                               # default 1; 1e-6 to 1e6; keys are tried by weight, highest first
+
+[[claude.api_keys.team.by_model]]          # first match wins; weight only
+models = ["*opus*"]                        # required, non-empty
+weight = 0.5                               # required; 1e-6 to 1e6
 ```
 
 The table name (`team`) names the key everywhere: in the trailer's
@@ -631,7 +688,12 @@ turn and the reason is that quota is gone, never that data is missing:
 - A profile with no local credential counts neither way.
 
 A key is considered when no profile holds it back and at least one lets it
-spend. The first key, in name order, that is not set aside, has its key
+spend. Keys are tried by `weight`, highest first — the first `by_model` rule
+whose `models` match the model sets it, else the key's own `weight`, else 1 —
+and then in name order. A key takes no weekly-reset override, in its table or
+its rules: it has no weekly bucket and no score for an earlier reset to pull
+forward, so `weekly_reset_*` there is refused as an unknown field. The first
+key that is not set aside, has its key
 file, has a `models` glob matching the model, and is in budget takes the
 turn, with a note: `no profile can take <model> (<reasons>); using API key
 <name>: $<spent> of $<budget> spent this month`. A key is **in budget** when
@@ -654,10 +716,13 @@ session spends`), and selection for a launch does not consider keys. With
 `[claude] profiles` empty there is no selection, so a key is used only through
 `--profile`.
 
-`ccc which <type>` prints one line per key under the candidate table — month,
-spent, budget, reserve, exhausted flag, whether `models` matches, and `would
-be used: yes|no (<reason>)` — and `--json` carries the same under
-`api_keys`. It reads the budget each time, which with the bus enabled
+`ccc which <type>` prints one line per key under the candidate table, in name
+order — the key's weight when it is not 1 (`api-key team weight 2: …`, with
+` (by_model rule <n>)` when a rule set it), month, spent, budget, reserve,
+exhausted flag, whether `models` matches, and `would be used: yes|no
+(<reason>)`, where a key passed over because a heavier or earlier one was
+taken reads `key <name> was taken first` — and `--json` carries the same,
+`weight` included, under `api_keys`. It reads the budget each time, which with the bus enabled
 publishes this host's spend level (see "Bus").
 
 **Who can read the key.** A key turn's Claude session holds the key in

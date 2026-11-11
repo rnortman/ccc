@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+- **Choose which Claude accounts get spent first.** When ccc picks a
+  subscription account for a turn, you can now tilt the choice toward
+  particular accounts, for all models or only some. Set the knobs in the
+  account's `[claude.selection.profile.<name>]` table:
+  - `weight` multiplies the account's score (default 1, allowed range
+    0.000001 to 1000000).
+  - A pretend weekly reset makes ccc treat the account's weekly quota as
+    resetting sooner than it really does. Use `weekly_reset_earlier_h` to move
+    it a fixed number of hours earlier every week, or `weekly_reset_at` to
+    give a time in the current week. The pull toward the account gets
+    stronger as the pretend reset gets closer. After that time passes, the
+    account stays strongly preferred until its real reset, as long as it has
+    quota left. `min_time_left_h` sets how strong that preference is.
+  - To set different values per model, add `[[…profile.<name>.by_model]]`
+    rules that match model names with globs. The first matching rule wins.
+
+  The knobs only reorder accounts that are equally usable. An account whose
+  5-hour window is nearly spent does not get ahead of one with room, and the
+  knobs never decide whether an API key is used. `ccc which` shows what each
+  knob changed for each account. See "Priority knobs" in the README.
+- **API keys can be ordered by `weight`.** When several API keys could take a
+  turn, the highest `weight` is tried first, with per-model `by_model` rules
+  as for profiles. Keys are still used only after every subscription account
+  is out of quota. `ccc which` now says `key <name> was taken first` when
+  another key was chosen ahead of one.
+- New settings that make no sense are rejected when the config is loaded, with
+  the setting named. That includes a weight out of range, both reset forms in
+  one table, and a `by_model` rule with no `models` or no knob.
+- `ccc which --json` now includes each candidate's `weight` and its weekly
+  reset times after any pretend reset (`resets_g`, `resets_f`), and each API
+  key's `weight`.
+
 ## 0.4.0 — 2026-11-10
 
 - **New harness: Goose, for self-hosted models.** ccc can now run agents
