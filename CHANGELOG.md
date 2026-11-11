@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.5.0 — 2026-11-11
+
 - **Choose which Claude accounts get spent first.** When ccc picks a
   subscription account for a turn, you can now tilt the choice toward
   particular accounts, for all models or only some. Set the knobs in the
