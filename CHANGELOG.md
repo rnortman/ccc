@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.6.0 — 2026-11-12
+
 - **Usage limits are recognised from Claude Code's structured error.** A
   one-shot Claude turn now runs with `--output-format stream-json
   --verbose`, and a failed result carrying `api_error_status: 429` is a usage
