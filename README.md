@@ -55,6 +55,10 @@ Requirements:
   enabled. Their tools run inside a bwrap sandbox (see [Goose
   box](#goose-box)). Every such run first starts the sandbox once with
   `/bin/true`, and fails with exit 2 naming bwrap when that does not work.
+  The box needs a host that lets bwrap create namespaces and mount a fresh
+  `/proc`; an unprivileged container commonly does not, so there the
+  preflight refuses Goose agents that need a box, and the test suite skips
+  its real-box tests.
 - Optional: [claude-usage-mqtt](https://github.com/rnortman/claude-usage-mqtt)
   and an MQTT broker, only to choose between several Claude accounts by live
   usage (`[claude] profiles`, see [Account selection](#account-selection)). A

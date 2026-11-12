@@ -67,6 +67,94 @@ pub fn ccc_binary() -> PathBuf {
     binary
 }
 
+/// Whether this host can start a bubblewrap box. `Err` carries why not.
+///
+/// Runs `/bin/true` under the `bwrap` found on `/usr/bin:/bin` with every
+/// flag by which the Goose box asks the kernel for a privilege a host can
+/// refuse. The argv is written out here rather than taken from
+/// `boxed::build`, so a defect in `build` fails the box tests instead of
+/// skipping them. Computed once per test process.
+// TODO(goose-removal): this probe and the tests gated on it exist only while Goose ships; see TODO.md.
+#[cfg(target_os = "linux")]
+pub fn box_host() -> Result<(), String> {
+    static RESULT: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    RESULT.get_or_init(probe_box_host).clone()
+}
+
+#[cfg(target_os = "linux")]
+fn probe_box_host() -> Result<(), String> {
+    let bwrap = ["/usr/bin", "/bin"]
+        .iter()
+        .map(|dir| Path::new(dir).join("bwrap"))
+        .find(|path| path.is_file())
+        .ok_or_else(|| "no bwrap on /usr/bin:/bin".to_string())?;
+    probe_box_host_with(&bwrap)
+}
+
+/// Runs the probe argv under `bwrap` and reports whether it exited 0.
+#[cfg(target_os = "linux")]
+fn probe_box_host_with(bwrap: &Path) -> Result<(), String> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let mut command = Command::new(bwrap);
+    command
+        .args([
+            "--unshare-all",
+            "--unshare-user",
+            "--disable-userns",
+            "--die-with-parent",
+            "--ro-bind",
+            "/",
+            "/",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--",
+            "/bin/true",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = BoundedChild::spawn(&mut command)
+        .map_err(|error| format!("could not spawn {}: {error}", bwrap.display()))?;
+    let mut pipe = child.child.as_mut().and_then(|inner| inner.stderr.take());
+    let status = child.finish_by(Instant::now() + Duration::from_secs(5));
+    // On a timeout the drop kills and reaps the group, so the pipe reaches EOF.
+    drop(child);
+    let mut stderr = String::new();
+    if let Some(pipe) = pipe.as_mut() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    let stderr = stderr.trim();
+    match status {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("{} exited {status}: {stderr}", bwrap.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => Err(format!(
+            "{} did not exit within 5 s: {stderr}",
+            bwrap.display()
+        )),
+        Err(error) => Err(format!(
+            "could not wait for {}: {error}: {stderr}",
+            bwrap.display()
+        )),
+    }
+}
+
+/// Prints why and returns `true` when this host cannot start a bubblewrap
+/// box; a test that needs a real box returns early on `true`.
+#[cfg(target_os = "linux")]
+pub fn skip_without_box_host() -> bool {
+    match box_host() {
+        Ok(()) => false,
+        Err(why) => {
+            eprintln!("skipped: this host cannot start a bubblewrap box: {why}");
+            true
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub struct BoundedChild {
     child: Option<Child>,
@@ -242,6 +330,40 @@ mod tests {
     fn fixture_scan_helper_accepts_bounded_sleep_forms() {
         for line in ["sleep 10", "sleep 0.5", r#"sleep \"$r\""#] {
             assert_allowed(line);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_box_probe_answers_by_the_exit_status_of_bwrap() {
+        let dir = TempDir::new("box-probe");
+        let accepts = dir.write_file("accepts", "#!/bin/sh\nexit 0\n", 0o755);
+        let refuses = dir.write_file(
+            "refuses",
+            "#!/bin/sh\necho 'stand-in refusal' >&2\nexit 3\n",
+            0o755,
+        );
+
+        assert_eq!(probe_box_host_with(&accepts), Ok(()));
+
+        let why = probe_box_host_with(&refuses).expect_err("a non-zero exit is a refusal");
+        assert!(
+            why.contains(&refuses.display().to_string()),
+            "reason does not name the stand-in: {why}"
+        );
+        assert!(
+            why.contains("stand-in refusal"),
+            "reason does not carry stderr: {why}"
+        );
+
+        let not_executable = dir.write_file("not-executable", "#!/bin/sh\nexit 0\n", 0o644);
+        for unspawnable in [dir.path().join("absent"), not_executable] {
+            let why =
+                probe_box_host_with(&unspawnable).expect_err("an unspawnable bwrap is a refusal");
+            assert!(
+                why.starts_with(&format!("could not spawn {}", unspawnable.display())),
+                "reason does not name the unspawnable path: {why}"
+            );
         }
     }
 

@@ -3147,18 +3147,28 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn boot_seconds_tracks_boottime() {
+        // `/proc/uptime` may have its own origin (lxcfs reports the
+        // container's uptime), so this checks the rate, not the origin.
+        fn offset() -> f64 {
+            let mut timestamp = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            let result = unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut timestamp) };
+            assert_eq!(result, 0);
+            let kernel = timestamp.tv_sec as f64 + timestamp.tv_nsec as f64 / 1e9;
+            kernel - boot_seconds_unfloored()
+        }
+        let offset_before = offset();
         let first = boot_seconds();
         std::thread::sleep(Duration::from_millis(1100));
         let second = boot_seconds();
+        let offset_after = offset();
         assert!((first + 1..=first + 2).contains(&second));
-        let mut timestamp = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        let result = unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut timestamp) };
-        assert_eq!(result, 0);
-        let kernel_seconds = timestamp.tv_sec as u64;
-        assert!(boot_seconds().abs_diff(kernel_seconds) <= 1);
+        assert!(
+            (offset_after - offset_before).abs() < 0.5,
+            "/proc/uptime drifted from CLOCK_BOOTTIME: {offset_before} then {offset_after}"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -5374,7 +5384,7 @@ mod tests {
             .unwrap();
             let env_file = f.path("calls/env");
             f.claude_custom_script(&format!(
-                "env > '{}'; printf '%s' '{OK_RESULT}'; printf '%s' 'diagnostic' >&2",
+                "cat >/dev/null; env > '{}'; printf '%s' '{OK_RESULT}'; printf '%s' 'diagnostic' >&2",
                 env_file.display()
             ));
             let output = f
@@ -12934,8 +12944,16 @@ mod tests {
             self.write_executable(&path, &script);
             self.env
                 .insert("CCC_GOOSE_BIN".to_string(), path.display().to_string());
-            self.env
-                .insert("PATH".to_string(), "/usr/bin:/bin".to_string());
+            // A stand-in `bwrap` the launch preflight finds on `PATH`, so these
+            // tests do not depend on the host being able to start a box. Its
+            // own directory, apart from `bin/`, which may not overlap a write
+            // root.
+            std::fs::create_dir_all(self.path("fake-bwrap")).unwrap();
+            self.write_executable(&self.path("fake-bwrap/bwrap"), "#!/bin/sh\nexit 0\n");
+            self.env.insert(
+                "PATH".to_string(),
+                format!("{}:/usr/bin:/bin", self.path("fake-bwrap").display()),
+            );
         }
 
         fn canonical(&self, rel: &str) -> PathBuf {
@@ -13000,6 +13018,20 @@ mod tests {
     fn flag_value<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
         let i = argv.iter().position(|a| a == flag)?;
         argv.get(i + 1).map(String::as_str)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_goose_run_passes_the_real_box_preflight() {
+        if crate::testutil::skip_without_box_host() {
+            return;
+        }
+        let mut f = Fixture::new("goose-real-box");
+        f.goose();
+        f.env
+            .insert("PATH".to_string(), "/usr/bin:/bin".to_string());
+        let (code, out) = f.run_goose("gexplorer", &f.work(), &GooseFlags::default());
+        assert_eq!(code.unwrap(), 0, "{out}");
     }
 
     #[cfg(unix)]

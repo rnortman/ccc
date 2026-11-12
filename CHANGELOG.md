@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **`make check` now passes inside an unprivileged container.** Tests that
+  need a real bubblewrap sandbox (the "Goose box") now skip themselves, still
+  reporting a pass, when the host cannot start one: for example a container
+  that does not let bwrap create namespaces or mount `/proc`, or a host
+  without `bwrap`. Everywhere else they run as before. The other Goose tests
+  now use a stand-in `bwrap`, so they no longer need a host that can start
+  a box. ccc's own behaviour is unchanged. The README now says that a
+  Goose agent that needs a box is refused at startup on such hosts.
+- Fixed two tests that failed inside containers or under load: the boot-clock
+  test now checks that the clock advances at the right rate instead of
+  comparing its starting point to the kernel's (container tools such as lxcfs
+  report a container's own uptime), and a test with a stand-in `claude` that
+  could exit before ccc finished sending it the prompt now reads the whole
+  prompt first.
+
 ## 0.5.0 — 2026-11-11
 
 - **Choose which Claude accounts get spent first.** When ccc picks a

@@ -1072,13 +1072,25 @@ mod tests {
     }
 
     #[test]
-    fn preflight_passes_and_fails_naming_bwrap() {
+    fn preflight_passes_on_a_box_host() {
+        if crate::testutil::skip_without_box_host() {
+            return;
+        }
+        let t = TempDir::new("box-preflight-pass");
+        let r = mkdir(t.path(), "r");
+        let p = policy(&[&r], &[]);
+        let exe = std::env::current_exe().unwrap();
+        preflight(&p, &settings(vec![]), &exe, Duration::from_secs(5))
+            .expect("bwrap must work on this host");
+    }
+
+    #[test]
+    fn preflight_fails_naming_bwrap() {
         let t = TempDir::new("box-preflight");
         let r = mkdir(t.path(), "r");
         let p = policy(&[&r], &[]);
         let exe = std::env::current_exe().unwrap();
         let grace = Duration::from_secs(5);
-        preflight(&p, &settings(vec![]), &exe, grace).expect("bwrap must work on this host");
 
         let mut missing = settings(vec![]);
         missing.bwrap = t.path().join("no-bwrap");
@@ -1104,8 +1116,19 @@ mod tests {
         );
         assert!(err.contains("did not finish"), "{err}");
 
+        // A bwrap that would succeed, so only the root walk can refuse.
+        let ok = t.write_file("ok-bwrap", "#!/bin/sh\nexit 0\n", 0o755);
+        let mut ok_settings = settings(vec![]);
+        ok_settings.bwrap = ok;
         std::fs::remove_dir(&r).unwrap();
-        assert!(preflight(&p, &settings(vec![]), &exe, grace).is_err());
+        let err = format!(
+            "{:#}",
+            preflight(&p, &ok_settings, &exe, grace).unwrap_err()
+        );
+        assert!(
+            err.contains("the Goose box cannot mount") && err.contains(&r.display().to_string()),
+            "{err}"
+        );
     }
 
     /// A running `ccc goose-tools --role box`. It reads its stdin, whose only
@@ -1237,6 +1260,9 @@ mod tests {
 
     #[test]
     fn the_box_confines_files_network_processes_and_environment() {
+        if crate::testutil::skip_without_box_host() {
+            return;
+        }
         let b = BoxEnv::new("box-behaviour");
         std::fs::write(b.t.path().join("outside"), "outside").unwrap();
         symlink(b.t.path().join("outside"), b.write.join("escape")).unwrap();
@@ -1368,6 +1394,9 @@ mod tests {
 
     #[test]
     fn a_box_started_as_goose_starts_it_reads_the_host_config_and_box_ro() {
+        if crate::testutil::skip_without_box_host() {
+            return;
+        }
         let b = BoxEnv::new("box-host-env");
         let real_home = mkdir(b.t.path(), "realhome");
         let tools = mkdir(&real_home, "tools");
@@ -1419,6 +1448,9 @@ mod tests {
 
     #[test]
     fn a_background_job_ends_with_the_box() {
+        if crate::testutil::skip_without_box_host() {
+            return;
+        }
         let b = BoxEnv::new("box-bg");
         // A fractional duration unique to this test process names the job,
         // which lives over 6 s unless the box takes it down: at most 2 s to
@@ -1441,6 +1473,9 @@ mod tests {
 
     #[test]
     fn a_write_root_swapped_for_a_symlink_is_never_mounted() {
+        if crate::testutil::skip_without_box_host() {
+            return;
+        }
         let b = BoxEnv::new("box-swap");
         let mut s = b.start();
         let (_, err) = s.call(
