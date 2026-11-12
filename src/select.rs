@@ -106,8 +106,7 @@ impl Scored {
     }
 }
 
-/// Why a scored profile is unusable, as a type: the key rule
-/// (`lets_key_spend`) reads this and never the text of `reason`.
+/// Why a scored profile is unusable, as a type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Out {
@@ -198,10 +197,8 @@ pub enum KeyDecision {
     Ineligible,
     /// A profile with a positive score won; keys were not looked at.
     ProfileWon,
-    /// No profile is out of quota.
-    NoProfileOut,
-    /// A profile may still have quota: `<profile>: <reason>`, joined.
-    HeldBack(String),
+    /// Usage data is unavailable, so preference order picks a profile.
+    UsageUnknown,
     /// The keys were looked at: the one taken, or why each was passed over.
     Looked {
         took: Option<String>,
@@ -223,44 +220,10 @@ pub struct Choice {
     pub key_notes: Vec<String>,
 }
 
-/// One profile's answer to "does this profile let a key spend?".
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Lets {
-    Yes,
-    No,
-}
-
-// TODO(api-key-priority-over-quota): keys never outrank a profile with quota; see TODO.md.
-/// A scored profile's answer to "does this profile let a key spend?", one
-/// arm per row of the rule.
-fn lets_key_spend(s: &Scored) -> Lets {
-    match s.out {
-        // Usable. It scores zero only when a bucket the model draws on is
-        // spent; otherwise it wins.
-        None if s.score > 0.0 => Lets::No,
-        None => Lets::Yes,
-        // The floor is a margin the operator set, and the window refills
-        // within five hours.
-        Some(Out::FiveHourFloor) => Lets::No,
-        // The snapshot cannot tell an account without Fable from a Fable
-        // bucket that went unread.
-        Some(Out::NoFableWindow) => Lets::No,
-        // Absent or doubtful data never spends money.
-        Some(
-            Out::Auth
-            | Out::CarriedForward
-            | Out::Stale
-            | Out::NoSnapshot
-            | Out::NoData
-            | Out::NoGeneralWindow,
-        ) => Lets::No,
-    }
-}
-
 /// Pick the account for a Claude run: drop profiles with no local credential,
-/// score the rest against the retained usage, overflow to an API key when
-/// every profile is out of quota, and otherwise fall back to preference
-/// order whenever the data cannot support a decision.
+/// score the rest against the retained usage, and take the best profile with
+/// a positive score. When none has one, an API key takes the run; when usage
+/// data is unavailable, preference order does.
 ///
 /// Profiles and keys named in `exclude` are not considered at all.
 ///
@@ -339,57 +302,47 @@ pub fn choose(
             .map(|_| profile)
     });
     let mut key_notes = Vec::new();
+    // TODO(api-key-priority-over-quota): keys never outrank a profile with quota; see TODO.md.
     let decision = if !keys.eligible || claude.api_keys.is_empty() {
         KeyDecision::Ineligible
     } else if wins_outright.is_some() {
         KeyDecision::ProfileWon
+    } else if degraded.is_some() && !candidates.is_empty() {
+        KeyDecision::UsageUnknown
     } else {
-        let held: Vec<String> = scored
-            .iter()
-            .filter(|s| lets_key_spend(s) == Lets::No)
-            .map(|s| format!("{}: {}", s.profile, profile_state(s)))
-            .collect();
-        let out_of_quota: Vec<String> = excluded
+        // No profile can take the work: the key does.
+        let cannot: Vec<String> = excluded
             .iter()
             .map(|p| format!("{p}: set aside"))
             .chain(
                 scored
                     .iter()
-                    .filter(|s| lets_key_spend(s) == Lets::Yes)
                     .map(|s| format!("{}: {}", s.profile, profile_state(s))),
             )
             .collect();
-        if !held.is_empty() {
-            let held = held.join("; ");
-            key_notes.push(format!("API key not considered: {held}"));
-            KeyDecision::HeldBack(held)
-        } else if out_of_quota.is_empty() {
-            KeyDecision::NoProfileOut
+        let (took, passed) = pick_key(claude, tuning, env, model, exclude, keys.budget);
+        if let Some((name, view)) = &took {
+            key_notes.push(format!(
+                "no profile can take {model} ({}); using API key {name}: ${:.2} of ${:.2} spent this month{}",
+                cannot.join("; "),
+                view.spent_usd,
+                view.budget_usd,
+                if view.remote {
+                    String::new()
+                } else {
+                    format!(" ({})", crate::budget::THIS_HOST_ONLY)
+                },
+            ));
         } else {
-            let (took, passed) = pick_key(claude, tuning, env, model, exclude, keys.budget);
-            if let Some((name, view)) = &took {
-                key_notes.push(format!(
-                    "no profile can take {model} ({}); using API key {name}: ${:.2} of ${:.2} spent this month{}",
-                    out_of_quota.join("; "),
-                    view.spent_usd,
-                    view.budget_usd,
-                    if view.remote {
-                        String::new()
-                    } else {
-                        format!(" ({})", crate::budget::THIS_HOST_ONLY)
-                    },
-                ));
-            } else {
-                key_notes.extend(
-                    passed
-                        .iter()
-                        .map(|(name, why)| format!("API key {name} passed over: {why}")),
-                );
-            }
-            KeyDecision::Looked {
-                took: took.map(|(name, _)| name),
-                passed,
-            }
+            key_notes.extend(
+                passed
+                    .iter()
+                    .map(|(name, why)| format!("API key {name} passed over: {why}")),
+            );
+        }
+        KeyDecision::Looked {
+            took: took.map(|(name, _)| name),
+            passed,
         }
     };
 
@@ -584,8 +537,7 @@ pub fn key_rows(
             let why_not = (!used).then(|| match &choice.keys {
                 KeyDecision::Ineligible => "keys are not eligible for this turn".to_string(),
                 KeyDecision::ProfileWon => "a profile can take the work".to_string(),
-                KeyDecision::NoProfileOut => "no profile is out of quota".to_string(),
-                KeyDecision::HeldBack(held) => format!("not considered: {held}"),
+                KeyDecision::UsageUnknown => "usage data is unavailable".to_string(),
                 KeyDecision::Looked { took, passed } => passed
                     .iter()
                     .find(|(n, _)| n == name)
@@ -2592,8 +2544,8 @@ mod tests {
     }
 
     #[test]
-    fn doubtful_data_or_the_five_hour_floor_holds_the_key_back() {
-        let dir = crate::testutil::TempDir::new("select-key-held");
+    fn any_profile_that_cannot_take_the_work_lets_the_key_take_it() {
+        let dir = crate::testutil::TempDir::new("select-key-cannot");
         let cfg = keyed(&dir, &["a", "b"]);
         let b = fresh("b");
         let cases: Vec<(Option<ProfileUsage>, &str, Out)> = vec![
@@ -2644,34 +2596,20 @@ mod tests {
         for (b, model, out) in cases {
             let mut profiles = vec![spent("a")];
             profiles.extend(b.clone());
-            let (choice, calls) = pick(&cfg, model, reported(profiles.clone()), &[]);
+            let (choice, calls) = pick(&cfg, model, reported(profiles), &[]);
             let choice = choice.unwrap();
-            assert_eq!(calls, 0, "{out:?}");
-            // The zero-scored profile wins from tier 2.
-            assert_eq!(choice.account.profile, "a", "{out:?}");
+            took_key(&choice, "team");
+            assert_eq!(calls, 1, "{out:?}");
             let scored_b = choice.scored.iter().find(|s| s.profile == "b").unwrap();
             assert_eq!(scored_b.out, Some(out));
-            assert_eq!(
-                choice.key_notes,
-                vec![format!(
-                    "API key not considered: b: {}",
-                    scored_b.reason.as_deref().unwrap()
-                )]
+            assert!(
+                choice.key_notes[0]
+                    .contains(&format!("b: {}", scored_b.reason.as_deref().unwrap())),
+                "{choice:?}"
             );
-            assert!(matches!(choice.keys, KeyDecision::HeldBack(_)), "{out:?}");
-
-            // With `a` excluded instead, the same profile still holds it back.
-            if matches!(out, Out::NoGeneralWindow | Out::NoFableWindow) {
-                let (choice, calls) = pick(&cfg, model, reported(profiles), &["a"]);
-                let choice = choice.unwrap();
-                assert_eq!(calls, 0);
-                assert_eq!(choice.account.profile, "b");
-                assert!(choice.degraded.is_some());
-            }
         }
 
-        // Stale throughout, or floored throughout: nobody is out of quota by
-        // its own numbers, so no key.
+        // Every profile unusable, none of them zero-scored: still the key.
         for each in [
             |n: &str| ProfileUsage {
                 stale_reason: Some("x".into()),
@@ -2680,13 +2618,15 @@ mod tests {
             |n: &str| profile(n, 99.5, 10.0, Some(10.0)),
         ] {
             let (choice, calls) = pick(&cfg, OPUS, reported(vec![each("a"), each("b")]), &[]);
-            let choice = choice.unwrap();
-            assert_eq!(calls, 0);
-            assert_eq!(choice.account.profile, "a");
-            assert!(choice.degraded.is_some());
+            took_key(&choice.unwrap(), "team");
+            assert_eq!(calls, 1);
         }
+    }
 
-        // Usage missing with a candidate: no key.
+    #[test]
+    fn usage_data_unavailable_keeps_preference_order_and_no_key() {
+        let dir = crate::testutil::TempDir::new("select-key-nodata");
+        let cfg = keyed(&dir, &["a", "b"]);
         let offline = UsageSource::Report(UsageReport {
             daemon_status: Some("offline".into()),
             ..report(vec![spent("a"), spent("b")])
@@ -2697,6 +2637,8 @@ mod tests {
             assert_eq!(calls, 0);
             assert!(choice.scored.iter().all(|s| s.out == Some(Out::NoData)));
             assert_eq!(choice.account.profile, "a");
+            assert_eq!(choice.keys, KeyDecision::UsageUnknown);
+            assert!(choice.degraded.is_some());
         }
     }
 
@@ -2724,17 +2666,13 @@ mod tests {
     }
 
     #[test]
-    fn a_setup_with_no_credential_keeps_todays_refusal() {
+    fn a_setup_with_no_credential_goes_to_the_key() {
         let dir = crate::testutil::TempDir::new("select-key-nocred");
         let mut cfg = claude_config(dir.path(), &["a", "b"]);
         add_key(&dir, &mut cfg, "team", &["*"]);
         let (choice, calls) = pick(&cfg, OPUS, reported(vec![spent("a"), spent("b")]), &[]);
-        let err = choice.unwrap_err().to_string();
-        assert!(
-            err.starts_with("no configured Claude profile has a local credential"),
-            "{err}"
-        );
-        assert_eq!(calls, 0);
+        took_key(&choice.unwrap(), "team");
+        assert_eq!(calls, 1);
 
         // One credential-less beside one zero-scored: the key.
         dir.write_file("a.token", "t\n", 0o600);

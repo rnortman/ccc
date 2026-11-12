@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.5.1 — 2026-11-11
+
+- **An API key now takes a turn whenever no subscription profile can.**
+  Before, a profile at its 5-hour floor or with doubtful usage data (stale,
+  carried forward, no snapshot, a missing weekly window, bad login) held the
+  key back, and ccc sent the turn to a profile with no quota left for the
+  model, where it would hit a usage limit. Now any profile that cannot take
+  the turn lets the key take it, including a setup where no profile has a
+  credential. The one exception: when usage data is unavailable entirely
+  (broker unreachable, daemon offline), ccc still picks a profile in
+  configured order and leaves the key alone.
 - **`make check` now passes inside an unprivileged container.** Tests that
   need a real bubblewrap sandbox (the "Goose box") now skip themselves, still
   reporting a pass, when the host cannot start one: for example a container

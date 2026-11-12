@@ -7510,7 +7510,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_subscription_limit_does_not_spend_a_key_on_doubtful_data() {
+    fn a_subscription_limit_hands_off_to_a_key_past_a_profile_with_doubtful_data() {
         let stale = |now: Timestamp| ProfileUsage {
             stale_reason: Some("upstream poll failed".into()),
             ..snapshot(now, "team04", 0.0, 10.0)
@@ -7526,7 +7526,7 @@ mod tests {
         };
         for fable in [false, true] {
             let _lock = test_io_lock();
-            let mut f = Fixture::new("run-limited-key-held");
+            let mut f = Fixture::new("run-limited-key-doubtful");
             if fable {
                 // The explorer's model counts as Fable work here.
                 f.cfg.claude.selection.fable_models = vec!["*haiku*".into()];
@@ -7551,9 +7551,19 @@ mod tests {
             };
 
             let (completion, text) = keyed_limited_run(&f, &usage);
-            assert_eq!(completion, crate::harness::EXIT_LIMITED, "{fable}: {text}");
-            assert_eq!(spawned_profiles(&f).len(), 1);
-            assert!(key_ledger(&f, "team").is_none());
+            // team04 cannot take the work (stale, or no Fable window), so the
+            // key does.
+            assert_eq!(completion, 0, "{fable}: {text}");
+            let inv = f.audit.lineage().invocation_id.clone();
+            assert_eq!(
+                spawned_profiles(&f),
+                vec![
+                    (inv.clone(), Some("team03".to_string())),
+                    (inv, Some("team".to_string())),
+                ],
+                "{fable}"
+            );
+            assert_eq!(key_ledger(&f, "team").unwrap().turns, 1);
         }
     }
 

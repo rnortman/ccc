@@ -676,23 +676,15 @@ exit 2 before anything runs.
 **When a key is spent.** `--profile <key>` on `ccc run` or `ccc resume` runs
 the turn on that key, with no selection, no budget check and no exhausted
 check; the turn is still charged and can still raise the exhausted flag.
-Without `--profile`, a key is considered only when no profile can take the
-turn and the reason is that quota is gone, never that data is missing:
+Without `--profile`, a key is considered whenever no profile can take the
+turn, which means no profile is usable with a score above zero. Being set
+aside after a usage limit, having no credential, a spent weekly bucket, the
+5-hour floor, and a stale, carried-forward or missing reading all mean a
+profile cannot take it. The one exception is when the usage data is
+unavailable entirely (broker unreachable, daemon offline): then no key is
+considered and selection falls back to preference order among the profiles.
 
-- A profile *lets a key spend* when it was set aside after a usage limit on
-  this invocation, or when it is usable but scores zero because a weekly
-  bucket the model draws on is spent.
-- A profile *holds the key back* when its login is not `ok`, its reading is
-  carried forward or older than `stale_grace_s`, it has no snapshot, the
-  usage data is unavailable (broker unreachable, daemon offline), it is at or
-  below its 5-hour floor, its snapshot has no general weekly window, or —
-  for a Fable model — no Fable weekly window. The 5-hour floor refills within
-  hours at no cost, and a missing Fable window cannot be told apart from a
-  Fable bucket the daemon failed to read, so neither spends money.
-- A profile with no local credential counts neither way.
-
-A key is considered when no profile holds it back and at least one lets it
-spend. Keys are tried by `weight`, highest first — the first `by_model` rule
+Keys are tried by `weight`, highest first — the first `by_model` rule
 whose `models` match the model sets it, else the key's own `weight`, else 1 —
 and then in name order. A key takes no weekly-reset override, in its table or
 its rules: it has no weekly bucket and no score for an earlier reset to pull
@@ -704,8 +696,8 @@ turn, with a note: `no profile can take <model> (<reasons>); using API key
 it has no exhausted flag for the current month, its ledger can be read, and
 its spent figure is below `budget_usd - reserve_usd`. Turns in flight are not
 counted; `reserve_usd` is the allowance for them and for estimate drift.
-Otherwise selection ends as it would without keys, with a note saying which
-profile held the key back or why each key was passed over.
+Otherwise selection ends as it would without keys, with a note saying why
+each key was passed over.
 
 So `models = ["*fable*"]` gives the key to Fable work only, when every
 account's Fable or general bucket is spent; `models = ["*"]` gives it to
