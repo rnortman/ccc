@@ -13,6 +13,7 @@ mod glob;
 mod goose_policy;
 mod goose_tools;
 mod harness;
+mod limits;
 mod output;
 mod procs;
 mod resolve;
@@ -197,7 +198,8 @@ enum BudgetAction {
         #[arg(long, value_name = "USD", allow_negative_numbers = true)]
         spent: f64,
     },
-    /// Clear NAME's exhausted flag.
+    /// Clear NAME's exhausted flags: an API key's, or every bucket of a
+    /// profile's.
     Clear { name: String },
 }
 
@@ -433,6 +435,7 @@ fn budget(args: BudgetArgs) -> Result<i32> {
         &budget::BudgetCtx {
             cfg: &cfg,
             ledgers: &budget::Ledgers::in_env(&ProcessEnv),
+            limits: &limits::Limits::in_env(&ProcessEnv),
             now: Timestamp::now(),
             open_bus: &open_bus,
         },
@@ -550,14 +553,14 @@ fn log(args: LogArgs) -> Result<i32> {
 fn which(args: WhichArgs) -> Result<i32> {
     let (cfg, sources) = Config::load_with_sources_in(&ProcessEnv)?;
     let usage = || usage::fetch(&cfg.mqtt, &cfg.claude.selection, &ProcessEnv);
-    // A short-lived bus for the one budget read; its notes go to stderr.
-    let budget = || {
+    // A short-lived bus for the one account read; its notes go to stderr.
+    let accounts = || {
         let bus = bus::open(&cfg, &ProcessEnv, bus_client_id());
-        let views = budget::bus_views(&cfg, &ProcessEnv, Timestamp::now(), bus.as_ref());
+        let read = budget::bus_accounts(&cfg, &ProcessEnv, Timestamp::now(), bus.as_ref());
         for note in bus.close() {
             harness::diag(format_args!("note: {note}"));
         }
-        views
+        read
     };
     which_with(
         &WhichCtx {
@@ -566,7 +569,7 @@ fn which(args: WhichArgs) -> Result<i32> {
             env: &ProcessEnv,
             now: Timestamp::now(),
             usage: &usage,
-            budget: &budget,
+            accounts: &accounts,
         },
         &args.agent,
         args.harness,
@@ -583,7 +586,7 @@ struct WhichCtx<'a> {
     env: &'a dyn config::EnvSource,
     now: Timestamp,
     usage: &'a dyn Fn() -> usage::UsageSource,
-    budget: &'a dyn Fn() -> std::collections::BTreeMap<String, budget::BudgetView>,
+    accounts: &'a dyn Fn() -> budget::Accounts,
 }
 
 /// [`which`] against an explicit context and output sinks. `err` receives the
@@ -625,10 +628,11 @@ fn which_with(
     };
 
     // Only a Claude resolution with configured profiles has an account to
-    // choose, so only that one reads usage. The budget views are read once,
-    // whether selection needed them or not, so the key rows can show them.
-    let views = std::cell::OnceCell::new();
-    let budget = || views.get_or_init(|| (ctx.budget)()).clone();
+    // choose, so only that one reads usage. The accounts are read once,
+    // whether selection needed them or not, so the key rows can show the key
+    // views of the same read the profiles were scored from.
+    let read = std::cell::OnceCell::new();
+    let accounts = || read.get_or_init(|| (ctx.accounts)()).clone();
     let choice = match r.harness {
         Harness::Claude if ctx.cfg.claude.ambient() => None,
         Harness::Claude => {
@@ -641,10 +645,8 @@ fn which_with(
                 ctx.now,
                 &source,
                 &[],
-                select::Keys {
-                    eligible: true,
-                    budget: &budget,
-                },
+                select::Keys { eligible: true },
+                &accounts,
             )?)
         }
         Harness::Codex | Harness::Goose => None,
@@ -653,9 +655,13 @@ fn which_with(
         c.report();
     }
     let keys = match &choice {
-        Some(c) if !ctx.cfg.claude.api_keys.is_empty() => {
-            select::key_rows(&ctx.cfg.claude, &ctx.cfg.tuning, &r.model, c, &budget())
-        }
+        Some(c) if !ctx.cfg.claude.api_keys.is_empty() => select::key_rows(
+            &ctx.cfg.claude,
+            &ctx.cfg.tuning,
+            &r.model,
+            c,
+            &accounts().keys,
+        ),
         _ => Vec::new(),
     };
 
@@ -879,8 +885,8 @@ fn scored_json(s: &select::Scored) -> serde_json::Value {
 mod tests {
     use super::*;
 
-    fn no_budget() -> std::collections::BTreeMap<String, budget::BudgetView> {
-        std::collections::BTreeMap::new()
+    fn no_accounts() -> budget::Accounts {
+        budget::Accounts::default()
     }
     use crate::agents::Sandbox;
     use crate::config::Effort;
@@ -1790,7 +1796,7 @@ mod tests {
             env: &env,
             now: Timestamp::now(),
             usage: &usage,
-            budget: &no_budget,
+            accounts: &no_accounts,
         };
         let given = std::env::current_dir().unwrap();
         let cwd = std::fs::canonicalize(&given).unwrap();
@@ -1926,7 +1932,7 @@ mod tests {
             env: &env,
             now,
             usage: &usage,
-            budget: &no_budget,
+            accounts: &no_accounts,
         };
         let mut out: Vec<u8> = Vec::new();
         let mut err: Vec<u8> = Vec::new();
@@ -1948,6 +1954,54 @@ mod tests {
         assert!(text.contains("profile=team03"), "{text}");
         assert!(text.contains("util5"), "{text}");
 
+        // A flag from the account read shows as the profile's reason, and as
+        // its `out` in JSON.
+        let mut flag = claude_usage_mqtt_core::Exhausted::new(
+            "2026-11-11T13:46:07Z".parse().unwrap(),
+            None,
+            None,
+        );
+        flag.until = Some("2026-11-11T18:00:00Z".parse().unwrap());
+        let flagged = || budget::Accounts {
+            keys: Default::default(),
+            flags: [(
+                "team03".to_string(),
+                [(crate::limits::FIVE_HOUR.to_string(), flag.clone())].into(),
+            )]
+            .into(),
+        };
+        let flagged_ctx = WhichCtx {
+            accounts: &flagged,
+            ..ctx
+        };
+        let reason =
+            "five_hour exhausted until 2026-11-11T18:00:00Z (flagged 2026-11-11T13:46:07Z)";
+        let mut out: Vec<u8> = Vec::new();
+        which_with(
+            &flagged_ctx,
+            "explorer",
+            None,
+            false,
+            &mut out,
+            &mut std::io::sink(),
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains(reason), "{text}");
+        let mut out: Vec<u8> = Vec::new();
+        which_with(
+            &flagged_ctx,
+            "explorer",
+            None,
+            true,
+            &mut out,
+            &mut std::io::sink(),
+        )
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(json["candidates"][0]["out"], "five-hour-exhausted");
+        assert_eq!(json["candidates"][0]["reason"], reason);
+
         // A Codex resolution has no account to pick, so it never reads usage.
         let boom = || panic!("codex resolution must not read usage");
         let ctx = WhichCtx {
@@ -1956,7 +2010,7 @@ mod tests {
             env: &env,
             now,
             usage: &boom,
-            budget: &no_budget,
+            accounts: &no_accounts,
         };
         let mut out: Vec<u8> = Vec::new();
         which_with(
@@ -2027,7 +2081,7 @@ mod tests {
                 env: &env,
                 now,
                 usage: &usage,
-                budget: &no_budget,
+                accounts: &no_accounts,
             };
             let mut out = Vec::new();
             let mut err = Vec::new();
@@ -2053,7 +2107,7 @@ mod tests {
             env: &env,
             now,
             usage: &usage,
-            budget: &no_budget,
+            accounts: &no_accounts,
         };
         let err = which_with(
             &skipped_ctx,
@@ -2145,7 +2199,7 @@ mod tests {
                 env: &env,
                 now,
                 usage: &usage,
-                budget: &no_budget,
+                accounts: &no_accounts,
             };
             let mut out = Vec::new();
             which_with(
@@ -2211,7 +2265,7 @@ mod tests {
             env: &env,
             now: Timestamp::now(),
             usage: &boom,
-            budget: &no_budget,
+            accounts: &no_accounts,
         };
 
         let mut out: Vec<u8> = Vec::new();

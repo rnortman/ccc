@@ -5,6 +5,9 @@
 //! rewritten under an exclusive lock on the sibling `<name>.lock`. A ledger
 //! whose `month` is not the current month in the key's `reset_tz` reads as
 //! empty for the current one: that is the monthly refill.
+//!
+//! `ccc budget` also shows and clears the profiles' exhausted flags, which
+//! [`crate::limits`] keeps.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -17,7 +20,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::bus::{Bus, Remote};
 use crate::config::{ApiKeyConfig, Config, EnvSource};
-use crate::fsutil::{ensure_private_dir, write_atomically, FileLock};
+use crate::fsutil::{ensure_private_dir, load_json, write_atomically, FileLock};
+use crate::limits::{self, Limits, LimitsFile};
 
 const LEDGER_VERSION: u32 = 1;
 
@@ -114,14 +118,7 @@ impl Ledgers {
 
     /// The file's ledger, or `None` when there is none.
     fn load(path: &Path) -> Result<Option<Ledger>> {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-        };
-        serde_json::from_str(&text)
-            .map(Some)
-            .with_context(|| format!("budget ledger {} is damaged", path.display()))
+        load_json(path, "budget ledger")
     }
 
     /// `name`'s ledger for the month of `now`: empty when there is no file or
@@ -244,23 +241,13 @@ impl Ledgers {
         remote: &[AccountSpend],
     ) -> Result<(Ledger, Option<String>)> {
         let month = month_of(key, now)?;
-        let newest = remote
-            .iter()
-            .filter(|r| r.account == name && r.period == month)
-            .filter_map(|r| r.exhausted.as_ref().map(|e| e.at))
-            .max();
-        let (at, note) = match newest {
-            Some(flag) if flag >= now => {
-                let at = flag + jiff::SignedDuration::from_secs(1);
-                (
-                    at,
-                    Some(format!(
-                        "the newest exhausted flag ({flag}) is ahead of this host's clock; cleared as of {at}"
-                    )),
-                )
-            }
-            _ => (now, None),
-        };
+        let (at, note) = clear_point(
+            remote
+                .iter()
+                .filter(|r| r.account == name && r.period == month)
+                .filter_map(|r| r.exhausted.as_ref().map(|e| e.at)),
+            now,
+        );
         let ledger = self.update(name, key, now, Damaged::Refuse, |ledger| {
             ledger.exhausted = None;
             ledger.cleared_at = Some(at);
@@ -270,8 +257,30 @@ impl Ledgers {
     }
 }
 
+/// When a clear on this host takes effect, given the `at` of every flag
+/// other publishers and hosts hold on the account: `now`, or one second past
+/// the newest flag when that flag is at or ahead of this host's clock, with a
+/// note saying so.
+pub(crate) fn clear_point(
+    remote_flags: impl Iterator<Item = Timestamp>,
+    now: Timestamp,
+) -> (Timestamp, Option<String>) {
+    match remote_flags.max() {
+        Some(flag) if flag >= now => {
+            let at = flag + jiff::SignedDuration::from_secs(1);
+            (
+                at,
+                Some(format!(
+                    "the newest exhausted flag ({flag}) is ahead of this host's clock; cleared as of {at}"
+                )),
+            )
+        }
+        _ => (now, None),
+    }
+}
+
 /// The records of `remote` for `account` in `month`, except `me`'s own.
-fn others<'a>(
+pub(crate) fn others<'a>(
     remote: &'a [AccountSpend],
     account: &'a str,
     month: &'a str,
@@ -396,7 +405,7 @@ pub fn view(
         reserve_usd: key.reserve_usd,
         turns: local.turns,
         unmeasured_turns: local.unmeasured_turns,
-        exhausted: claude_usage_mqtt_core::exhausted(&records, name, &month).cloned(),
+        exhausted: claude_usage_mqtt_core::exhausted(&records, name, &month, None, now).cloned(),
         remote: remote.is_some(),
         ledger_error,
         ignored,
@@ -416,23 +425,51 @@ pub fn views(
         .collect()
 }
 
-/// Every configured key's view from this host's ledgers and one budget read
+/// A profile's flags in force, by bucket name.
+pub type ProfileFlags = BTreeMap<String, Exhausted>;
+
+/// What one account read found, resolved at the read's clock.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Accounts {
+    /// Every configured key's budget view that could be built.
+    pub keys: BTreeMap<String, BudgetView>,
+    /// Every configured profile's flags in force; a profile with none maps
+    /// to an empty set.
+    pub flags: BTreeMap<String, ProfileFlags>,
+}
+
+/// Every configured key's view and every configured profile's flags in force
+/// at `now`, from this host's ledgers and limits files and one account read
 /// over `bus`, for selection and `ccc which`. When the broker cannot be read
-/// the views are this host's alone; the bus's notes say why. A view that
+/// both are this host's alone; the bus's notes say why. A key view that
 /// cannot be built is reported on stderr and left out.
-pub fn bus_views(
-    cfg: &Config,
-    env: &dyn EnvSource,
-    now: Timestamp,
-    bus: &dyn Bus,
-) -> BTreeMap<String, BudgetView> {
-    // With no key there is no level to publish and nothing to read for.
-    if cfg.claude.api_keys.is_empty() {
-        return BTreeMap::new();
+pub fn bus_accounts(cfg: &Config, env: &dyn EnvSource, now: Timestamp, bus: &dyn Bus) -> Accounts {
+    // With no key and no profile there is no level to publish and nothing to
+    // read for.
+    if cfg.claude.api_keys.is_empty() && cfg.claude.profiles.is_empty() {
+        return Accounts::default();
     }
     let ledgers = Ledgers::in_env(env);
-    let remote = read_remote(cfg, &ledgers, now, bus);
-    lenient(each_view(cfg, &ledgers, now, remote_of(&remote, bus)))
+    let files = limits_files(cfg, &Limits::in_env(env), now);
+    let remote = fetch_remote(cfg, &ledgers, &files, now, bus);
+    let remote = remote_of(&remote, bus);
+    Accounts {
+        keys: lenient(each_view(cfg, &ledgers, now, remote)),
+        flags: flags_in_force(&files, remote, now),
+    }
+}
+
+/// Each profile's flags in force at `now`, from its limits file in `files`
+/// and the records of the account read.
+fn flags_in_force(
+    files: &BTreeMap<String, LimitsFile>,
+    remote: Option<(&[AccountSpend], &Identity)>,
+    now: Timestamp,
+) -> BTreeMap<String, ProfileFlags> {
+    files
+        .iter()
+        .map(|(p, file)| (p.clone(), limits::in_force(p, file, remote, now)))
+        .collect()
 }
 
 /// The views of `views` that could be built; the rest reported on stderr.
@@ -463,16 +500,32 @@ fn remote_of<'a>(
     }
 }
 
-/// This host's level for every configured key whose ledger can be read; a
-/// key never charged has a zero level.
-fn levels(cfg: &Config, ledgers: &Ledgers, now: Timestamp, me: &Identity) -> Vec<AccountSpend> {
-    cfg.claude
-        .api_keys
+/// This host's level for every configured key whose ledger can be read, a
+/// key never charged having a zero level, and its record of every configured
+/// profile's flags.
+fn levels(
+    cfg: &Config,
+    ledgers: &Ledgers,
+    files: &BTreeMap<String, LimitsFile>,
+    now: Timestamp,
+    me: &Identity,
+) -> Vec<AccountSpend> {
+    let keys = cfg.claude.api_keys.iter().filter_map(|(name, key)| {
+        let ledger = ledgers.read(name, key, now).ok()?;
+        Some(to_account_spend(name, key, &ledger, me))
+    });
+    let profiles = files
         .iter()
-        .filter_map(|(name, key)| {
-            let ledger = ledgers.read(name, key, now).ok()?;
-            Some(to_account_spend(name, key, &ledger, me))
-        })
+        .map(|(p, file)| limits::to_account_spend(p, file, me));
+    keys.chain(profiles).collect()
+}
+
+/// This host's limits file of every configured profile, read once.
+fn limits_files(cfg: &Config, limits: &Limits, now: Timestamp) -> BTreeMap<String, LimitsFile> {
+    cfg.claude
+        .profiles
+        .iter()
+        .map(|p| (p.clone(), limits.read(p, now)))
         .collect()
 }
 
@@ -484,16 +537,23 @@ pub fn publish_level(bus: &dyn Bus, name: &str, key: &ApiKeyConfig, ledger: &Led
     }
 }
 
-/// The budget read: this host's levels published first, then every
-/// publisher's and host's records, bounded by `[claude.selection]`'s broker
-/// timeout with its quiesce. [`Remote::Off`] when the bus is.
-pub fn read_remote(cfg: &Config, ledgers: &Ledgers, now: Timestamp, bus: &dyn Bus) -> Remote {
+/// The account read: this host's levels for every key and for every profile
+/// in `files` published first, then every publisher's and host's records,
+/// bounded by `[claude.selection]`'s broker timeout with its quiesce.
+/// [`Remote::Off`] when the bus is.
+fn fetch_remote(
+    cfg: &Config,
+    ledgers: &Ledgers,
+    files: &BTreeMap<String, LimitsFile>,
+    now: Timestamp,
+    bus: &dyn Bus,
+) -> Remote {
     let Some(me) = bus.identity() else {
         return Remote::Off;
     };
     let sel = &cfg.claude.selection;
     bus.fetch_accounts(
-        levels(cfg, ledgers, now, me),
+        levels(cfg, ledgers, files, now, me),
         std::time::Duration::from_millis(sel.mqtt_quiesce_ms),
         std::time::Duration::from_millis(sel.mqtt_timeout_ms),
     )
@@ -524,10 +584,11 @@ pub enum BudgetCommand {
 pub struct BudgetCtx<'a> {
     pub cfg: &'a Config,
     pub ledgers: &'a Ledgers,
+    pub limits: &'a Limits,
     pub now: Timestamp,
     /// Opens the bus, which is read for other hosts' records and written
-    /// with this host's. Called only when the command names no unknown key
-    /// and a key is configured.
+    /// with this host's. Called only when the command names no unknown
+    /// account and a key or a profile is configured.
     pub open_bus: &'a dyn Fn() -> Box<dyn Bus>,
 }
 
@@ -535,10 +596,11 @@ pub struct BudgetCtx<'a> {
 /// read.
 pub const THIS_HOST_ONLY: &str = "spend: this host only";
 
-/// Runs `ccc budget`. With a key configured every form reads the broker
-/// first, publishing this host's levels as it does, and the two that change
-/// a ledger publish the new level. `set` is refused, exit 1, when the bus is
-/// on and the broker cannot be read. The bus is closed on every exit. Its
+/// Runs `ccc budget`. With a key or a profile configured every form reads
+/// the broker first, publishing this host's levels as it does, and the two
+/// that change a ledger or a limits file publish the new level. `set` is
+/// refused, exit 1, when the bus is on and the broker cannot be read. The bus
+/// is closed on every exit. Its
 /// notes end the report, or go to `err` for `--json` and ahead of an error.
 pub fn budget_with(
     ctx: &BudgetCtx<'_>,
@@ -546,17 +608,25 @@ pub fn budget_with(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<i32> {
-    if let BudgetCommand::Set { name, .. } | BudgetCommand::Clear { name } = cmd {
-        key_of(ctx.cfg, name)?;
+    match cmd {
+        BudgetCommand::Set { name, .. } => {
+            key_of(ctx.cfg, name)?;
+        }
+        BudgetCommand::Clear { name } => {
+            account_of(ctx.cfg, name)?;
+        }
+        BudgetCommand::Show { .. } => {}
     }
-    // With no key there is no level to publish and nothing to read for; only
-    // `show` gets here.
-    if ctx.cfg.claude.api_keys.is_empty() {
-        return act(ctx, &crate::bus::NoBus, cmd, &Remote::Off, out, err);
+    // With no key and no profile there is no level to publish and nothing to
+    // read for; only `show` gets here.
+    if ctx.cfg.claude.api_keys.is_empty() && ctx.cfg.claude.profiles.is_empty() {
+        let files = BTreeMap::new();
+        return act(ctx, &crate::bus::NoBus, cmd, &Remote::Off, &files, out, err);
     }
     let bus = (ctx.open_bus)();
-    let remote = read_remote(ctx.cfg, ctx.ledgers, ctx.now, bus.as_ref());
-    let code = act(ctx, bus.as_ref(), cmd, &remote, out, err);
+    let files = limits_files(ctx.cfg, ctx.limits, ctx.now);
+    let remote = fetch_remote(ctx.cfg, ctx.ledgers, &files, ctx.now, bus.as_ref());
+    let code = act(ctx, bus.as_ref(), cmd, &remote, &files, out, err);
     let notes = bus.close();
     let code = match code {
         Ok(code) => code,
@@ -602,12 +672,30 @@ fn key_of<'c>(cfg: &'c Config, name: &str) -> Result<&'c ApiKeyConfig> {
         .with_context(|| format!("no API key named {name:?} in [claude.api_keys]"))
 }
 
-/// `cmd`'s own output, given the broker read's outcome.
+/// An account `ccc budget clear` can name.
+enum Named<'c> {
+    Key(&'c ApiKeyConfig),
+    Profile,
+}
+
+fn account_of<'c>(cfg: &'c Config, name: &str) -> Result<Named<'c>> {
+    if let Some(key) = cfg.claude.api_keys.get(name) {
+        return Ok(Named::Key(key));
+    }
+    if cfg.claude.profiles.iter().any(|p| p == name) {
+        return Ok(Named::Profile);
+    }
+    bail!("no API key named {name:?} in [claude.api_keys] and no profile of that name in [claude] profiles")
+}
+
+/// `cmd`'s own output, given the broker read's outcome and the limits
+/// `files` it published.
 fn act(
     ctx: &BudgetCtx<'_>,
     bus: &dyn Bus,
     cmd: &BudgetCommand,
     remote: &Remote,
+    files: &BTreeMap<String, LimitsFile>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<i32> {
@@ -615,21 +703,27 @@ fn act(
     Ok(match cmd {
         BudgetCommand::Show { json } => {
             let views = views(ctx.cfg, ctx.ledgers, ctx.now, records)?;
+            let profiles = flags_in_force(files, records, ctx.now);
             if *json {
                 let mut doc = serde_json::json!({
                     "remote": records.is_some(),
                     "api_keys": views,
+                    "profiles": profiles,
                 });
                 if let Remote::Unavailable(why) = remote {
                     doc["broker_error"] = why.clone().into();
                 }
                 serde_json::to_writer_pretty(&mut *out, &doc)?;
                 writeln!(out)?;
-            } else if views.is_empty() {
-                writeln!(out, "no API keys configured ([claude.api_keys])")?;
             } else {
+                if views.is_empty() {
+                    writeln!(out, "no API keys configured ([claude.api_keys])")?;
+                }
                 for (name, view) in &views {
                     write_view(out, name, view)?;
+                }
+                for (name, flags) in &profiles {
+                    write_profile(out, name, flags)?;
                 }
             }
             0
@@ -661,18 +755,51 @@ fn act(
             }
         }
         BudgetCommand::Clear { name } => {
-            let key = key_of(ctx.cfg, name)?;
             let seen = records.map_or(&[][..], |(r, _)| r);
-            let (ledger, note) = ctx.ledgers.clear(name, key, ctx.now, seen)?;
-            publish_level(bus, name, key, &ledger);
+            let (cleared_at, note, what) = match account_of(ctx.cfg, name)? {
+                Named::Key(key) => {
+                    let (ledger, note) = ctx.ledgers.clear(name, key, ctx.now, seen)?;
+                    publish_level(bus, name, key, &ledger);
+                    (ledger.cleared_at, note, "exhausted flag")
+                }
+                Named::Profile => {
+                    let (file, note) = ctx.limits.clear(name, ctx.now, seen)?;
+                    limits::publish(bus, name, &file);
+                    (file.cleared_at, note, "exhausted flags")
+                }
+            };
             if let Some(note) = note {
                 writeln!(out, "note: {note}")?;
             }
-            let at = ledger.cleared_at.map(|t| t.to_string()).unwrap_or_default();
-            writeln!(out, "{name}: exhausted flag cleared as of {at}")?;
+            let at = cleared_at.map(|t| t.to_string()).unwrap_or_default();
+            writeln!(out, "{name}: {what} cleared as of {at}")?;
             0
         }
     })
+}
+
+/// A profile's flags in force, one line per bucket, or that it has none.
+fn write_profile(
+    out: &mut dyn Write,
+    name: &str,
+    flags: &BTreeMap<String, Exhausted>,
+) -> Result<()> {
+    if flags.is_empty() {
+        writeln!(out, "{name}: exhausted: no")?;
+    }
+    for (bucket, e) in flags {
+        writeln!(
+            out,
+            "{name}: {bucket} exhausted since {}{}{}",
+            e.at,
+            e.until.map(|u| format!(" until {u}")).unwrap_or_default(),
+            e.message
+                .as_deref()
+                .map(|m| format!(": {m}"))
+                .unwrap_or_default()
+        )?;
+    }
+    Ok(())
 }
 
 fn write_view(out: &mut dyn Write, name: &str, view: &BudgetView) -> Result<()> {
@@ -1068,6 +1195,7 @@ mod tests {
         let ctx = BudgetCtx {
             cfg: &cfg,
             ledgers: &l,
+            limits: &Limits::at(l.dir.join("limits")),
             now: ts(NOW),
             open_bus: &open_bus,
         };
@@ -1147,11 +1275,13 @@ mod tests {
     fn budget_command_with_no_keys_says_so_without_opening_the_bus() {
         let dir = crate::testutil::TempDir::new("budget");
         let l = Ledgers::at(dir.path().to_path_buf());
-        let cfg = Config::default();
+        let mut cfg = Config::default();
+        cfg.claude.profiles.clear();
         let open_bus = || -> Box<dyn Bus> { panic!("the bus was opened with no key") };
         let ctx = BudgetCtx {
             cfg: &cfg,
             ledgers: &l,
+            limits: &Limits::at(l.dir.join("limits")),
             now: ts(NOW),
             open_bus: &open_bus,
         };
@@ -1166,11 +1296,181 @@ mod tests {
         let (code, json) = run(BudgetCommand::Show { json: true });
         assert_eq!(code.unwrap(), 0);
         let json: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(json, serde_json::json!({ "remote": false, "api_keys": {} }));
+        assert_eq!(
+            json,
+            serde_json::json!({ "remote": false, "api_keys": {}, "profiles": {} })
+        );
         let (code, _) = run(BudgetCommand::Clear {
             name: "team".into(),
         });
-        assert!(format!("{:#}", code.unwrap_err()).contains("no API key named"));
+        let err = format!("{:#}", code.unwrap_err());
+        assert!(
+            err.contains("no API key named") && err.contains("no profile"),
+            "{err}"
+        );
+    }
+
+    fn profile_flag(at: &str, until: &str) -> Exhausted {
+        let mut e = Exhausted::new(ts(at), Some("inv".into()), Some("Fable limit".into()));
+        e.until = Some(ts(until));
+        e.kind = Some("seven_day_overage_included".into());
+        e
+    }
+
+    fn subscription(publisher: &str, host: &str) -> AccountSpend {
+        AccountSpend::new(
+            "team01",
+            AccountKind::Subscription,
+            publisher,
+            host,
+            limits::PERIOD,
+            0.0,
+            ts(NOW),
+        )
+    }
+
+    #[test]
+    fn budget_show_lists_profiles_with_and_without_flags_when_no_key_is_configured() {
+        let dir = crate::testutil::TempDir::new("budget");
+        let l = Ledgers::at(dir.path().to_path_buf());
+        let mut cfg = Config::default();
+        cfg.claude.profiles = vec!["team01".into(), "team02".into()];
+        Limits::at(l.dir.join("limits"))
+            .raise(
+                "team01",
+                limits::FABLE,
+                profile_flag(NOW, "2026-11-13T04:00:00Z"),
+                ts(NOW),
+            )
+            .unwrap();
+        let mut zeus = subscription("ccc", "zeus");
+        zeus.exhausted_buckets.insert(
+            limits::FIVE_HOUR.into(),
+            profile_flag(NOW, "2026-11-10T18:00:00Z"),
+        );
+        let bus = Arc::new(RecordingBus::new(
+            "ccc",
+            "atlas",
+            Remote::Records(vec![zeus]),
+        ));
+
+        let (code, text, _) = run_on(&cfg, &l, &bus, BudgetCommand::Show { json: false });
+        assert_eq!(code, 0);
+        assert!(text.starts_with("no API keys configured"), "{text}");
+        assert!(
+            text.contains(
+                "team01: fable exhausted since 2026-11-10T14:03:11Z until 2026-11-13T04:00:00Z: Fable limit\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("team01: five_hour exhausted since"), "{text}");
+        assert!(text.contains("team02: exhausted: no\n"), "{text}");
+        // This host's profile records were put first.
+        match &bus.calls()[0] {
+            Recorded::Fetch(levels) => {
+                let names: Vec<_> = levels.iter().map(|s| s.account.as_str()).collect();
+                assert_eq!(names, vec!["team01", "team02"]);
+                assert!(levels[0].exhausted_buckets.contains_key("fable"));
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let (_, json, _) = run_on(&cfg, &l, &bus, BudgetCommand::Show { json: true });
+        let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(json["api_keys"], serde_json::json!({}));
+        assert_eq!(
+            json["profiles"]["team01"]["fable"]["until"],
+            "2026-11-13T04:00:00Z"
+        );
+        assert!(json["profiles"]["team01"]["five_hour"]["at"].is_string());
+        assert_eq!(json["profiles"]["team02"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn budget_clear_on_a_profile_lifts_every_bucket_writes_and_publishes() {
+        let dir = crate::testutil::TempDir::new("budget");
+        let l = Ledgers::at(dir.path().to_path_buf());
+        let k = key("UTC");
+        let mut cfg = config_with(&k);
+        cfg.claude.profiles = vec!["team01".into()];
+        let limits = Limits::at(l.dir.join("limits"));
+        for bucket in [limits::FABLE, limits::GENERAL] {
+            limits
+                .raise(
+                    "team01",
+                    bucket,
+                    profile_flag(NOW, "2026-11-13T04:00:00Z"),
+                    ts(NOW),
+                )
+                .unwrap();
+        }
+        let mut zeus = subscription("ccc", "zeus");
+        zeus.exhausted_buckets.insert(
+            limits::FIVE_HOUR.into(),
+            profile_flag("2026-11-10T13:00:00Z", "2026-11-10T18:00:00Z"),
+        );
+        let bus = Arc::new(RecordingBus::new(
+            "ccc",
+            "atlas",
+            Remote::Records(vec![zeus]),
+        ));
+        let (code, out, _) = run_on(
+            &cfg,
+            &l,
+            &bus,
+            BudgetCommand::Clear {
+                name: "team01".into(),
+            },
+        );
+        assert_eq!(code, 0);
+        assert!(
+            out.contains("team01: exhausted flags cleared as of 2026-11-10T14:03:11Z"),
+            "{out}"
+        );
+        assert!(out.ends_with("published to the broker\n"), "{out}");
+        let file = limits.try_read("team01", ts(NOW)).unwrap();
+        assert!(file.buckets.is_empty());
+        assert_eq!(file.cleared_at, Some(ts(NOW)));
+        let put = bus
+            .calls()
+            .into_iter()
+            .find_map(|c| match c {
+                Recorded::PutAccount(s) => Some(*s),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            (put.account.as_str(), put.cleared_at),
+            ("team01", Some(ts(NOW)))
+        );
+        // The key's ledger is untouched.
+        assert!(l.read("team", &k, ts(NOW)).unwrap().cleared_at.is_none());
+
+        // Every bucket on every host is lifted; a flag raised after the clear
+        // is in force again.
+        let remote = vec![{
+            let mut z = subscription("ccc", "zeus");
+            z.exhausted_buckets.insert(
+                limits::FIVE_HOUR.into(),
+                profile_flag("2026-11-10T13:00:00Z", "2026-11-10T18:00:00Z"),
+            );
+            z
+        }];
+        let me = me();
+        let flags = |file: &limits::LimitsFile| {
+            limits::in_force("team01", file, Some((remote.as_slice(), &me)), ts(NOW))
+        };
+        assert!(flags(&file).is_empty());
+        let later = "2026-11-10T14:30:00Z";
+        let file = limits
+            .raise(
+                "team01",
+                limits::FABLE,
+                profile_flag(later, "2026-11-13T04:00:00Z"),
+                ts(later),
+            )
+            .unwrap();
+        assert_eq!(flags(&file).keys().collect::<Vec<_>>(), vec!["fable"]);
     }
 
     #[test]
@@ -1186,6 +1486,7 @@ mod tests {
         let ctx = BudgetCtx {
             cfg: &cfg,
             ledgers: &l,
+            limits: &Limits::at(l.dir.join("limits")),
             now: ts(NOW),
             open_bus: &open_bus,
         };
@@ -1226,6 +1527,7 @@ mod tests {
         let ctx = BudgetCtx {
             cfg,
             ledgers: l,
+            limits: &Limits::at(l.dir.join("limits")),
             now: ts(NOW),
             open_bus: &open_bus,
         };
@@ -1402,7 +1704,7 @@ mod tests {
             "atlas",
             Remote::Records(vec![spend("ccc", "zeus", "2026-11", 395.0)]),
         );
-        let views = bus_views(&cfg, &env, ts(NOW), &over);
+        let views = bus_accounts(&cfg, &env, ts(NOW), &over).keys;
         let v = &views["team"];
         assert_eq!((v.spent_usd, v.local_usd, v.remote), (405.0, 10.0, true));
         assert!(!v.in_budget(), "{v:?}");
@@ -1422,7 +1724,87 @@ mod tests {
                 "2026-11-10T14:00:00Z",
             )]),
         );
-        let v = &bus_views(&cfg, &env, ts(NOW), &flag)["team"];
+        let v = &bus_accounts(&cfg, &env, ts(NOW), &flag).keys["team"];
         assert!(v.exhausted.is_some() && !v.in_budget(), "{v:?}");
+    }
+
+    #[test]
+    fn one_account_read_serves_the_keys_and_the_profiles_flags() {
+        let dir = crate::testutil::TempDir::new("budget");
+        let env: BTreeMap<String, String> = [(
+            "XDG_STATE_HOME".to_string(),
+            dir.path().display().to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let k = key("UTC");
+        let mut cfg = config_with(&k);
+        cfg.claude.profiles = vec!["team01".into(), "team02".into()];
+        Limits::in_env(&env)
+            .raise(
+                "team01",
+                limits::FABLE,
+                profile_flag(NOW, "2026-11-13T04:00:00Z"),
+                ts(NOW),
+            )
+            .unwrap();
+
+        // Another host's flag counts; this host's own retained record does
+        // not, nor does an expired flag.
+        let mut zeus = subscription("ccc", "zeus");
+        zeus.exhausted_buckets.insert(
+            limits::FIVE_HOUR.into(),
+            profile_flag(NOW, "2026-11-10T18:00:00Z"),
+        );
+        zeus.exhausted_buckets.insert(
+            limits::GENERAL.into(),
+            profile_flag("2026-11-09T14:00:00Z", "2026-11-10T00:00:00Z"),
+        );
+        let mut own = subscription("ccc", "atlas");
+        own.account = "team02".into();
+        own.exhausted_buckets.insert(
+            limits::GENERAL.into(),
+            profile_flag(NOW, "2026-11-13T04:00:00Z"),
+        );
+        let bus = RecordingBus::new(
+            "ccc",
+            "atlas",
+            Remote::Records(vec![zeus, own, spend("ccc", "zeus", "2026-11", 5.0)]),
+        );
+        let read = bus_accounts(&cfg, &env, ts(NOW), &bus);
+        assert_eq!(read.keys["team"].spent_usd, 5.0);
+        assert_eq!(
+            read.flags["team01"].keys().collect::<Vec<_>>(),
+            vec!["fable", "five_hour"]
+        );
+        assert!(read.flags["team02"].is_empty(), "{read:?}");
+        match bus.calls().as_slice() {
+            [Recorded::Fetch(levels)] => {
+                let names: Vec<_> = levels.iter().map(|s| s.account.as_str()).collect();
+                assert_eq!(names, vec!["team", "team01", "team02"]);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // With the bus off the flags are this host's alone.
+        let read = bus_accounts(&cfg, &env, ts(NOW), &crate::bus::NoBus);
+        assert_eq!(
+            read.flags["team01"].keys().collect::<Vec<_>>(),
+            vec!["fable"]
+        );
+        assert!(!read.keys["team"].remote);
+
+        // A clear lifts every bucket at the next read.
+        Limits::in_env(&env).clear("team01", ts(NOW), &[]).unwrap();
+        let read = bus_accounts(&cfg, &env, ts(NOW), &crate::bus::NoBus);
+        assert!(read.flags["team01"].is_empty(), "{read:?}");
+
+        // With neither a key nor a profile nothing is read.
+        let none = RecordingBus::new("ccc", "atlas", Remote::Records(Vec::new()));
+        assert_eq!(
+            bus_accounts(&Config::default(), &env, ts(NOW), &none),
+            Accounts::default()
+        );
+        assert!(none.calls().is_empty());
     }
 }

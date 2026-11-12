@@ -322,6 +322,15 @@ pub struct Outcome {
     pub warnings: Vec<String>,
 }
 
+/// The quota a provider said refused a turn, and until when.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LimitInfo {
+    /// The provider's name for the limit (`rateLimitType`), when it gave one.
+    pub kind: Option<String>,
+    /// When the provider said the refusal ends (`resetsAt`, Unix seconds).
+    pub resets_at: Option<jiff::Timestamp>,
+}
+
 /// Why a turn did not produce an [`Outcome`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum HarnessError {
@@ -340,6 +349,9 @@ pub enum HarnessError {
         message: String,
         native: serde_json::Value,
         warnings: Vec<String>,
+        /// The provider's own account of the refusal, when it gave one.
+        /// Boxed to keep `HarnessError` small.
+        limit: Option<Box<LimitInfo>>,
     },
     /// The harness crashed, or its output held no final message.
     Unusable {
@@ -653,6 +665,7 @@ mod tests {
             message: "You've hit your session limit".into(),
             native: serde_json::Value::Null,
             warnings: vec![],
+            limit: None,
         };
         assert_eq!(limited.exit_code(), EXIT_LIMITED);
         assert_eq!(limited.session_id(), Some("abc"));

@@ -4,13 +4,13 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::audit::HookKind;
 use crate::config::{expand_tilde_in, ClaudeAuth, ClaudeConfig, EnvSource, PermissionMode};
 use crate::harness::{
-    binary_in, check_arg_len, tail, Captured, Common, Driver, HarnessError, Invocation, Io, Origin,
-    Outcome,
+    binary_in, check_arg_len, tail, Captured, Common, Driver, HarnessError, Invocation, Io,
+    LimitInfo, Origin, Outcome,
 };
 use crate::resolve::Resolved;
 
@@ -346,7 +346,7 @@ fn build(r: &Resolved, c: &Common, d: &ClaudeDriver) -> Result<Invocation> {
     let mut args: Vec<String> = Vec::new();
     let one_shot = !c.mode.is_launch();
     if one_shot {
-        args.extend(["-p", "--output-format", "json"].map(String::from));
+        args.extend(["-p", "--output-format", "stream-json", "--verbose"].map(String::from));
     }
     args.push("--model".into());
     args.push(r.model.clone());
@@ -413,25 +413,105 @@ fn shell_quote(path: &str) -> String {
 }
 
 /// Whether a failed turn's message is Claude Code saying the account hit a
-/// usage limit (`You've hit your session limit · resets …`, or a wording
-/// naming a usage limit).
+/// usage limit (`You've hit your session limit · resets …`, `You've reached
+/// your Fable limit. …`, or a wording naming a usage limit).
 pub fn is_usage_limit(message: &str) -> bool {
     let message = message.trim();
-    (message.starts_with("You've hit your") && message.contains("limit"))
+    ((message.starts_with("You've hit your") || message.starts_with("You've reached your"))
+        && message.contains("limit"))
         || message.contains("usage limit")
 }
 
-/// Parses one `--output-format json` object.
-fn parse(stdout: &str, stderr: &str) -> Result<Outcome, HarnessError> {
-    let value: serde_json::Value = match serde_json::from_str(stdout.trim()) {
-        Ok(v) => v,
-        Err(e) => {
-            return Err(HarnessError::unusable(format!(
-                "claude produced no JSON result ({e}); stderr: {}",
-                tail(stderr, 5)
-            )))
+/// The events of one `--output-format stream-json` run that `parse` reads.
+#[derive(Default)]
+struct Events {
+    /// The last `result` event: the turn's outcome.
+    result: Option<Value>,
+    /// The `rate_limit_info` of the last `rate_limit_event` whose status is
+    /// `rejected`.
+    rejected: Option<Value>,
+    /// The `api_error_params.rate_limit_info` of the last `assistant` event
+    /// whose `error` is `rate_limit`, whatever its status.
+    assistant_limit: Option<Value>,
+}
+
+impl Events {
+    /// Reads every line that is a JSON object; skips the rest.
+    fn read(stdout: &str) -> Events {
+        let mut ev = Events::default();
+        for line in stdout.lines() {
+            let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(line.trim()) else {
+                continue;
+            };
+            let value = Value::Object(obj);
+            match value.get("type").and_then(Value::as_str) {
+                Some("result") => ev.result = Some(value),
+                Some("rate_limit_event") => {
+                    if let Some(info) = value.get("rate_limit_info") {
+                        if is_rejected(info) {
+                            ev.rejected = Some(info.clone());
+                        }
+                    }
+                }
+                Some("assistant")
+                    if value.get("error").and_then(Value::as_str) == Some("rate_limit") =>
+                {
+                    ev.assistant_limit =
+                        value.pointer("/api_error_params/rate_limit_info").cloned();
+                }
+                _ => {}
+            }
         }
+        ev
+    }
+
+    /// The provider's refusal: the last rejected rate-limit event, else the
+    /// rate-limit object of the last rate-limited assistant message when it
+    /// is rejected.
+    fn refusal(&self) -> Option<&Value> {
+        self.rejected
+            .as_ref()
+            .or_else(|| self.assistant_limit.as_ref().filter(|i| is_rejected(i)))
+    }
+}
+
+fn is_rejected(info: &Value) -> bool {
+    info.get("status").and_then(Value::as_str) == Some("rejected")
+}
+
+/// The limit a refusal names: its `rateLimitType` and `resetsAt`.
+fn limit_info(refusal: &Value) -> LimitInfo {
+    let resets_at = refusal.get("resetsAt").and_then(|v| {
+        v.as_i64()
+            .or_else(|| v.as_f64().map(|f| f as i64))
+            .and_then(|s| jiff::Timestamp::from_second(s).ok())
+    });
+    LimitInfo {
+        kind: refusal
+            .get("rateLimitType")
+            .and_then(Value::as_str)
+            .map(String::from),
+        resets_at,
+    }
+}
+
+// TODO(claude-stream-liveness): the events are read once, after the child
+// exits; a refused turn waits for any background command the agent left
+// running.
+/// Parses the event lines of one `--output-format stream-json --verbose`
+/// run. The last `result` event is the outcome. A failed result is a usage
+/// limit when it carries `api_error_status` 429 or its message reads as one
+/// ([`is_usage_limit`]); the limit names the provider's refusal when the
+/// stream reported one.
+fn parse(stdout: &str, stderr: &str) -> Result<Outcome, HarnessError> {
+    let events = Events::read(stdout);
+    let Some(value) = &events.result else {
+        return Err(HarnessError::unusable(format!(
+            "claude produced no result event; stderr: {}",
+            tail(stderr, 5)
+        )));
     };
+    let refusal = events.refusal();
 
     let session_id = value
         .get("session_id")
@@ -447,6 +527,10 @@ fn parse(stdout: &str, stderr: &str) -> Result<Outcome, HarnessError> {
         COST_FIELD: value.get(COST_FIELD),
         "duration_ms": value.get("duration_ms"),
         "modelUsage": value.get("modelUsage"),
+        "terminal_reason": value.get("terminal_reason"),
+        "api_error_status": value.get("api_error_status"),
+        "api_error": value.get("api_error"),
+        "rate_limit_info": refusal,
     });
 
     if value.get("is_error").and_then(|v| v.as_bool()) == Some(true) {
@@ -469,12 +553,14 @@ fn parse(stdout: &str, stderr: &str) -> Result<Outcome, HarnessError> {
                 )
             }
         };
-        if is_usage_limit(&message) {
+        let status_429 = value.get("api_error_status").and_then(Value::as_u64) == Some(429);
+        if status_429 || is_usage_limit(&message) {
             return Err(HarnessError::Limited {
                 session_id,
                 message,
                 native,
                 warnings: Vec::new(),
+                limit: refusal.map(|r| Box::new(limit_info(r))),
             });
         }
         return Err(HarnessError::Reported {
@@ -487,7 +573,7 @@ fn parse(stdout: &str, stderr: &str) -> Result<Outcome, HarnessError> {
 
     let Some(session_id) = session_id else {
         return Err(HarnessError::unusable(
-            "claude returned JSON without a session_id".to_string(),
+            "claude returned a result without a session_id".to_string(),
         ));
     };
     if result.is_empty() {
@@ -610,7 +696,10 @@ mod tests {
         let e = env(&[]);
         let i = driver(&e).build(&resolved(), &common(run_mode())).unwrap();
         assert_eq!(i.program, "claude");
-        assert_eq!(&i.args[0..3], &["-p", "--output-format", "json"]);
+        assert_eq!(
+            &i.args[0..4],
+            &["-p", "--output-format", "stream-json", "--verbose"]
+        );
         assert_eq!(i.value_of("--model"), Some("claude-haiku-4-5[1m]"));
         assert_eq!(i.value_of("--effort"), Some("low"));
         assert_eq!(i.value_of("--agent"), Some("explorer"));
@@ -683,7 +772,10 @@ mod tests {
         let resume = driver(&e)
             .build(&r, &common(one_shot(resumed("9f22dd1b", false))))
             .unwrap();
-        assert_eq!(&resume.args[0..3], &["-p", "--output-format", "json"]);
+        assert_eq!(
+            &resume.args[0..4],
+            &["-p", "--output-format", "stream-json", "--verbose"]
+        );
         assert_eq!(resume.value_of("--permission-mode"), Some("dontAsk"));
         assert_eq!(resume.value_of("--resume"), Some("9f22dd1b"));
         assert!(!resume.has_arg("--agent"), "{:?}", resume.args);
@@ -1014,21 +1106,21 @@ mod tests {
 
     #[test]
     fn reported_cost_reads_a_refused_result_and_is_none_without_one() {
-        let refused = r#"{"type":"result","is_error":true,"result":"no",
-            "session_id":"9f22dd1b-1111-2222-3333-444455556666","total_cost_usd":0.5}"#;
+        let refused = r#"{"type":"result","is_error":true,"result":"no","session_id":"9f22dd1b-1111-2222-3333-444455556666","total_cost_usd":0.5}"#;
         let err = parse(refused, "").unwrap_err();
         assert_eq!(reported_cost(err.reported().unwrap().1), Some(0.5));
-        let free = r#"{"type":"result","is_error":false,"result":"ok",
-            "session_id":"9f22dd1b-1111-2222-3333-444455556666"}"#;
+        let free = r#"{"type":"result","is_error":false,"result":"ok","session_id":"9f22dd1b-1111-2222-3333-444455556666"}"#;
         assert_eq!(reported_cost(&parse(free, "").unwrap().native), None);
     }
 
     #[test]
     fn parses_a_successful_result() {
-        let stdout = r#"{"type":"result","subtype":"success","is_error":false,
+        let stdout = json!({"type":"result","subtype":"success","is_error":false,
             "session_id":"9f22dd1b-1111-2222-3333-444455556666","result":"PROBE-OK hello",
             "num_turns":1,"total_cost_usd":0.0031,"duration_ms":4200,
-            "modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":10}}}"#;
+            "modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":10}}})
+        .to_string();
+        let stdout = stdout.as_str();
         let out = parse(stdout, "").unwrap();
         assert_eq!(out.session_id, "9f22dd1b-1111-2222-3333-444455556666");
         assert_eq!(out.result, "PROBE-OK hello");
@@ -1041,8 +1133,7 @@ mod tests {
 
     #[test]
     fn is_error_becomes_a_reported_failure() {
-        let stdout =
-            r#"{"is_error":true,"session_id":"abc","result":"Not logged in","num_turns":0}"#;
+        let stdout = r#"{"type":"result","is_error":true,"session_id":"abc","result":"Not logged in","num_turns":0}"#;
         let err = parse(stdout, "").unwrap_err();
         assert_eq!(err.exit_code(), 1);
         assert_eq!(err.message(), "Not logged in");
@@ -1050,12 +1141,172 @@ mod tests {
     }
 
     const LIMIT_MESSAGE: &str = "You've hit your session limit · resets 3pm (America/New_York)";
+    const FABLE_MESSAGE: &str =
+        "You've reached your Fable limit. Switch to another model to continue.";
+    const FABLE_STREAM: &str = include_str!("testdata/claude-stream-fable-limit.jsonl");
+    const OK_STREAM: &str = include_str!("testdata/claude-stream-ok.jsonl");
+
+    fn limit_of(err: &HarnessError) -> Option<&LimitInfo> {
+        match err {
+            HarnessError::Limited { limit, .. } => limit.as_deref(),
+            other => panic!("not limited: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_refused_fable_stream_is_limited_with_the_providers_reset() {
+        let err = parse(FABLE_STREAM, "").unwrap_err();
+        assert_eq!(err.exit_code(), crate::harness::EXIT_LIMITED);
+        assert_eq!(err.message(), FABLE_MESSAGE);
+        assert_eq!(
+            err.session_id(),
+            Some("c7e95cd7-20b2-4454-9851-fbba6d6a9777")
+        );
+        let limit = limit_of(&err).expect("the stream reported its refusal");
+        assert_eq!(limit.kind.as_deref(), Some("seven_day_overage_included"));
+        assert_eq!(
+            limit.resets_at,
+            Some("2026-11-13T04:00:00Z".parse().unwrap())
+        );
+        let native = err.reported().unwrap().1;
+        assert_eq!(native["api_error_status"], json!(429));
+        assert_eq!(native["api_error"], json!("model_requires_usage_credits"));
+        assert_eq!(native["terminal_reason"], json!("api_error"));
+        assert_eq!(native["rate_limit_info"]["status"], json!("rejected"));
+        assert_eq!(
+            native["rate_limit_info"]["rateLimitType"],
+            json!("seven_day_overage_included")
+        );
+    }
+
+    #[test]
+    fn a_successful_stream_is_ok_with_its_cost() {
+        let out = parse(OK_STREAM, "").unwrap();
+        assert_eq!(out.session_id, "9db845f0-22b5-4353-8899-4f2d2269c816");
+        assert_eq!(out.result, "hi");
+        let cost = reported_cost(&out.native).unwrap();
+        assert!((cost - 0.0275102).abs() < 1e-12, "{cost}");
+        assert_eq!(out.native["terminal_reason"], json!("completed"));
+        assert_eq!(out.native["api_error_status"], Value::Null);
+        // Its `allowed_warning` rate-limit event is not a refusal.
+        assert_eq!(out.native["rate_limit_info"], Value::Null);
+    }
+
+    fn result_line(fields: Value) -> String {
+        let mut v = json!({"type": "result", "session_id": "abc", "num_turns": 1});
+        for (k, f) in fields.as_object().unwrap() {
+            v[k] = f.clone();
+        }
+        v.to_string()
+    }
+
+    #[test]
+    fn a_429_without_a_rate_limit_event_is_limited_with_no_limit() {
+        let stdout = result_line(json!({
+            "is_error": true, "result": "API Error: something", "api_error_status": 429,
+        }));
+        let err = parse(&stdout, "").unwrap_err();
+        assert_eq!(limit_of(&err), None);
+        assert_eq!(err.message(), "API Error: something");
+    }
+
+    #[test]
+    fn a_limit_message_without_a_status_is_limited_with_no_limit() {
+        for message in [FABLE_MESSAGE, LIMIT_MESSAGE] {
+            let stdout = result_line(json!({"is_error": true, "result": message}));
+            let err = parse(&stdout, "").unwrap_err();
+            assert_eq!(limit_of(&err), None, "{message}");
+        }
+    }
+
+    #[test]
+    fn another_status_with_another_message_is_a_reported_failure() {
+        let stdout = result_line(json!({
+            "is_error": true, "result": "API Error: overloaded", "api_error_status": 529,
+        }));
+        let err = parse(&stdout, "").unwrap_err();
+        assert!(matches!(err, HarnessError::Reported { .. }), "{err:?}");
+        assert_eq!(err.reported().unwrap().1["api_error_status"], json!(529));
+    }
+
+    #[test]
+    fn a_rejected_assistant_message_stands_in_for_a_missing_rate_limit_event() {
+        let assistant = |status: &str| {
+            json!({"type": "assistant", "error": "rate_limit", "api_error_params": {
+                "rate_limit_info": {"status": status, "resetsAt": 1794448200,
+                                    "rateLimitType": "five_hour"}}})
+            .to_string()
+        };
+        let result = result_line(json!({
+            "is_error": true, "result": "x", "api_error_status": 429,
+        }));
+        let err = parse(&format!("{}\n{result}\n", assistant("rejected")), "").unwrap_err();
+        let limit = limit_of(&err).unwrap();
+        assert_eq!(limit.kind.as_deref(), Some("five_hour"));
+        assert_eq!(
+            limit.resets_at,
+            Some(jiff::Timestamp::from_second(1794448200).unwrap())
+        );
+
+        // Only the last such message counts, and only when it is rejected.
+        let stdout = format!(
+            "{}\n{}\n{result}",
+            assistant("rejected"),
+            assistant("allowed")
+        );
+        assert_eq!(limit_of(&parse(&stdout, "").unwrap_err()), None);
+
+        // A rejected rate-limit event outranks the assistant message.
+        let event = json!({"type": "rate_limit_event", "rate_limit_info":
+            {"status": "rejected", "rateLimitType": "seven_day"}})
+        .to_string();
+        let stdout = format!("{event}\n{}\n{result}", assistant("rejected"));
+        let limit = limit_of(&parse(&stdout, "").unwrap_err()).cloned().unwrap();
+        assert_eq!(limit.kind.as_deref(), Some("seven_day"));
+        assert_eq!(limit.resets_at, None);
+
+        // Fractional seconds are truncated, not dropped.
+        let event = json!({"type": "rate_limit_event", "rate_limit_info":
+            {"status": "rejected", "resetsAt": 1794448200.5}})
+        .to_string();
+        let limit = limit_of(&parse(&format!("{event}\n{result}"), "").unwrap_err())
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            limit.resets_at,
+            Some(jiff::Timestamp::from_second(1794448200).unwrap())
+        );
+    }
+
+    #[test]
+    fn the_last_result_event_is_the_outcome_and_other_lines_are_ignored() {
+        let first = result_line(json!({"is_error": true, "result": "first"}));
+        let last = result_line(json!({"is_error": false, "result": "second", "result_index": 1}));
+        let stdout = format!("not json\n{first}\n[1,2]\n\n{last}\n{{\"type\":\"system\"}}\n");
+        let out = parse(&stdout, "").unwrap();
+        assert_eq!(out.result, "second");
+    }
+
+    #[test]
+    fn a_stream_without_a_result_event_is_unusable() {
+        let stdout = json!({"type": "system", "subtype": "init", "session_id": "abc"}).to_string();
+        let err = parse(&stdout, "boom\n").unwrap_err();
+        assert_eq!(err.exit_code(), 3);
+        assert!(
+            err.message().contains("no result event"),
+            "{}",
+            err.message()
+        );
+        assert!(err.message().contains("boom"), "{}", err.message());
+    }
 
     #[test]
     fn the_usage_limit_shape_matches_only_limit_failures() {
         assert!(is_usage_limit(LIMIT_MESSAGE));
         assert!(is_usage_limit(&format!("  {LIMIT_MESSAGE}\n")));
         assert!(is_usage_limit("You've hit your weekly limit"));
+        assert!(is_usage_limit(FABLE_MESSAGE));
+        assert!(!is_usage_limit("You've reached your destination"));
         assert!(is_usage_limit(
             "Claude usage limit reached. Try again later."
         ));
@@ -1070,6 +1321,7 @@ mod tests {
     #[test]
     fn a_usage_limit_failure_is_limited_and_keeps_its_session() {
         let stdout = json!({
+            "type": "result",
             "is_error": true,
             "session_id": "abc",
             "result": LIMIT_MESSAGE,
@@ -1086,6 +1338,7 @@ mod tests {
     #[test]
     fn a_successful_result_that_mentions_a_usage_limit_is_a_success() {
         let stdout = json!({
+            "type": "result",
             "is_error": false,
             "session_id": "abc",
             "result": "You've hit your usage limit check in the parser; fixed.",
@@ -1097,7 +1350,7 @@ mod tests {
     #[test]
     fn a_failure_without_a_result_still_carries_a_reason() {
         let err = parse(
-            r#"{"is_error":true,"session_id":"abc","result":""}"#,
+            r#"{"type":"result","is_error":true,"session_id":"abc","result":""}"#,
             "auth failed\n",
         )
         .unwrap_err();
@@ -1106,7 +1359,7 @@ mod tests {
         assert_eq!(err.session_id(), Some("abc"));
 
         let err = parse(
-            r#"{"is_error":true,"session_id":"abc","result":"","subtype":"error_max_turns","num_turns":7}"#,
+            r#"{"type":"result","is_error":true,"session_id":"abc","result":"","subtype":"error_max_turns","num_turns":7}"#,
             "",
         )
         .unwrap_err();
@@ -1123,9 +1376,14 @@ mod tests {
         let err = parse("claude: command failed", "boom\n").unwrap_err();
         assert_eq!(err.exit_code(), 3);
         assert!(err.message().contains("boom"));
-        assert_eq!(parse(r#"{"result":"hi"}"#, "").unwrap_err().exit_code(), 3);
         assert_eq!(
-            parse(r#"{"session_id":"a","result":""}"#, "")
+            parse(r#"{"type":"result","result":"hi"}"#, "")
+                .unwrap_err()
+                .exit_code(),
+            3
+        );
+        assert_eq!(
+            parse(r#"{"type":"result","session_id":"a","result":""}"#, "")
                 .unwrap_err()
                 .exit_code(),
             3

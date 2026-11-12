@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+- **Usage limits are recognised from Claude Code's structured error.** A
+  one-shot Claude turn now runs with `--output-format stream-json
+  --verbose`, and a failed result carrying `api_error_status: 429` is a usage
+  limit whatever its message says. The Fable-quota refusal (`You've reached
+  your Fable limit…`), which ended as an ordinary failure (exit 1) with no
+  hand-off, is now continued on another account. The message match remains
+  as a fallback for older Claude Code builds and also accepts that wording.
+  A failed turn's end record now shows the structured error fields.
+- **A refused subscription account is flagged per quota and skipped by every
+  host until the quota resets.** A limited profile turn records an exhausted
+  flag on the quota that refused it — the 5-hour window, the weekly general
+  quota or the weekly Fable quota — with the provider's reset time, in
+  `<state home>/ccc/limits/<profile>.json`, and publishes it on the bus.
+  Selection, on this host and every host reading the bus, treats a profile
+  flagged for a quota the model draws on as unable to take the turn, so an API
+  key takes it when one is in budget; with the broker down the flags still
+  steer the fallback to configured order. `ccc which` shows the reason.
+- With usage data unavailable (broker unreachable, daemon offline) and
+  every candidate profile flagged exhausted for the model, an in-budget API
+  key takes the turn. In 0.5.1 no key was considered whenever usage data
+  was unavailable and there was a candidate profile; that still holds when
+  some candidate is unflagged.
+- **`ccc budget clear` takes a profile**, lifting all of its flags on every
+  host, and `ccc budget` lists each profile's flags (`profiles` in `--json`).
+- Every selection now makes the account read on the bus when a key or a
+  profile is configured, where before only a selection that reached the keys
+  did.
+- With `[bus] enabled = true`, a `[claude] profiles` name that is not
+  topic-safe (letters, digits, `.`, `_`, `-`) is refused at config load,
+  since the profile's flags are published under its name. A config valid in
+  0.5.1 with the bus on and such a name must rename the profile.
+- Requires `claude-usage-mqtt` 0.4.0, whose bus records carry per-quota
+  exhausted flags.
+
 ## 0.5.1 — 2026-11-11
 
 - **An API key now takes a turn whenever no subscription profile can.**

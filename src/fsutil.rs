@@ -6,6 +6,19 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+/// The JSON document at `path`, or `None` when there is no file. A file that
+/// does not parse is an error naming it `what`.
+pub fn load_json<T: serde::de::DeserializeOwned>(path: &Path, what: &str) -> Result<Option<T>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    serde_json::from_str(&text)
+        .map(Some)
+        .with_context(|| format!("{what} {} is damaged", path.display()))
+}
+
 /// Replaces `path` through a sibling temporary file and a rename, so a reader
 /// never sees a torn file and a kill mid-write cannot truncate the target. A
 /// new file is created 0600; an existing one keeps its mode. A `path` that is a

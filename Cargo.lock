@@ -193,9 +193,9 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "claude-usage-mqtt-client"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d62d99de085f63125268962ca5612cc8b70a8c22c3e80754929d4912fbf060b9"
+checksum = "89e2b13a0117cc77153603ee5876e7f0d93bab56bfdb718d71bedead350619bf"
 dependencies = [
  "anyhow",
  "clap",
@@ -211,9 +211,9 @@ dependencies = [
 
 [[package]]
 name = "claude-usage-mqtt-core"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a4b4aab395a2e90193f174f47e1c02d20fafb624f63efafb2762fdda1582c35"
+checksum = "6f721d192c41924eeced9ad519516217ca7940cdd5638a6753db0623764b2cce"
 dependencies = [
  "anyhow",
  "jiff",

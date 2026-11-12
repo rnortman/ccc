@@ -25,8 +25,8 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-claude-usage-mqtt-client = "0.3.0"
-claude-usage-mqtt-core = "0.3.0"
+claude-usage-mqtt-client = "0.4.0"
+claude-usage-mqtt-core = "0.4.0"
 clap = { version = "4", features = ["derive"] }
 jiff = { version = "0.2", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }

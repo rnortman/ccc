@@ -495,9 +495,10 @@ Fable work spends both weekly buckets, so it is scored by whichever runs out
 first; other work is scored against the general remainder net of what the Fable
 remainder will need, so both buckets can be spent by the end of the week. The
 reserve term is zero for an account with no Fable bucket — there is nothing to
-hold quota back for. A profile is excluded outright when its auth is not `ok`,
-its reading is stale or carried forward, or its 5-hour window is at or below
-its floor. An account above its knee with a positive score (tier 1) beats any
+hold quota back for. A profile is excluded outright when it carries an
+exhausted flag for a bucket the model draws on (see "Usage limits"), its auth
+is not `ok`, its reading is stale or carried forward, or its 5-hour window is
+at or below its floor. An account above its knee with a positive score (tier 1) beats any
 account in its 5-hour ramp or scoring zero (tier 2), however their weekly
 rates compare: running out of 5-hour window mid-session is a hard failure, an
 uneven weekly burn a soft one. Within a tier the highest score wins, ties go
@@ -555,7 +556,8 @@ missing bucket named as the reason.
 
 Nothing here can block a spawn: an unreachable broker, an offline daemon or a
 table of unusable candidates falls back to the first credentialed profile in
-`profiles` order and says so on stderr. `ccc which <type>` prints the whole
+`profiles` order with no exhausted flag for the model — the first one when
+every profile has one — and says so on stderr. `ccc which <type>` prints the whole
 table — utilisations, hours, gate, tier, score and the reason for each
 exclusion, or why a candidate is in tier 2 — and `--json` adds each profile's
 resolved floor and knee.
@@ -607,9 +609,18 @@ that can read the transcript.
 
 ### Usage limits
 
-A Claude turn that fails with Claude Code's usage-limit message
-(`You've hit your session limit · resets …`, or one naming a `usage limit`)
-is continued once on another account: `ccc` sets the limited profile aside,
+A one-shot Claude turn runs `claude -p --output-format stream-json --verbose`,
+and `ccc` reads the event lines once the child exits. A failed result
+(`is_error: true`) is a **usage limit** when it carries `api_error_status:
+429`. A result without that field — an older Claude Code — is one when its
+message starts `You've hit your` or `You've reached your` and names a limit,
+or names a `usage limit`. The provider's own account of the refusal, the
+`rejected` rate-limit object of the turn's `rate_limit_event` (or of its
+refused assistant message), gives the limit's type and reset time. The end
+record of a failed turn shows `terminal_reason`, `api_error_status`,
+`api_error` and that object in its native report.
+
+A limited turn is continued once on another account: `ccc` sets the limited profile aside,
 selects again, and when another profile wins outright it resumes the session
 there with the prompt `Your previous turn was cut off by a usage limit on
 another account. Continue from where you stopped.` That turn's result and
@@ -625,6 +636,32 @@ together, after a hand-off, with the limited turn's native report. A
 continuation that ran but whose result could not be written fails as that
 write failure, not as exit 4. Codex limits are not recognised and stay
 exit 1.
+
+**Exhausted flags.** A limited turn on a profile — run, resume, continuation
+or `--profile` alike — raises an **exhausted flag** on one of the account's
+three quotas, its **buckets**, when the refusal gave a reset time in the
+future:
+
+| Limit type | Fable model | other model |
+|---|---|---|
+| `five_hour` | `five_hour` | `five_hour` |
+| `seven_day` | `general` | `general` |
+| anything else, or none | `fable` | `general` |
+
+The flag records the time, the invocation id, the message, the reset time as
+`until` and the limit type, and expires at `until` by itself. A refusal with
+no future reset time, or one recognised only by its message, is handed off
+but flags nothing, with `<profile> was not flagged exhausted: the limit
+carried no reset time` among the warnings. Selection treats a profile flagged
+for a bucket the model draws on as unusable — `five_hour` and `general` for
+every model, `fable` for Fable models — with the reason `<bucket> exhausted
+until <until> (flagged <at>)`, ahead of anything its usage snapshot says and
+whether or not there is one: `ccc which` shows it, and its `--json` `out` is
+`five-hour-exhausted` or `weekly-exhausted`. A flag holds against a snapshot
+that disagrees: it records a refusal, the snapshot a poll. With the bus
+enabled every host honours every host's flags (see "Bus"); `ccc budget clear
+<profile>` lifts them early (see "Budget"), and `--profile` ignores them, so
+it is the way to test an account.
 
 ## API key accounts
 
@@ -678,11 +715,15 @@ the turn on that key, with no selection, no budget check and no exhausted
 check; the turn is still charged and can still raise the exhausted flag.
 Without `--profile`, a key is considered whenever no profile can take the
 turn, which means no profile is usable with a score above zero. Being set
-aside after a usage limit, having no credential, a spent weekly bucket, the
-5-hour floor, and a stale, carried-forward or missing reading all mean a
-profile cannot take it. The one exception is when the usage data is
-unavailable entirely (broker unreachable, daemon offline): then no key is
-considered and selection falls back to preference order among the profiles.
+aside after a usage limit, having no credential, an exhausted flag for a
+bucket the model draws on, a spent weekly bucket, the 5-hour floor, and a
+stale, carried-forward or missing reading all mean a profile cannot take it.
+The one exception is when the usage data is unavailable entirely (broker
+unreachable, daemon offline) and some profile has no exhausted flag for the
+model: then no key is considered and selection falls back to preference order
+among the unflagged profiles. When every profile is flagged, the flags —
+read from this host's own files whether or not the broker answers — say no
+profile can take the turn, and a key is considered as usual.
 
 Keys are tried by `weight`, highest first — the first `by_model` rule
 whose `models` match the model sets it, else the key's own `weight`, else 1 —
@@ -806,9 +847,10 @@ bus, until it is cleared.
 
 ```
 ccc budget [--json]               # every key: month, spent (all hosts and this host), budget,
-                                  # reserve, turns, unmeasured, in budget, exhausted flag
+                                  # reserve, turns, unmeasured, in budget, exhausted flag;
+                                  # then every profile's exhausted flags
 ccc budget set NAME --spent USD   # reconcile: make the all-hosts total equal USD
-ccc budget clear NAME             # clear the exhausted flag, for every reader
+ccc budget clear NAME             # clear a key's or a profile's exhausted flags, for every reader
 ```
 
 `set` writes `adjust_usd` on this host so that the total over every host
@@ -822,7 +864,34 @@ when the bus is enabled, and `clear` reports whether the publish reached the
 broker. With the bus off, or the broker unreadable, the report ends `spend:
 this host only`. `ccc budget` lists, by publisher and host, every record it
 ignored for being from another month: publishers of one key must agree on its
-`reset_tz`. With no key configured it says so and exits 0.
+`reset_tz`. With no key configured it says so, lists the profiles, and exits
+0.
+
+A profile's exhausted flags (see "Usage limits") live in one file per profile
+and host, `<state home>/ccc/limits/<profile>.json`, written under a lock
+beside it:
+
+```json
+{ "v": 1,
+  "buckets": { "fable": { "at": "2026-11-11T13:46:07Z", "session": "416f28da",
+                          "message": "You've reached your Fable limit. …",
+                          "until": "2026-11-13T04:00:00Z",
+                          "kind": "seven_day_overage_included" } },
+  "cleared_at": null, "updated_at": "2026-11-11T13:46:07Z" }
+```
+
+Every write drops the flags that have expired or been cleared. A file that
+cannot be read counts as no flags, with a warning on stderr, and the next
+flag or clear replaces it: a flag is advice, and a damaged file must not take
+a profile out of use. A file that cannot be written costs one warning on the
+turn (`could not record <profile> as exhausted: …`) and the turn's outcome
+stands. `ccc budget` lists each configured profile after the keys —
+`team01: fable exhausted since <at> until <until>: <message>`, or
+`team01: exhausted: no` — and `--json` adds `profiles`, a map from each
+profile to its flags in force by bucket. `clear` on a profile sets the file's
+`cleared_at`, lifting every bucket's flag on every host at once (there is no
+per-bucket clear), with the same one-second rule as a key; a bucket still
+exhausted refuses its next turn, which is handed off and flags it again.
 
 **What the estimate does not see**: a `ccc` killed mid-turn (its turn is not
 even counted as unmeasured), anything that spends the key without going
@@ -870,8 +939,15 @@ Per invocation `ccc` publishes, under `<prefix>/agents/<publisher>/<host>/`:
   withdrawn.
 - `account/<key>` for each API key, retained without expiry: this host's
   month-to-date figure, turns, unmeasured turns, budget, exhausted flag and
-  clear — after every charge, every flag, every `ccc budget` and every budget
+  clear — after every charge, every flag, every `ccc budget` and every account
   read.
+- `account/<profile>` for each subscription profile, retained without expiry:
+  a `subscription` record with period `-` and `usd` 0 carrying this host's
+  exhausted flags by bucket (`exhausted_buckets`) and its clear — after every
+  flag, every clear, every `ccc budget` and every account read. A host on
+  `ccc` 0.5.1 or earlier neither publishes nor honours profile flags. With
+  the bus enabled, a profile name must be topic-safe (letters, digits, `.`,
+  `_`, `-`), or the config is refused.
 
 The prompt is not published unless `prompt_chars` is set: prompts carry
 whatever the caller put in them, and a broker is a wider audience than a 0700
@@ -898,11 +974,13 @@ a line of `ccc budget`'s report.
 Nothing here can block a spawn. The connection is made in the background; a
 broker that has not answered within `connect_timeout_ms` costs one note and
 the bus is off for the rest of that process, with budgets read from this
-host's ledgers alone. A clean exit waits at most `flush_timeout_ms` for
-queued publishes. A budget read — this host's levels published first, then
-one retained read of every host's — is bounded by `[claude.selection]
-mqtt_timeout_ms` and ends on `mqtt_quiesce_ms`, and happens only when the
-selection rule lets a key be considered, or for `ccc which` and `ccc budget`.
+host's ledgers and limits files alone. A clean exit waits at most
+`flush_timeout_ms` for queued publishes. An account read — this host's levels
+for every key and profile published first, then one retained read of every
+host's — is bounded by `[claude.selection] mqtt_timeout_ms` and ends on
+`mqtt_quiesce_ms`. Every selection with a key or a profile configured makes
+one, a limit continuation included, as do `ccc which` and `ccc budget`; its
+key budgets and profile flags are resolved at the read's own clock.
 Nothing in `ccc` reads the session records yet; they are there for dashboards
 and other tools.
 

@@ -1074,6 +1074,20 @@ impl Config {
         for (name, key) in &self.claude.api_keys {
             key.validate(name, &self.claude.profiles)?;
         }
+        // With the bus on, each profile's exhausted flags are published under
+        // its name as a topic segment.
+        if self.bus.enabled {
+            if let Some(name) = self
+                .claude
+                .profiles
+                .iter()
+                .find(|p| !claude_usage_mqtt_core::is_topic_safe(p))
+            {
+                anyhow::bail!(
+                    "[claude] profiles: {name:?} is not topic-safe (letters, digits, '.', '_', '-'), which [bus] enabled = true needs: the profile's exhausted flags are published under its name"
+                );
+            }
+        }
         self.claude.selection.validate()?;
         // A typo in an override name would silently leave that account on the
         // global knobs.
@@ -2422,6 +2436,22 @@ box_ro = [\"{entry}\"]
         }
         let err = format!("{:#}", site_cfg("[bus]\ntopic = \"x\"\n").unwrap_err());
         assert!(err.contains("topic"), "{err}");
+    }
+
+    #[test]
+    fn a_profile_name_that_cannot_name_a_topic_is_refused_only_with_the_bus_on() {
+        let profiles = "[claude]\nprofiles = [\"team01\", \"rn+work\"]\n";
+        let c = site_cfg(profiles).unwrap();
+        assert_eq!(c.claude.profiles, vec!["team01", "rn+work"]);
+        let err = site_cfg(&format!("{profiles}[bus]\nenabled = true\n"))
+            .unwrap_err()
+            .root_cause()
+            .to_string();
+        assert!(
+            err.contains("[claude] profiles: \"rn+work\" is not topic-safe"),
+            "{err}"
+        );
+        site_cfg("[claude]\nprofiles = [\"team-01.a_b\"]\n[bus]\nenabled = true\n").unwrap();
     }
 
     #[test]
