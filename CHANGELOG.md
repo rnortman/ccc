@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **Fixed: a resumed or handed-off Claude turn was charged the whole
+  session's cost to date.** Claude Code's `total_cost_usd` is a running total
+  that a `claude -p --resume` process restores from its transcript, so every
+  `ccc resume` and every usage-limit hand-off continuation re-charged
+  everything the session had cost before it, on the key ledger and in the
+  bus session record's `cost_usd`. A Claude turn is now charged the sum of
+  the costs its results state for that process's own calls
+  (`model_usage_since_last_result`); a process none of whose results states
+  one is an unmeasured turn. `--json` gains `native.turn_cost_usd`, the
+  figure charged; `native.total_cost_usd` is still Claude Code's raw running
+  total. Ledgers already inflated are corrected with
+  `ccc budget set NAME --spent <console figure>`.
+
 ## 0.6.0 — 2026-11-12
 
 - **Usage limits are recognised from Claude Code's structured error.** A

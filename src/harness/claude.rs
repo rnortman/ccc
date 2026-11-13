@@ -29,9 +29,9 @@ const TOKEN_VAR: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 pub const API_KEY_VAR: &str = "ANTHROPIC_API_KEY";
 const CONFIG_DIR_VAR: &str = "CLAUDE_CONFIG_DIR";
 
-/// The field of a result, and of the native fields `parse` keeps, that
-/// carries the turn's cost in USD.
-const COST_FIELD: &str = "total_cost_usd";
+/// The native field `parse` writes with the process's cost in USD: the sum
+/// of the costs its `result` events state, or `null` when none states one.
+const COST_FIELD: &str = "turn_cost_usd";
 
 /// The cost in USD a parsed turn's native fields report, or `None` when they
 /// report none.
@@ -427,6 +427,9 @@ pub fn is_usage_limit(message: &str) -> bool {
 struct Events {
     /// The last `result` event: the turn's outcome.
     result: Option<Value>,
+    /// The sum of the costs stated by the `result` events that state one
+    /// ([`stated_cost`]), or `None` when none does.
+    cost: Option<f64>,
     /// The `rate_limit_info` of the last `rate_limit_event` whose status is
     /// `rejected`.
     rejected: Option<Value>,
@@ -445,7 +448,12 @@ impl Events {
             };
             let value = Value::Object(obj);
             match value.get("type").and_then(Value::as_str) {
-                Some("result") => ev.result = Some(value),
+                Some("result") => {
+                    if let Some(cost) = stated_cost(&value) {
+                        ev.cost = Some(ev.cost.unwrap_or(0.0) + cost);
+                    }
+                    ev.result = Some(value);
+                }
                 Some("rate_limit_event") => {
                     if let Some(info) = value.get("rate_limit_info") {
                         if is_rejected(info) {
@@ -475,6 +483,24 @@ impl Events {
     }
 }
 
+/// The cost a `result` event states for the calls its process made since its
+/// previous result: the sum of `costUSD` over `model_usage_since_last_result`.
+/// `{}` states 0; an absent field, or an entry without a numeric `costUSD` or
+/// with a negative one, states none. Claude Code states each call on at most
+/// one result, across resumes, so these sum without double counting;
+/// `total_cost_usd` is a running total that a resumed process restores from
+/// its transcript.
+fn stated_cost(result: &Value) -> Option<f64> {
+    result
+        .get("model_usage_since_last_result")?
+        .as_object()?
+        .values()
+        .try_fold(0.0, |total, entry| {
+            let cost = entry.get("costUSD")?.as_f64()?;
+            (cost.is_finite() && cost >= 0.0).then_some(total + cost)
+        })
+}
+
 fn is_rejected(info: &Value) -> bool {
     info.get("status").and_then(Value::as_str) == Some("rejected")
 }
@@ -499,7 +525,9 @@ fn limit_info(refusal: &Value) -> LimitInfo {
 // exits; a refused turn waits for any background command the agent left
 // running.
 /// Parses the event lines of one `--output-format stream-json --verbose`
-/// run. The last `result` event is the outcome. A failed result is a usage
+/// run. The last `result` event is the outcome; its raw fields are kept in
+/// `native`, beside `turn_cost_usd`, the cost every result of the process
+/// stated. A failed result is a usage
 /// limit when it carries `api_error_status` 429 or its message reads as one
 /// ([`is_usage_limit`]); the limit names the provider's refusal when the
 /// stream reported one.
@@ -524,7 +552,8 @@ fn parse(stdout: &str, stderr: &str) -> Result<Outcome, HarnessError> {
         .to_string();
     let native = json!({
         "num_turns": value.get("num_turns"),
-        COST_FIELD: value.get(COST_FIELD),
+        COST_FIELD: events.cost,
+        "total_cost_usd": value.get("total_cost_usd"),
         "duration_ms": value.get("duration_ms"),
         "modelUsage": value.get("modelUsage"),
         "terminal_reason": value.get("terminal_reason"),
@@ -1106,7 +1135,7 @@ mod tests {
 
     #[test]
     fn reported_cost_reads_a_refused_result_and_is_none_without_one() {
-        let refused = r#"{"type":"result","is_error":true,"result":"no","session_id":"9f22dd1b-1111-2222-3333-444455556666","total_cost_usd":0.5}"#;
+        let refused = r#"{"type":"result","is_error":true,"result":"no","session_id":"9f22dd1b-1111-2222-3333-444455556666","total_cost_usd":0.5,"model_usage_since_last_result":{"m":{"costUSD":0.5}}}"#;
         let err = parse(refused, "").unwrap_err();
         assert_eq!(reported_cost(err.reported().unwrap().1), Some(0.5));
         let free = r#"{"type":"result","is_error":false,"result":"ok","session_id":"9f22dd1b-1111-2222-3333-444455556666"}"#;
@@ -1117,18 +1146,70 @@ mod tests {
     fn parses_a_successful_result() {
         let stdout = json!({"type":"result","subtype":"success","is_error":false,
             "session_id":"9f22dd1b-1111-2222-3333-444455556666","result":"PROBE-OK hello",
-            "num_turns":1,"total_cost_usd":0.0031,"duration_ms":4200,
-            "modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":10}}})
+            "num_turns":1,"total_cost_usd":4.2,"duration_ms":4200,
+            "modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":10,"costUSD":4.2}},
+            "model_usage_since_last_result":{"claude-haiku-4-5-20251001":{"costUSD":0.0031}}})
         .to_string();
         let stdout = stdout.as_str();
         let out = parse(stdout, "").unwrap();
         assert_eq!(out.session_id, "9f22dd1b-1111-2222-3333-444455556666");
         assert_eq!(out.result, "PROBE-OK hello");
-        assert_eq!(out.native["total_cost_usd"], json!(0.0031));
+        assert_eq!(out.native["turn_cost_usd"], json!(0.0031));
         assert_eq!(reported_cost(&out.native), Some(0.0031));
+        assert_eq!(out.native["total_cost_usd"], json!(4.2));
         assert!(out.native["modelUsage"]
             .get("claude-haiku-4-5-20251001")
             .is_some());
+    }
+
+    #[test]
+    fn the_stated_cost_sums_models_and_reads_an_empty_object_as_zero() {
+        let two = result_line(json!({"is_error": false, "result": "ok",
+            "model_usage_since_last_result": {"a": {"costUSD": 0.25}, "b": {"costUSD": 0.5}}}));
+        assert_eq!(reported_cost(&parse(&two, "").unwrap().native), Some(0.75));
+        let empty = result_line(json!({"is_error": false, "result": "ok",
+            "total_cost_usd": 3.0, "model_usage_since_last_result": {}}));
+        assert_eq!(reported_cost(&parse(&empty, "").unwrap().native), Some(0.0));
+    }
+
+    #[test]
+    fn a_result_without_a_stated_cost_reports_none() {
+        let absent = result_line(json!({"is_error": false, "result": "ok", "total_cost_usd": 0.4}));
+        let out = parse(&absent, "").unwrap();
+        assert_eq!(out.native["turn_cost_usd"], Value::Null);
+        assert_eq!(reported_cost(&out.native), None);
+        assert_eq!(out.native["total_cost_usd"], json!(0.4));
+        let partial = result_line(json!({"is_error": false, "result": "ok",
+            "model_usage_since_last_result": {"a": {"costUSD": 0.1}, "b": {"inputTokens": 3}}}));
+        assert_eq!(reported_cost(&parse(&partial, "").unwrap().native), None);
+        let negative = result_line(json!({"is_error": false, "result": "ok",
+            "model_usage_since_last_result": {"a": {"costUSD": 0.5}, "b": {"costUSD": -0.3}}}));
+        assert_eq!(reported_cost(&parse(&negative, "").unwrap().native), None);
+    }
+
+    #[test]
+    fn every_result_of_a_process_is_summed_and_the_last_is_passed_through() {
+        let first = result_line(json!({"is_error": false, "result": "one",
+            "total_cost_usd": 7.02, "model_usage_since_last_result": {"m": {"costUSD": 0.02}}}));
+        let second = result_line(json!({"is_error": false, "result": "two",
+            "total_cost_usd": 7.05, "model_usage_since_last_result": {"m": {"costUSD": 0.03}},
+            "modelUsage": {"m": {"costUSD": 7.05}}}));
+        let out = parse(&format!("{first}\n{second}\n"), "").unwrap();
+        assert_eq!(out.result, "two");
+        let cost = reported_cost(&out.native).unwrap();
+        assert!((cost - 0.05).abs() < 1e-12, "{cost}");
+        assert_eq!(out.native["total_cost_usd"], json!(7.05));
+        assert_eq!(out.native["modelUsage"]["m"]["costUSD"], json!(7.05));
+    }
+
+    #[test]
+    fn a_result_stating_no_cost_adds_nothing_to_one_that_does() {
+        let first = result_line(json!({"is_error": false, "result": "one",
+            "model_usage_since_last_result": {"m": {"costUSD": 0.02}}}));
+        let second =
+            result_line(json!({"is_error": false, "result": "two", "total_cost_usd": 9.0}));
+        let out = parse(&format!("{first}\n{second}\n"), "").unwrap();
+        assert_eq!(reported_cost(&out.native), Some(0.02));
     }
 
     #[test]
@@ -1169,6 +1250,7 @@ mod tests {
             Some("2026-11-13T04:00:00Z".parse().unwrap())
         );
         let native = err.reported().unwrap().1;
+        assert_eq!(reported_cost(native), Some(0.0));
         assert_eq!(native["api_error_status"], json!(429));
         assert_eq!(native["api_error"], json!("model_requires_usage_credits"));
         assert_eq!(native["terminal_reason"], json!("api_error"));
@@ -1186,6 +1268,8 @@ mod tests {
         assert_eq!(out.result, "hi");
         let cost = reported_cost(&out.native).unwrap();
         assert!((cost - 0.0275102).abs() < 1e-12, "{cost}");
+        assert!(out.native["total_cost_usd"].is_number());
+        assert!(out.native["modelUsage"].is_object());
         assert_eq!(out.native["terminal_reason"], json!("completed"));
         assert_eq!(out.native["api_error_status"], Value::Null);
         // Its `allowed_warning` rate-limit event is not a refusal.

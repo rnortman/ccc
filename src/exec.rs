@@ -1811,7 +1811,8 @@ fn drive_with_meta_report(
 /// Runs the built invocation under the supervisor and parses its result.
 /// Returns the result together with the cost the harness reported for the
 /// turn, `None` when it reported none: a child that never started or was
-/// terminated, or a result without `total_cost_usd`. The cost is read before
+/// terminated, or a process none of whose results stated a cost in
+/// `model_usage_since_last_result`. The cost is read before
 /// a prompt shortfall discards a successful result, because that turn was
 /// billed.
 #[allow(clippy::too_many_arguments)]
@@ -3142,9 +3143,9 @@ mod tests {
         }
     }
 
-    const OK_RESULT: &str = r#"{"type":"result","session_id":"9f22dd1b-aaaa","result":"the answer","is_error":false,"num_turns":1,"total_cost_usd":0.01}"#;
+    const OK_RESULT: &str = r#"{"type":"result","session_id":"9f22dd1b-aaaa","result":"the answer","is_error":false,"num_turns":1,"total_cost_usd":0.01,"model_usage_since_last_result":{"claude-sonnet-5-5":{"costUSD":0.01}}}"#;
 
-    const FORK_RESULT: &str = r#"{"type":"result","session_id":"fork-1111","result":"forked answer","is_error":false,"num_turns":1,"total_cost_usd":0.01}"#;
+    const FORK_RESULT: &str = r#"{"type":"result","session_id":"fork-1111","result":"forked answer","is_error":false,"num_turns":1,"total_cost_usd":0.01,"model_usage_since_last_result":{"claude-sonnet-5-5":{"costUSD":0.01}}}"#;
 
     /// Writes a sidecar for `id` recorded an hour ago and returns its text, so
     /// a test can check the parent of a fork is left byte-identical.
@@ -3841,6 +3842,21 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_key_turn_with_a_running_total_but_no_stated_cost_is_counted_unmeasured() {
+        let _lock = test_io_lock();
+        let mut f = Fixture::new("run-api-key-total-only");
+        api_key(&mut f, "team");
+        f.claude_script(r#"{"type":"result","session_id":"9f22dd1b-aaaa","result":"the answer","is_error":false,"num_turns":1,"total_cost_usd":0.01}"#);
+        assert_eq!(pinned_run(&f, "team"), 0);
+        let ledger = key_ledger(&f, "team").unwrap();
+        assert_eq!(
+            (ledger.usd, ledger.turns, ledger.unmeasured_turns),
+            (0.0, 1, 1)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_terminated_key_turn_is_counted_unmeasured() {
         let _signal_lock = PROCESS_SIGNAL_TEST_LOCK
             .lock()
@@ -3921,6 +3937,7 @@ mod tests {
             "is_error": true,
             "num_turns": 1,
             "total_cost_usd": 0.0,
+            "model_usage_since_last_result": {},
         })
         .to_string()
     }
@@ -3960,6 +3977,7 @@ mod tests {
             "api_error_status": 429,
             "num_turns": 1,
             "total_cost_usd": 0.0,
+            "model_usage_since_last_result": {},
         })
         .to_string()
     }
@@ -7742,6 +7760,7 @@ mod tests {
             "is_error": true,
             "num_turns": 1,
             "total_cost_usd": 0.25,
+            "model_usage_since_last_result": {"claude-sonnet-5-5": {"costUSD": 0.25}},
         })
         .to_string();
         claude_turns(&mut f, &[limited_with_cost, OK_RESULT.to_string()]);
@@ -7776,6 +7795,107 @@ mod tests {
             .calls()
             .iter()
             .any(|c| matches!(c, crate::bus::Recorded::Fetch(levels) if levels.len() == 2)));
+    }
+
+    /// A result of a resumed process: Claude Code's running total carries
+    /// the session's earlier 5.00, and the process states only its own 0.01.
+    const RESUMED_RESULT: &str = r#"{"type":"result","session_id":"9f22dd1b-aaaa","result":"the answer","is_error":false,"num_turns":1,"total_cost_usd":5.01,"model_usage_since_last_result":{"claude-sonnet-5-5":{"costUSD":0.01}}}"#;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_resumed_key_turn_is_charged_only_what_its_process_states() {
+        let _lock = test_io_lock();
+        let mut f = Fixture::new("resume-key-stated-cost");
+        api_key(&mut f, "team");
+        claude_turns(&mut f, &[OK_RESULT.to_string(), RESUMED_RESULT.to_string()]);
+        assert_eq!(pinned_run(&f, "team"), 0);
+
+        let start = StartPayload {
+            pid: std::process::id(),
+            cmd: AuditCommand::Run,
+            agent: Some("explorer".into()),
+            session: None,
+            cwd_arg: Some(f.work()),
+            profile_arg: None,
+            harness_arg: None,
+            json: false,
+            prompt_source: Some(PromptSource::Arg),
+            prompt_file: None,
+            prompt: Some("again".into()),
+            passthrough: vec![],
+            fork: false,
+        };
+        let bus =
+            crate::bus::RecordingBus::new("ccc", "atlas", crate::bus::Remote::Records(vec![]));
+        let live = Live::new(
+            bus.identity(),
+            f.audit.lineage(),
+            &start,
+            "/cfg/agents.toml",
+            0,
+            f.now,
+        );
+        let usage = || UsageSource::Unavailable("not consulted".into());
+        let accounts = || crate::budget::bus_accounts(&f.cfg, &f.env, f.now, &bus);
+        let ctx = f.ctx_with_bus(&usage, &accounts, &bus, &live);
+        let mut out: Vec<u8> = Vec::new();
+        let completion = resume_with(
+            &ctx,
+            "9f22dd1b-aaaa",
+            false,
+            Some("team"),
+            "again".to_string(),
+            false,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(completion, 0);
+
+        let ledger = key_ledger(&f, "team").unwrap();
+        assert!((ledger.usd - 0.02).abs() < 1e-9, "{}", ledger.usd);
+        assert_eq!((ledger.turns, ledger.unmeasured_turns), (2, 0));
+        let (_, last) = bus.sessions().pop().unwrap();
+        assert_eq!(last.cost_usd, Some(0.01));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hand_off_charges_the_key_only_what_the_continuation_states() {
+        let _lock = test_io_lock();
+        let mut f = Fixture::new("run-bus-handoff-stated");
+        f.cfg.claude.profiles = vec!["team03".into()];
+        f.token("team03");
+        api_key(&mut f, "team");
+        let limited = serde_json::json!({
+            "type": "result",
+            "session_id": "9f22dd1b-aaaa",
+            "result": LIMITED_MESSAGE,
+            "is_error": true,
+            "num_turns": 1,
+            "total_cost_usd": 0.25,
+            "model_usage_since_last_result": {"claude-sonnet-5-5": {"costUSD": 0.25}},
+        })
+        .to_string();
+        let continued = serde_json::json!({
+            "type": "result",
+            "session_id": "9f22dd1b-aaaa",
+            "result": "the answer",
+            "is_error": false,
+            "num_turns": 1,
+            "total_cost_usd": 7.26,
+            "model_usage_since_last_result": {"claude-sonnet-5-5": {"costUSD": 0.01}},
+        })
+        .to_string();
+        claude_turns(&mut f, &[limited, continued]);
+        let usage = || report(vec![snapshot(Timestamp::now(), "team03", 0.0, 10.0)]);
+        let (completion, bus) = bus_run(&f, None, &usage, vec![]);
+        assert_eq!(completion, 0);
+        let ledger = key_ledger(&f, "team").unwrap();
+        assert!((ledger.usd - 0.01).abs() < 1e-9, "{}", ledger.usd);
+        assert_eq!((ledger.turns, ledger.unmeasured_turns), (1, 0));
+        let (_, ended) = bus.sessions().pop().unwrap();
+        let cost = ended.cost_usd.unwrap();
+        assert!((cost - 0.26).abs() < 1e-9, "{cost}");
     }
 
     #[cfg(unix)]
@@ -12033,7 +12153,7 @@ mod tests {
         f.token("team03");
         f.cfg.claude.profiles = vec!["team03".into()];
         let script = f.path("fake-claude");
-        f.write_executable(&script, "#!/bin/sh\npreset=\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--session-id\" ]; then preset=\"$2\"; fi\n  shift\ndone\nprintf '{\"type\":\"result\",\"session_id\":\"%s\",\"result\":\"the answer\",\"is_error\":false,\"num_turns\":1,\"total_cost_usd\":0.01}' \"$preset\"\n");
+        f.write_executable(&script, "#!/bin/sh\npreset=\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--session-id\" ]; then preset=\"$2\"; fi\n  shift\ndone\nprintf '{\"type\":\"result\",\"session_id\":\"%s\",\"result\":\"the answer\",\"is_error\":false,\"num_turns\":1,\"total_cost_usd\":0.01,\"model_usage_since_last_result\":{\"m\":{\"costUSD\":0.01}}}' \"$preset\"\n");
         f.env
             .insert("CCC_CLAUDE_BIN".into(), script.display().to_string());
         let cfg = f.cfg.clone();
@@ -13503,7 +13623,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn claude_echoing_its_session(f: &mut Fixture, sleep: u32) {
         f.claude_custom_script(&format!(
-            "cat >/dev/null\nid=; prev=\nfor a in \"$@\"; do case \"$prev\" in --session-id|--resume) id=$a;; esac; prev=$a; done\nsleep {sleep}\nprintf '{{\"type\":\"result\",\"session_id\":\"%s\",\"result\":\"the answer\",\"is_error\":false,\"num_turns\":1,\"total_cost_usd\":0.01}}' \"$id\""
+            "cat >/dev/null\nid=; prev=\nfor a in \"$@\"; do case \"$prev\" in --session-id|--resume) id=$a;; esac; prev=$a; done\nsleep {sleep}\nprintf '{{\"type\":\"result\",\"session_id\":\"%s\",\"result\":\"the answer\",\"is_error\":false,\"num_turns\":1,\"total_cost_usd\":0.01,\"model_usage_since_last_result\":{{\"m\":{{\"costUSD\":0.01}}}}}}' \"$id\""
         ));
     }
 

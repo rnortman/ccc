@@ -824,13 +824,18 @@ lock beside it:
 
 `month` is the current calendar month in the key's `reset_tz`; a ledger from
 another month reads as empty, flag and clear included — that is the monthly
-refill, and nothing is scheduled. `usd` sums Claude Code's own
-`total_cost_usd` over this host's key turns this month; `adjust_usd` is the
-manual correction below; this host's figure is `usd + adjust_usd`.
+refill, and nothing is scheduled. `usd` sums, over this host's key turns
+this month, the cost Claude Code states on each result for the calls that
+process made since its previous result (`model_usage_since_last_result`);
+`adjust_usd` is the manual correction below; this host's figure is
+`usd + adjust_usd`. A resumed turn (`ccc resume`, a usage-limit hand-off) is
+charged only what that process spent, not the session's earlier cost that
+Claude Code's running `total_cost_usd` carries over.
 
 Every key turn is charged once, when it ends, whatever account picked it. A
 turn that reports no cost — the child never started, was killed (`ccc kill`,
-a signal), or printed a result without `total_cost_usd` — is charged nothing
+a signal), or printed no result stating `model_usage_since_last_result` — is
+charged nothing
 and counted in `unmeasured_turns`, so that count is a ceiling on how blind the
 estimate is. A turn whose prompt was cut short is charged what it reported.
 A ledger that cannot be read or written is a note on stderr and in the end
@@ -930,7 +935,9 @@ Per invocation `ccc` publishes, under `<prefix>/agents/<publisher>/<host>/`:
   and trace (as `parent` and `root`), harness, model, agent, account and its
   kind (`subscription` or `api-key`; absent in ambient mode and for Codex and
   Goose), cwd, pid, the harness session id once known, the turns' summed
-  `cost_usd` when they reported one, and under `meta` the command, effort,
+  `cost_usd` when they reported one (for Claude, what each process's results
+  stated in `model_usage_since_last_result`, never the session's running
+  total), and under `meta` the command, effort,
   `auth`, the agents config path, and on the end its exit code and launch
   turn count. It is republished with the new account after a usage-limit
   hand-off.

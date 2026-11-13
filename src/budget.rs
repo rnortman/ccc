@@ -31,7 +31,8 @@ pub struct Ledger {
     pub v: u32,
     /// `YYYY-MM` in the key's `reset_tz`.
     pub month: String,
-    /// The sum of the reported cost of this host's key turns this month.
+    /// The sum of the per-result costs Claude Code stated
+    /// (`model_usage_since_last_result`) for this host's key turns this month.
     pub usd: f64,
     /// Key turns charged this month, measured or not.
     pub turns: u64,
@@ -161,11 +162,11 @@ impl Ledgers {
         Ok(ledger)
     }
 
-    /// Charges one key turn: its reported cost, or nothing and one more
-    /// unmeasured turn when it reported none.
+    /// Charges one key turn: the sum of the costs its process's results
+    /// stated, or nothing and one more unmeasured turn when none stated one.
     // TODO(api-key-assumptions-unconfirmed): A3 — the charge is Claude Code's
-    // own `total_cost_usd`, which has never been compared with what the
-    // Platform bills for a key turn.
+    // own `model_usage_since_last_result` cost, which has never been compared
+    // with what the Platform bills for a key turn.
     pub fn charge(
         &self,
         name: &str,
