@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.6.1 — 2026-11-13
+
 - **Fixed: a resumed or handed-off Claude turn was charged the whole
   session's cost to date.** Claude Code's `total_cost_usd` is a running total
   that a `claude -p --resume` process restores from its transcript, so every
