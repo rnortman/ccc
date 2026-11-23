@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.6.2 — 2026-11-23
+
 - **Fixed: a Claude subagent waiting on a background agent was cut off after
   ten minutes.** A one-shot Claude subagent that started a background agent
   and ended its turn to wait for it was stopped by Claude Code's print-mode
