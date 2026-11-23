@@ -465,6 +465,15 @@ inert in this mode, but a `[claude.selection.profile.<name>]` table is still
 refused, as it is for any name not in `profiles`. `--profile NAME` works as
 below.
 
+Whatever the account, a one-shot Claude child (`ccc run`, `ccc resume`) runs
+with `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`, so Claude Code does not stop a
+subagent's background tasks ten minutes after its last turn; `ccc`
+overwrites an inherited value. A `ccc launch` session does not get it. The
+child then waits for every background task it left running, including a
+background shell or monitor with no deadline of its own (a shell has none
+when Claude Code's background deadlines are turned off), so such a task keeps
+`ccc run` from returning until it ends or `ccc kill` stops the child.
+
 A non-empty `profiles` list turns on everything that follows. With a profile,
 under either `auth`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and
 `CLAUDE_CODE_USE_*` are removed from the child as well, without a note. For a

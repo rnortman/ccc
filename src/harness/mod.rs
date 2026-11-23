@@ -309,6 +309,16 @@ impl Invocation {
     pub fn has_arg(&self, arg: &str) -> bool {
         self.args.iter().any(|a| a == arg)
     }
+
+    /// Every value `env_set` gives `key`, in order; duplicates are kept.
+    #[cfg(test)]
+    pub fn env_values(&self, key: &str) -> Vec<&str> {
+        self.env_set
+            .iter()
+            .filter(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+            .collect()
+    }
 }
 
 /// A successful turn.

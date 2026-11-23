@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **Fixed: a Claude subagent waiting on a background agent was cut off after
+  ten minutes.** A one-shot Claude subagent that started a background agent
+  and ended its turn to wait for it was stopped by Claude Code's print-mode
+  background-wait ceiling ten minutes later, and `ccc` reported an ordinary
+  finished turn whose work had been killed. Every one-shot Claude child now
+  runs with `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`, which disables the
+  ceiling; an inherited value is overwritten. The child now also waits for a
+  background shell or monitor with no deadline of its own, which the ceiling
+  used to stop after ten minutes; `ccc kill` stops such a child.
+
 ## 0.6.1 — 2026-11-13
 
 - **Fixed: a resumed or handed-off Claude turn was charged the whole

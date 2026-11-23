@@ -28,6 +28,17 @@ const TOKEN_VAR: &str = "CLAUDE_CODE_OAUTH_TOKEN";
 /// The environment variable that carries a Platform API key to a Claude child.
 pub const API_KEY_VAR: &str = "ANTHROPIC_API_KEY";
 const CONFIG_DIR_VAR: &str = "CLAUDE_CONFIG_DIR";
+/// Claude Code's print-mode ceiling, in milliseconds, on how long it waits
+/// after the last turn for background tasks before stopping them and
+/// exiting; `0` disables it (semantics checked against Claude Code 2.1.330).
+/// Every one-shot child gets `0`, overwriting any inherited value: ccc treats
+/// the child's exit as the end of the turn, so a ceiling would report a
+/// finished turn whose background work was killed underneath it. The ceiling
+/// is also the last-resort stop for background shells and monitors that have
+/// no deadline of their own (a shell has none when Claude Code's background
+/// deadlines are off), so at `0` a child left running one does not exit until
+/// it ends or `ccc kill` stops the child.
+const BG_WAIT_CEILING_VAR: &str = "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS";
 
 /// The native field `parse` writes with the process's cost in USD: the sum
 /// of the costs its `result` events state, or `null` when none states one.
@@ -393,10 +404,13 @@ fn build(r: &Resolved, c: &Common, d: &ClaudeDriver) -> Result<Invocation> {
     }
     args.extend(c.extra_args.iter().cloned());
 
-    let (env_set, env_remove) = match &d.account {
+    let (mut env_set, env_remove) = match &d.account {
         Some(acct) => acct.env_edits()?,
         None => ambient_env_edits(),
     };
+    if one_shot {
+        env_set.push((BG_WAIT_CEILING_VAR.into(), "0".into()));
+    }
 
     Ok(Invocation {
         program: binary_in(d.env, "CCC_CLAUDE_BIN", "claude"),
@@ -877,7 +891,48 @@ mod tests {
                 }
                 assert_eq!(i.has_arg("--settings"), !is_one_shot, "{mode:?}");
                 assert_eq!(i.args.last().map(String::as_str), Some("--extra"));
+                let expected: &[&str] = if is_one_shot { &["0"] } else { &[] };
+                assert_eq!(i.env_values(BG_WAIT_CEILING_VAR), expected, "{mode:?}");
             }
+        }
+    }
+
+    #[test]
+    fn every_account_mode_disables_the_bg_wait_ceiling_over_an_inherited_value() {
+        let dir = TempDir::new("claude-bg-ceiling");
+        dir.write_file("team03.token", "sk-ant-oat-secret\n", 0o600);
+        dir.write_file("team.key", "sk-ant-api-secret\n", 0o600);
+        let token = Account {
+            profile: "team03".into(),
+            auth: ClaudeAuth::Token,
+            token_dir: dir.path().to_path_buf(),
+            profiles_dir: PathBuf::from("/nope"),
+            key_file: None,
+        };
+        let config_dir = Account {
+            profile: "personal".into(),
+            auth: ClaudeAuth::ConfigDir,
+            token_dir: PathBuf::from("/tokens"),
+            profiles_dir: PathBuf::from("/profiles"),
+            key_file: None,
+        };
+        let key = Account::for_key(&key_config(&dir), "team", &env(&[])).unwrap();
+
+        // `build` sees only the driver's env; seeding it makes a
+        // set-if-absent `build` fail here. Overwriting the parent process's
+        // value is `Command::env` applying `env_set`, which `env_remove` would
+        // undo, hence the `env_remove` check below.
+        let e = env(&[(BG_WAIT_CEILING_VAR, "600000")]);
+        for account in [Some(token), Some(config_dir), Some(key), None] {
+            let label = format!("{:?}", account.as_ref().map(|a| a.auth));
+            let mut d = driver(&e);
+            d.account = account;
+            let i = d.build(&resolved(), &common(run_mode())).unwrap();
+            assert_eq!(i.env_values(BG_WAIT_CEILING_VAR), ["0"], "{label}");
+            assert!(
+                !i.env_remove.iter().any(|k| k == BG_WAIT_CEILING_VAR),
+                "{label}"
+            );
         }
     }
 
@@ -925,7 +980,10 @@ mod tests {
         let i = d.build(&resolved(), &common(run_mode())).unwrap();
         assert_eq!(
             i.env_set,
-            vec![(TOKEN_VAR.to_string(), "sk-ant-oat-secret".to_string())]
+            vec![
+                (TOKEN_VAR.to_string(), "sk-ant-oat-secret".to_string()),
+                (BG_WAIT_CEILING_VAR.to_string(), "0".to_string()),
+            ]
         );
         assert!(i.env_remove.contains(&CONFIG_DIR_VAR.to_string()));
         for var in TOKEN_CONFLICTS {
@@ -953,7 +1011,10 @@ mod tests {
             let i = d.build(&resolved(), &common(run_mode())).unwrap();
             assert_eq!(
                 i.env_set,
-                vec![(TOKEN_VAR.to_string(), "secret".to_string())]
+                vec![
+                    (TOKEN_VAR.to_string(), "secret".to_string()),
+                    (BG_WAIT_CEILING_VAR.to_string(), "0".to_string()),
+                ]
             );
             assert!(i.env_remove.contains(&var.to_string()), "{var}");
         }
