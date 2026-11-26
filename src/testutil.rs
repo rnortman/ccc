@@ -50,6 +50,7 @@ impl Drop for TempDir {
 /// The `ccc` binary beside this test executable. `cargo test` builds it
 /// because `tests/cli_binary.rs` is an integration-test target;
 /// `cargo test --bin ccc` selects no integration test and does not.
+// TODO(stale-binary-after-package): nothing here checks that the binary was built from the working tree; see TODO.md.
 #[cfg(target_os = "linux")]
 pub fn ccc_binary() -> PathBuf {
     let binary = std::env::current_exe()

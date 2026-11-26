@@ -681,20 +681,25 @@ impl Recorder {
         }
     }
 
+    /// This invocation's turns; an unreadable trace is reported and read as
+    /// none.
     pub fn turns(&self) -> Vec<Turn> {
-        match read_trace(&self.dir, &self.lineage.trace_id) {
-            Ok(records) => records
-                .into_iter()
-                .filter_map(|r| match r {
-                    Record::Turn(t) if t.inv == self.lineage.invocation_id => Some(t),
-                    _ => None,
-                })
-                .collect(),
-            Err(e) => {
-                crate::harness::diag(format_args!("audit trace read failed: {e:#}"));
-                Vec::new()
-            }
-        }
+        self.try_turns().unwrap_or_else(|e| {
+            crate::harness::diag(format_args!("audit trace read failed: {e:#}"));
+            Vec::new()
+        })
+    }
+
+    /// This invocation's turns, or the error that kept the trace from being
+    /// read.
+    pub fn try_turns(&self) -> Result<Vec<Turn>> {
+        Ok(read_trace(&self.dir, &self.lineage.trace_id)?
+            .into_iter()
+            .filter_map(|r| match r {
+                Record::Turn(t) if t.inv == self.lineage.invocation_id => Some(t),
+                _ => None,
+            })
+            .collect())
     }
 }
 

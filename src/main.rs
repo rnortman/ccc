@@ -228,8 +228,14 @@ struct LaunchArgs {
     fork: bool,
     #[arg(long, conflicts_with = "resume")]
     cwd: Option<String>,
+    /// Account to run on: a profile, or with --force-unbudgeted an API key
+    /// account; never chosen by selection.
     #[arg(long)]
     profile: Option<String>,
+    /// Launch on the API key account --profile names although the session's
+    /// spend is not charged to the key's budget.
+    #[arg(long, requires = "profile")]
+    force_unbudgeted: bool,
     #[arg(long, value_parser = parse_harness, conflicts_with = "resume", requires = "agent")]
     harness: Option<Harness>,
     /// Without an agent type: model, as an alias from `[launch.aliases]` or a full model string.
@@ -383,7 +389,12 @@ fn dispatch(cli: Cli) -> Result<i32> {
         ),
         Command::Launch(mut args) => {
             let passthrough = std::mem::take(&mut args.passthrough);
-            exec::launch(launch_target(&args), args.profile.as_deref(), passthrough)
+            exec::launch(
+                launch_target(&args),
+                args.profile.as_deref(),
+                args.force_unbudgeted,
+                passthrough,
+            )
         }
         Command::GooseTools(args) => goose_tools::run(args.role, &args.policy, args.tool_wait_s),
         Command::Hook(args) => {
@@ -1618,6 +1629,78 @@ mod tests {
             }
             other => panic!("parsed as {other:?}"),
         }
+    }
+
+    #[test]
+    fn force_unbudgeted_needs_a_profile_and_reaches_every_launch_form() {
+        for argv in [
+            vec!["ccc", "launch", "--force-unbudgeted"],
+            vec!["ccc", "launch", "explorer", "--force-unbudgeted"],
+            vec!["ccc", "launch", "--resume", "ID", "--force-unbudgeted"],
+        ] {
+            let err = Cli::try_parse_from(&argv).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{argv:?}"
+            );
+        }
+        let forced = |argv: &[&str], want: exec::LaunchTarget| {
+            let Command::Launch(a) = Cli::try_parse_from(argv).unwrap().command else {
+                panic!("{argv:?} is not a launch");
+            };
+            assert!(a.force_unbudgeted, "{argv:?}");
+            assert_eq!(a.profile.as_deref(), Some("team"), "{argv:?}");
+            assert_eq!(launch_target(&a), want, "{argv:?}");
+        };
+        forced(
+            &["ccc", "launch", "--profile", "team", "--force-unbudgeted"],
+            exec::LaunchTarget::Roleless {
+                cwd: None,
+                model: None,
+                effort: None,
+            },
+        );
+        forced(
+            &[
+                "ccc",
+                "launch",
+                "explorer",
+                "--profile",
+                "team",
+                "--force-unbudgeted",
+            ],
+            exec::LaunchTarget::Fresh {
+                agent: "explorer",
+                cwd: None,
+                cli_harness: None,
+                allow_read: &[],
+                allow_write: &[],
+                allow_exec: &[],
+            },
+        );
+        for fork in [false, true] {
+            let mut argv = vec![
+                "ccc",
+                "launch",
+                "--resume",
+                "ID",
+                "--profile",
+                "team",
+                "--force-unbudgeted",
+            ];
+            if fork {
+                argv.push("--fork");
+            }
+            forced(&argv, exec::LaunchTarget::Resume { id: "ID", fork });
+        }
+        let Command::Launch(a) = Cli::try_parse_from(["ccc", "launch", "--profile", "team"])
+            .unwrap()
+            .command
+        else {
+            panic!("not a launch");
+        };
+        assert!(!a.force_unbudgeted);
     }
 
     #[test]

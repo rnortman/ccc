@@ -21,9 +21,9 @@ ccc resume <session-id | trace-prefix> [--fork] [--prompt-file F] [--profile NAM
 ccc status [--trace PREFIX] [--json]
 ccc kill   <TARGET>... [--all] [--trace PREFIX] [--now] [--grace SECS] [--no-wait] [--json]
 ccc which  <agent-type> [--harness H] [--json]
-ccc launch <agent-type> [--cwd DIR] [--profile NAME] [--harness H] [--allow-read|--allow-write|--allow-exec DIR]... [-- harness args...]
-ccc launch --resume <session-id | trace-prefix> [--fork] [--profile NAME] [-- harness args...]
-ccc launch [--cwd DIR] [--profile NAME] [--model M] [--effort E] [-- harness args...]
+ccc launch <agent-type> [--cwd DIR] [--profile NAME [--force-unbudgeted]] [--harness H] [--allow-read|--allow-write|--allow-exec DIR]... [-- harness args...]
+ccc launch --resume <session-id | trace-prefix> [--fork] [--profile NAME [--force-unbudgeted]] [-- harness args...]
+ccc launch [--cwd DIR] [--profile NAME [--force-unbudgeted]] [--model M] [--effort E] [-- harness args...]
 ccc log    [TRACE-PREFIX | --latest] [--flat] [--verbose] [--json]
 ```
 
@@ -756,11 +756,29 @@ limits") continues the session on a key when the rule holds over the profiles
 left, including in a one-profile setup; a key turn refused for spend
 continues on a profile that can take it, or ends in exit 4.
 
-`ccc launch` never uses a key: `--profile <key>` is exit 2 (`an API key
-account cannot be used at the terminal: ccc cannot see what an interactive
-session spends`), and selection for a launch does not consider keys. With
-`[claude] profiles` empty there is no selection, so a key is used only through
-`--profile`.
+`ccc launch` uses a key only when asked twice. `ccc` does not measure what
+an interactive session spends, so `--profile <key>` alone is exit 2 (`API key
+account <name> is not budgeted at the terminal: ccc does not measure what an
+interactive session spends; pass --force-unbudgeted to launch anyway`).
+`--profile <key> --force-unbudgeted` launches the session on the key, Claude
+only — an agent or recorded session on Codex or Goose is exit 2 (`API key
+account <name> cannot be used by a <harness> session`), refused before a
+resumed session's record is touched. A forced launch prints ``warning: API key
+<name> at the terminal is unbudgeted: this session's spend is not charged to
+the ledger, and no budget or exhausted check applies; correct the ledger with
+`ccc budget set` ``; the message after `warning: ` also goes in the spawn
+record's notes. When the
+session ends, each turn its Stop hook recorded is added to the key's ledger
+as an unmeasured turn — `turns` and `unmeasured_turns` rise, `usd` does not —
+stamped with the time the session ended, and the level is published; a
+ledger that cannot be written is a warning on stderr and in the end record,
+and the exit code stands. No budget or exhausted check applies, and the
+session never raises the exhausted flag: a refusal for spend shows in the
+session itself. `--force-unbudgeted` needs `--profile`, and with a profile
+that is not a key it is exit 2 (`--force-unbudgeted applies only to an API
+key account; <name> is not one`). Selection for a launch never considers
+keys. With `[claude] profiles` empty there is no selection, so a key is used
+only through `--profile`.
 
 `ccc which <type>` prints one line per key under the candidate table, in name
 order — the key's weight when it is not 1 (`api-key team weight 2: …`, with
@@ -778,7 +796,8 @@ that calls the Platform with it directly (a bare `claude`, a script, an SDK)
 spends the key without the ledger seeing it; that is the estimate's blind
 spot, and the exhausted flag and `ccc budget set` are the corrections. A
 nested `ccc` run is not such a path. With a key configured, `ccc` gives
-`ANTHROPIC_API_KEY` to a child only on a key turn, which it charges: a nested
+`ANTHROPIC_API_KEY` to a child only on a key turn, which it charges, or a
+forced `ccc launch` (see above), whose spend it does not charge: a nested
 Claude run on a profile or the ambient login has the variable removed, a
 nested run on a key overwrites it and is charged, and every Codex and Goose
 spawn — headless or `launch`, fresh or resumed — has an inherited
@@ -908,7 +927,10 @@ per-bucket clear), with the same one-second rule as a key; a bucket still
 exhausted refuses its next turn, which is handed off and flags it again.
 
 **What the estimate does not see**: a `ccc` killed mid-turn (its turn is not
-even counted as unmeasured), anything that spends the key without going
+even counted as unmeasured), a `ccc launch --force-unbudgeted` session (its
+hook-recorded turns are counted as unmeasured, its spend is not charged, and
+turns after the last Stop hook or in a session `ccc` did not outlive are not
+counted at all), anything that spends the key without going
 through `ccc` (see "Who can read the key"), another tool that spends the key
 and publishes nothing, and the gap between Claude Code's estimate and the
 bill. `reserve_usd`, the exhausted flag and `ccc budget set` are the three

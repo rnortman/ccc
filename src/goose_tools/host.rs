@@ -1248,6 +1248,7 @@ mod tests {
         assert_eq!(last["result"], "the answer", "{last}");
     }
 
+    // TODO(goose-host-test-text-file-busy): failed once with "Text file busy" when spawning the script it wrote; cause not found; see TODO.md.
     #[test]
     fn a_failing_child_is_a_tool_error_with_its_code_and_stderr() {
         let t = Tree::new("host-fail");

@@ -184,6 +184,22 @@ impl Ledgers {
         })
     }
 
+    /// Counts `turns` key turns whose spend `ccc` could not see: each adds to
+    /// `turns` and `unmeasured_turns`, and nothing to `usd`.
+    pub fn charge_unmeasured(
+        &self,
+        name: &str,
+        key: &ApiKeyConfig,
+        now: Timestamp,
+        turns: u64,
+    ) -> Result<Ledger> {
+        self.update(name, key, now, Damaged::Refuse, |ledger| {
+            ledger.turns += turns;
+            ledger.unmeasured_turns += turns;
+            Ok(())
+        })
+    }
+
     /// Records that the provider refused a key turn for spend.
     pub fn mark_exhausted(
         &self,
@@ -910,6 +926,58 @@ mod tests {
             assert_eq!(mode(&dir.path().join("budget")), 0o700);
             assert_eq!(mode(&dir.path().join("budget/team.json")), 0o600);
         }
+    }
+
+    #[test]
+    fn charge_unmeasured_counts_turns_and_leaves_usd() {
+        let dir = crate::testutil::TempDir::new("budget");
+        let l = Ledgers::at(dir.path().to_path_buf());
+        let k = key("UTC");
+        l.charge("team", &k, ts(NOW), Some(3.5)).unwrap();
+        let ledger = l.charge_unmeasured("team", &k, ts(NOW), 4).unwrap();
+        assert_eq!(
+            (
+                ledger.month.as_str(),
+                ledger.usd,
+                ledger.turns,
+                ledger.unmeasured_turns
+            ),
+            ("2026-11", 3.5, 5, 4)
+        );
+        assert_eq!(l.read("team", &k, ts(NOW)).unwrap(), ledger);
+    }
+
+    #[test]
+    fn charge_unmeasured_starts_another_month_from_empty() {
+        let dir = crate::testutil::TempDir::new("budget");
+        let l = Ledgers::at(dir.path().to_path_buf());
+        let k = key("UTC");
+        l.charge("team", &k, ts("2026-10-20T00:00:00Z"), Some(7.0))
+            .unwrap();
+        let ledger = l.charge_unmeasured("team", &k, ts(NOW), 2).unwrap();
+        assert_eq!(
+            (
+                ledger.month.as_str(),
+                ledger.usd,
+                ledger.turns,
+                ledger.unmeasured_turns
+            ),
+            ("2026-11", 0.0, 2, 2)
+        );
+    }
+
+    #[test]
+    fn charge_unmeasured_refuses_a_damaged_ledger() {
+        let dir = crate::testutil::TempDir::new("budget");
+        let l = Ledgers::at(dir.path().to_path_buf());
+        let k = key("UTC");
+        std::fs::write(dir.path().join("team.json"), "{not json").unwrap();
+        let err = l.charge_unmeasured("team", &k, ts(NOW), 1).unwrap_err();
+        assert!(format!("{err:#}").contains("damaged"), "{err:#}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("team.json")).unwrap(),
+            "{not json"
+        );
     }
 
     #[test]

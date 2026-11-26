@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **`ccc launch` can run an interactive session on an API key account, when
+  forced.** `ccc launch --profile <key>` used to be refused outright, because
+  `ccc` cannot measure what an interactive session spends. It is still
+  refused on its own, but now names the way out: add `--force-unbudgeted` and
+  the Claude session starts on the key, with a warning that its spend is not
+  charged to the key's budget and that no budget or exhausted check applies.
+  When the session ends, each turn it recorded is added to the key's ledger
+  as an unmeasured turn (the turn count rises, the dollar figure does not);
+  correct the dollar figure with `ccc budget set`. Codex and Goose sessions
+  cannot use a key, and `--force-unbudgeted` with a profile that is not a key
+  is an error. Metering an interactive session's real cost remains open work.
+
 ## 0.6.2 — 2026-11-23
 
 - **Fixed: a Claude subagent waiting on a background agent was cut off after

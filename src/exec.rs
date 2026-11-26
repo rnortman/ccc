@@ -17,7 +17,7 @@ use crate::audit::{
 };
 use crate::budget::Accounts;
 use crate::bus::{Bus, Live};
-use crate::config::{Config, Effort, EnvSource, Harness, ProcessEnv};
+use crate::config::{ApiKeyConfig, Config, Effort, EnvSource, Harness, ProcessEnv};
 use crate::harness::claude::{Account, ClaudeDriver};
 use crate::harness::codex::{self, CodexDriver};
 use crate::harness::goose::GooseDriver;
@@ -1174,11 +1174,13 @@ fn resume_turn(
 pub fn launch(
     target: LaunchTarget,
     profile: Option<&str>,
+    force_unbudgeted: bool,
     passthrough: Vec<String>,
 ) -> Result<i32> {
     launch_in(
         target,
         profile,
+        force_unbudgeted,
         passthrough,
         &ProcessEnv,
         Config::load,
@@ -1189,6 +1191,7 @@ pub fn launch(
 fn launch_in<L>(
     target: LaunchTarget,
     profile: Option<&str>,
+    force_unbudgeted: bool,
     passthrough: Vec<String>,
     env: &dyn EnvSource,
     load_config: L,
@@ -1211,7 +1214,7 @@ where
     let recorder = Recorder::new(env)?;
     let start = launch_start(target, profile, &passthrough);
     let completion = audited_with_recorder_in(recorder, start, env, load_config, |ctx| {
-        launch_with_ctx(ctx, target, profile, passthrough)
+        launch_with_ctx(ctx, target, profile, force_unbudgeted, passthrough)
     })?;
     Ok(completion.code)
 }
@@ -1259,15 +1262,36 @@ fn launch_with_ctx(
     ctx: &Ctx,
     target: LaunchTarget,
     profile: Option<&str>,
+    force_unbudgeted: bool,
     passthrough: Vec<String>,
 ) -> std::result::Result<Completion, OperationError> {
-    if profile.is_some_and(|p| ctx.cfg.claude.api_keys.contains_key(p)) {
-        // TODO(api-key-at-launch): an interactive session reports no cost, so
-        // a key spent at the terminal would bypass the budget.
-        return Err(anyhow::anyhow!(
-            "an API key account cannot be used at the terminal: ccc cannot see what an interactive session spends"
-        )
-        .into());
+    let key = profile.and_then(|p| ctx.cfg.claude.api_keys.get_key_value(p));
+    match (key, force_unbudgeted) {
+        (Some((name, _)), false) => {
+            return Err(anyhow::anyhow!(
+                "API key account {name} is not budgeted at the terminal: ccc does not measure what an interactive session spends; pass --force-unbudgeted to launch anyway"
+            )
+            .into())
+        }
+        (None, true) => {
+            return Err(anyhow::anyhow!(
+                "--force-unbudgeted applies only to an API key account; {} is not one",
+                profile.unwrap_or_default()
+            )
+            .into())
+        }
+        _ => {}
+    }
+    let not_claude = |name: &str, harness: Harness| -> OperationError {
+        anyhow::anyhow!("API key account {name} cannot be used by a {harness} session").into()
+    };
+    if let (Some((name, _)), LaunchTarget::Resume { id, .. }) = (key, target) {
+        // Checked before the resume prologue, which locks and rewrites the
+        // record of a non-fork resume.
+        let recorded = session::load_from(&session::sessions_dir_in(ctx.env), id)?;
+        if recorded.harness != Harness::Claude {
+            return Err(not_claude(name, recorded.harness));
+        }
     }
     let terminal = ctx.at_terminal();
     let ctx = &terminal;
@@ -1320,6 +1344,16 @@ fn launch_with_ctx(
     };
     inv.env_set.extend(ctx.audit.lineage().child_env());
     let mut notes = notes;
+    if let Some((name, _)) = key {
+        if !account.as_ref().is_some_and(|a| a.key_file().is_some()) {
+            return Err(not_claude(name, r.harness));
+        }
+        let warning = format!(
+            "API key {name} at the terminal is unbudgeted: this session's spend is not charged to the ledger, and no budget or exhausted check applies; correct the ledger with `ccc budget set`"
+        );
+        diag(format!("warning: {warning}"));
+        notes.push(warning);
+    }
     if let Some(note) = withhold_api_key(ctx.cfg, ctx.env, r.harness, &mut inv) {
         diag(format!("note: {note}"));
         notes.push(note);
@@ -1379,7 +1413,13 @@ fn launch_with_ctx(
         &mut |_: &str| {},
     )?;
     let status = supervised.status;
-    let turns = ctx.audit.turns();
+    let (turns, unread) = match ctx.audit.try_turns() {
+        Ok(turns) => (turns, None),
+        Err(e) => {
+            diag(format_args!("audit trace read failed: {e:#}"));
+            (Vec::new(), Some(e))
+        }
+    };
     let last = turns.last();
     #[cfg(unix)]
     let signal = std::os::unix::process::ExitStatusExt::signal(&status);
@@ -1395,6 +1435,20 @@ fn launch_with_ctx(
     };
     report_warnings(&supervised.warnings);
     let mut warnings = supervised.warnings;
+    if let Some((name, key)) = key {
+        // TODO(api-key-at-launch): an interactive session reports no cost, so
+        // its turns are counted as unmeasured and nothing is charged.
+        let counted = match &unread {
+            None => count_unmeasured_launch_turns(ctx, name, key, turns.len()),
+            Some(e) => Err(format!(
+                "could not count the turns of the forced launch on API key {name}: {e:#}; its ledger was not updated, correct it with `ccc budget set`"
+            )),
+        };
+        if let Err(warning) = counted {
+            report_warnings(std::slice::from_ref(&warning));
+            warnings.push(warning);
+        }
+    }
     if r.harness == Harness::Goose {
         let (end, note) = goose_launch_end(expected, &turns);
         if let Some(note) = note {
@@ -1449,6 +1503,41 @@ fn launch_with_ctx(
         turns: Some(turns.len()),
     };
     Ok(Completion::new(code, end))
+}
+
+/// Adds a forced launch's `turns` to API key `name`'s ledger as unmeasured
+/// turns and publishes the level. Zero turns write nothing. The error is the
+/// warning for a ledger that could not be written.
+fn count_unmeasured_launch_turns(
+    ctx: &Ctx,
+    name: &str,
+    key: &ApiKeyConfig,
+    turns: usize,
+) -> std::result::Result<(), String> {
+    if turns == 0 {
+        return Ok(());
+    }
+    write_key_ledger(ctx, name, key, |ledgers, now| {
+        ledgers.charge_unmeasured(name, key, now, turns as u64)
+    })
+    .map_err(|e| {
+        format!("could not record {turns} unmeasured turns on API key {name}'s ledger: {e:#}")
+    })
+}
+
+/// Applies `write` to API key `name`'s ledger, stamped with the clock at the
+/// write rather than the invocation's start, so a write that comes after a
+/// month boundary lands in the month it happens in; publishes the new level
+/// when the write succeeds.
+fn write_key_ledger(
+    ctx: &Ctx,
+    name: &str,
+    key: &ApiKeyConfig,
+    write: impl FnOnce(&crate::budget::Ledgers, Timestamp) -> Result<crate::budget::Ledger>,
+) -> Result<()> {
+    let ledger = write(&crate::budget::Ledgers::in_env(ctx.env), Timestamp::now())?;
+    crate::budget::publish_level(ctx.bus, name, key, &ledger);
+    Ok(())
 }
 
 /// The session, result and turn count of a Goose launch's end record, and the
@@ -1996,15 +2085,13 @@ fn settle_key_turn(
     let Some(key) = ctx.cfg.claude.api_keys.get(name) else {
         return;
     };
-    let ledgers = crate::budget::Ledgers::in_env(ctx.env);
-    let publish =
-        |ledger: &crate::budget::Ledger| crate::budget::publish_level(ctx.bus, name, key, ledger);
-    match ledgers.charge(name, key, Timestamp::now(), cost) {
-        Ok(ledger) => publish(&ledger),
-        Err(e) => add_note(
+    if let Err(e) = write_key_ledger(ctx, name, key, |ledgers, now| {
+        ledgers.charge(name, key, now, cost)
+    }) {
+        add_note(
             result,
             format!("note: could not charge the turn to API key {name}'s ledger: {e:#}"),
-        ),
+        );
     }
     let (session_id, message, native, warnings) = match result {
         Err(HarnessError::Reported {
@@ -2032,20 +2119,21 @@ fn settle_key_turn(
         warnings: std::mem::take(warnings),
         limit: None,
     };
-    let marked = ledgers.mark_exhausted(
-        name,
-        key,
-        Timestamp::now(),
-        Some(ctx.audit.lineage().invocation_id.clone()),
-        limited.message(),
-    );
+    let marked = write_key_ledger(ctx, name, key, |ledgers, now| {
+        ledgers.mark_exhausted(
+            name,
+            key,
+            now,
+            Some(ctx.audit.lineage().invocation_id.clone()),
+            limited.message(),
+        )
+    });
     *result = Err(limited);
-    match marked {
-        Ok(ledger) => publish(&ledger),
-        Err(e) => add_note(
+    if let Err(e) = marked {
+        add_note(
             result,
             format!("note: could not record API key {name} as exhausted: {e:#}"),
-        ),
+        );
     }
 }
 
@@ -2108,9 +2196,10 @@ fn add_note(result: &mut std::result::Result<Outcome, HarnessError>, note: Strin
 
 /// With an API key account configured, removes `ANTHROPIC_API_KEY` from a
 /// Codex or Goose child, so the only child that receives it is a Claude key
-/// turn, which is charged. An `env_set` entry for the variable (Goose's
-/// `[goose.env]`) is the operator's and is kept. Returns a note when the
-/// removal was added and the variable is set and non-blank in `env`.
+/// turn: a headless one, which is charged, or a forced launch. An `env_set`
+/// entry for the variable (Goose's `[goose.env]`) is the operator's and is
+/// kept. Returns a note when the removal was added and the variable is set
+/// and non-blank in `env`.
 fn withhold_api_key(
     cfg: &Config,
     env: &dyn EnvSource,
@@ -4244,16 +4333,432 @@ mod tests {
             },
         ];
         for target in targets {
-            let err = launch_with_ctx(&f.ctx(&usage), target, Some("team"), vec![]).unwrap_err();
+            let err =
+                launch_with_ctx(&f.ctx(&usage), target, Some("team"), false, vec![]).unwrap_err();
             let message = format!("{:#}", err.error);
             assert!(
-                message.contains("an API key account cannot be used at the terminal"),
+                message.contains("API key account team is not budgeted at the terminal")
+                    && message.contains("pass --force-unbudgeted"),
                 "{message}"
             );
         }
-        assert!(!audit_records(&f)
+        assert!(!spawned(&f));
+    }
+
+    #[cfg(unix)]
+    fn spawned(f: &Fixture) -> bool {
+        audit_records(f)
             .iter()
-            .any(|r| matches!(r, audit::Record::Spawn(_))));
+            .any(|r| matches!(r, audit::Record::Spawn(_)))
+    }
+
+    #[cfg(unix)]
+    const FORCED_WARNING: &str = "API key team at the terminal is unbudgeted";
+
+    /// A forced launch of `target` on key `team` whose child records its
+    /// argv, cwd and environment, then `turns` hook turns in `session`.
+    #[cfg(unix)]
+    fn forced_launch(
+        f: &mut Fixture,
+        target: LaunchTarget,
+        session: &str,
+        turns: usize,
+    ) -> Completion {
+        let mut script = record_call_line(f);
+        for _ in 0..turns {
+            script.push('\n');
+            script.push_str(&turn_line(f, "claude", session));
+        }
+        script.push_str("\nexit 0");
+        f.launch_script(&script, false);
+        match target {
+            LaunchTarget::Resume { id, fork } => start_launch_resume(f, id, fork),
+            _ => start_launch(f),
+        }
+        let usage = || -> UsageSource { panic!("selection consulted for a forced launch") };
+        launch_with_ctx(&f.ctx(&usage), target, Some("team"), true, vec![]).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn fresh_target(cwd: &str) -> LaunchTarget<'_> {
+        LaunchTarget::Fresh {
+            agent: "explorer",
+            cwd: Some(cwd),
+            cli_harness: None,
+            allow_read: &[],
+            allow_write: &[],
+            allow_exec: &[],
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_forced_launch_runs_every_claude_form_on_the_key_and_counts_its_turns() {
+        let _lock = test_io_lock();
+        for form in ["fresh", "roleless", "resume", "fork"] {
+            let mut f = Fixture::new(&format!("launch-forced-{form}"));
+            api_key(&mut f, "team");
+            f.env
+                .insert("ANTHROPIC_API_KEY".into(), "sk-ant-inherited".into());
+            f.env.insert(
+                "CLAUDE_CONFIG_DIR".into(),
+                f.path("elsewhere").display().to_string(),
+            );
+            seed_parent(&f, "9f22dd1b-aaaa", Harness::Claude);
+            let work = f.work();
+            let (target, session) = match form {
+                "fresh" => (fresh_target(&work), "fresh-session"),
+                "roleless" => (
+                    LaunchTarget::Roleless {
+                        cwd: Some(&work),
+                        model: None,
+                        effort: None,
+                    },
+                    "roleless-session",
+                ),
+                "resume" => (
+                    LaunchTarget::Resume {
+                        id: "9f22dd1b-aaaa",
+                        fork: false,
+                    },
+                    "9f22dd1b-aaaa",
+                ),
+                _ => (
+                    LaunchTarget::Resume {
+                        id: "9f22dd1b-aaaa",
+                        fork: true,
+                    },
+                    "forked-session",
+                ),
+            };
+            let completion = forced_launch(&mut f, target, session, 2);
+            assert_eq!(completion.code, 0, "{form}");
+            assert_eq!(completion.end.turns, Some(2), "{form}");
+            record_completion(&f, completion);
+
+            let env = f.call("env");
+            assert!(
+                env.lines()
+                    .any(|l| l == "ANTHROPIC_API_KEY=sk-ant-api-team"),
+                "{form}: {env}"
+            );
+            assert!(!env.contains("sk-ant-inherited"), "{form}: {env}");
+            assert!(
+                !env.lines().any(|l| l.starts_with("CLAUDE_CONFIG_DIR=")),
+                "{form}: {env}"
+            );
+
+            let records = launch_records(&f);
+            let spawn = spawn_of(&records);
+            assert_eq!(spawn.payload.profile.as_deref(), Some("team"), "{form}");
+            assert_eq!(spawn.payload.auth, Some(ClaudeAuth::ApiKey), "{form}");
+            assert!(
+                spawn
+                    .payload
+                    .selection_notes
+                    .iter()
+                    .any(|n| n.starts_with(FORCED_WARNING) && n.contains("ccc budget set")),
+                "{form}: {:?}",
+                spawn.payload.selection_notes
+            );
+
+            let ledger = key_ledger(&f, "team").expect("ledger written");
+            assert_eq!(
+                (ledger.usd, ledger.turns, ledger.unmeasured_turns),
+                (0.0, 2, 2),
+                "{form}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_forced_launch_with_no_turn_leaves_the_ledger_alone() {
+        let _lock = test_io_lock();
+        let mut f = Fixture::new("launch-forced-no-turn");
+        api_key(&mut f, "team");
+        let work = f.work();
+        let completion = forced_launch(&mut f, fresh_target(&work), "unused", 0);
+        assert_eq!(completion.code, 0);
+        assert_eq!(completion.end.turns, Some(0));
+        assert!(!f.path("state/ccc/budget/team.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_forced_launch_whose_trace_cannot_be_read_warns_that_its_turns_went_uncounted() {
+        let _lock = test_io_lock();
+        let mut f = Fixture::new("launch-forced-unread-trace");
+        api_key(&mut f, "team");
+        let work = f.work();
+        let script = format!(
+            "{}\nprintf '{{\"t\":\"turn\",\"inv\":7}}\\n' >> \"{}/$CCC_TRACE_ID.jsonl\"\nexit 0",
+            turn_line(&f, "claude", "s"),
+            f.path("state/ccc/audit").display()
+        );
+        f.launch_script(&script, false);
+        start_launch(&f);
+        let usage = || -> UsageSource { panic!("selection consulted for a forced launch") };
+        let completion = launch_with_ctx(
+            &f.ctx(&usage),
+            fresh_target(&work),
+            Some("team"),
+            true,
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(completion.code, 0);
+        assert!(
+            warned(
+                &completion,
+                &[
+                    "could not count the turns of the forced launch on API key team",
+                    "ccc budget set"
+                ]
+            ),
+            "{:?}",
+            completion.end.warnings
+        );
+        assert!(!f.path("state/ccc/budget/team.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_forced_launch_publishes_the_level_its_turns_leave() {
+        let _lock = test_io_lock();
+        let mut f = Fixture::new("launch-forced-bus");
+        api_key(&mut f, "team");
+        let work = f.work();
+        let mut script = turn_line(&f, "claude", "s");
+        script.push('\n');
+        script.push_str(&turn_line(&f, "claude", "s"));
+        script.push_str("\nexit 0");
+        f.launch_script(&script, false);
+        start_launch(&f);
+        let bus =
+            crate::bus::RecordingBus::new("ccc", "atlas", crate::bus::Remote::Records(vec![]));
+        let usage = || -> UsageSource { panic!("selection consulted for a forced launch") };
+        let ctx = f.ctx_with_bus(&usage, &no_accounts, &bus, &OFF);
+        let completion =
+            launch_with_ctx(&ctx, fresh_target(&work), Some("team"), true, vec![]).unwrap();
+        assert_eq!(completion.code, 0);
+        let levels: Vec<_> = bus
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                crate::bus::Recorded::PutAccount(s) => Some(*s),
+                _ => None,
+            })
+            .collect();
+        let [level] = levels.as_slice() else {
+            panic!("{levels:#?}");
+        };
+        assert_eq!(level.account, "team");
+        assert_eq!(level.usd, 0.0);
+        assert_eq!((level.turns, level.unmeasured_turns), (Some(2), Some(2)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_forced_launch_warns_on_stderr_before_the_session() {
+        let mut f = Fixture::new("launch-forced-stderr");
+        f.install_cli_config();
+        let key = f.path("tokens").join("team.key");
+        std::fs::create_dir_all(f.path("tokens")).unwrap();
+        std::fs::write(&key, "sk-ant-api-team\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let config = f.path("config.toml");
+        let mut toml = std::fs::read_to_string(&config).unwrap();
+        toml.push_str(&format!(
+            "[claude.api_keys.team]\nkey_file = \"{}\"\nbudget_usd = 420.0\nmodels = [\"*\"]\n",
+            key.display()
+        ));
+        std::fs::write(&config, toml).unwrap();
+        f.launch_script("exit 0", false);
+        let work = f.work();
+        let output = f.cli(&[
+            "launch",
+            "explorer",
+            "--cwd",
+            &work,
+            "--profile",
+            "team",
+            "--force-unbudgeted",
+        ]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{stderr}");
+        assert_eq!(
+            stderr
+                .matches(&format!("warning: {FORCED_WARNING}"))
+                .count(),
+            1,
+            "{stderr}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_forced_launch_with_an_unwritable_ledger_warns_and_keeps_its_exit_code() {
+        let _lock = test_io_lock();
+        let mut f = Fixture::new("launch-forced-damaged");
+        api_key(&mut f, "team");
+        std::fs::create_dir_all(f.path("state/ccc/budget")).unwrap();
+        std::fs::write(f.path("state/ccc/budget/team.json"), "{damaged").unwrap();
+        let work = f.work();
+        let mut script = turn_line(&f, "claude", "s");
+        script.push_str("\nexit 3");
+        f.launch_script(&script, false);
+        start_launch(&f);
+        let usage = || -> UsageSource { panic!("selection consulted for a forced launch") };
+        let completion = launch_with_ctx(
+            &f.ctx(&usage),
+            fresh_target(&work),
+            Some("team"),
+            true,
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(completion.code, 3);
+        assert!(
+            warned(
+                &completion,
+                &[
+                    "could not record 1 unmeasured turns on API key team's ledger",
+                    "damaged"
+                ]
+            ),
+            "{:?}",
+            completion.end.warnings
+        );
+        assert_eq!(
+            std::fs::read_to_string(f.path("state/ccc/budget/team.json")).unwrap(),
+            "{damaged"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_forced_launch_counts_its_turns_in_the_month_it_ends_in() {
+        let _lock = test_io_lock();
+        let mut f = Fixture::new("launch-forced-month");
+        api_key(&mut f, "team");
+        let key = f.cfg.claude.api_keys["team"].clone();
+        let ledgers = crate::budget::Ledgers::in_env(&f.env);
+        let seeded = ledgers
+            .charge("team", &key, Timestamp::now(), Some(5.0))
+            .unwrap();
+        f.now = f
+            .now
+            .checked_sub(SignedDuration::from_hours(40 * 24))
+            .unwrap();
+        let work = f.work();
+        let completion = forced_launch(&mut f, fresh_target(&work), "s", 3);
+        assert_eq!(completion.code, 0);
+        let ledger = key_ledger(&f, "team").unwrap();
+        assert_eq!(ledger.month, seeded.month);
+        assert_eq!(
+            (ledger.usd, ledger.turns, ledger.unmeasured_turns),
+            (5.0, 4, 3)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn force_unbudgeted_on_a_profile_that_is_not_a_key_is_refused() {
+        let mut f = Fixture::new("launch-forced-not-key");
+        f.token("team03");
+        f.cfg.claude.profiles = vec!["team03".into()];
+        api_key(&mut f, "team");
+        f.launch_script("exit 0", false);
+        start_launch(&f);
+        let usage = || UsageSource::Unavailable("not consulted".into());
+        let work = f.work();
+        let err = launch_with_ctx(
+            &f.ctx(&usage),
+            fresh_target(&work),
+            Some("team03"),
+            true,
+            vec![],
+        )
+        .unwrap_err();
+        let message = format!("{:#}", err.error);
+        assert!(
+            message.contains(
+                "--force-unbudgeted applies only to an API key account; team03 is not one"
+            ),
+            "{message}"
+        );
+        assert!(!spawned(&f));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_forced_launch_of_a_codex_agent_is_refused() {
+        let mut f = Fixture::new("launch-forced-codex");
+        api_key(&mut f, "team");
+        f.cfg.agents.insert(
+            "explorer".into(),
+            crate::config::AgentOverrides {
+                codex_model: Some("gpt-5.6-terra".into()),
+                ..Default::default()
+            },
+        );
+        f.launch_script("exit 0", true);
+        start_launch(&f);
+        let usage = || UsageSource::Unavailable("not consulted".into());
+        let work = f.work();
+        let target = LaunchTarget::Fresh {
+            agent: "explorer",
+            cwd: Some(&work),
+            cli_harness: Some(Harness::Codex),
+            allow_read: &[],
+            allow_write: &[],
+            allow_exec: &[],
+        };
+        let err = launch_with_ctx(&f.ctx(&usage), target, Some("team"), true, vec![]).unwrap_err();
+        let message = format!("{:#}", err.error);
+        assert!(
+            message.contains("API key account team cannot be used by a codex session"),
+            "{message}"
+        );
+        assert!(!spawned(&f));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_forced_resume_of_a_codex_session_is_refused_before_the_record_is_touched() {
+        for fork in [false, true] {
+            let mut f = Fixture::new("launch-forced-codex-resume");
+            api_key(&mut f, "team");
+            let before = seed_parent(&f, "thread-parent", Harness::Codex);
+            f.launch_script("exit 0", true);
+            start_launch_resume(&f, "thread-parent", fork);
+            let usage = || UsageSource::Unavailable("not consulted".into());
+            let ctx = f.ctx(&usage);
+            let err = launch_with_ctx(
+                &ctx,
+                LaunchTarget::Resume {
+                    id: "thread-parent",
+                    fork,
+                },
+                Some("team"),
+                true,
+                vec![],
+            )
+            .unwrap_err();
+            let message = format!("{:#}", err.error);
+            assert!(
+                message.contains("API key account team cannot be used by a codex session"),
+                "fork={fork}: {message}"
+            );
+            assert!(!spawned(&f), "fork={fork}");
+            assert_eq!(sidecar_text(&f, "thread-parent"), before, "fork={fork}");
+            assert!(lock_is_free(&f, "thread-parent"), "fork={fork}");
+            drop(ctx);
+        }
     }
 
     #[cfg(unix)]
@@ -4578,6 +5083,7 @@ mod tests {
                 allow_exec: &[],
             },
             None,
+            false,
             vec![],
         )
         .unwrap();
@@ -4939,6 +5445,7 @@ mod tests {
                 allow_exec: &[],
             },
             None,
+            false,
             vec![],
         )
         .unwrap();
@@ -4977,6 +5484,7 @@ mod tests {
                 allow_exec: &[],
             },
             None,
+            false,
             vec![],
         )
         .unwrap();
@@ -5017,6 +5525,7 @@ mod tests {
                 allow_exec: &[],
             },
             None,
+            false,
             vec![],
         )
         .unwrap();
@@ -5052,6 +5561,7 @@ mod tests {
                 allow_exec: &[],
             },
             None,
+            false,
             vec![],
         )
         .unwrap();
@@ -5090,6 +5600,7 @@ mod tests {
                 allow_exec: &[],
             },
             None,
+            false,
             vec![],
         )
         .unwrap();
@@ -5120,6 +5631,7 @@ mod tests {
                 allow_exec: &[],
             },
             None,
+            false,
             vec![],
         )
         .unwrap();
@@ -9749,6 +10261,7 @@ mod tests {
                 allow_exec: &[],
             },
             None,
+            false,
             vec![],
         )
         .unwrap();
@@ -9814,7 +10327,7 @@ mod tests {
             });
             report(vec![snapshot(now, "team03", 0.0, 0.0), team04])
         };
-        let completion = launch_with_ctx(&f.ctx(&usage), target, None, passthrough).unwrap();
+        let completion = launch_with_ctx(&f.ctx(&usage), target, None, false, passthrough).unwrap();
         assert_eq!(completion.code, 0);
 
         let args: Vec<String> = std::fs::read_to_string(&argv)
@@ -9874,6 +10387,7 @@ mod tests {
                 effort: None,
             },
             None,
+            false,
             vec![],
         )
         .expect_err("a bad [launch] effort is an error");
@@ -9953,6 +10467,7 @@ mod tests {
                 allow_exec: &[],
             },
             None,
+            false,
             vec![],
         )
         .unwrap();
@@ -10002,6 +10517,7 @@ mod tests {
                 allow_exec: &[],
             },
             None,
+            false,
             vec![],
         )
         .unwrap();
@@ -10037,6 +10553,7 @@ mod tests {
                 fork: false,
             },
             None,
+            false,
             vec![],
         )
         .unwrap();
@@ -10112,6 +10629,7 @@ mod tests {
                 fork: false,
             },
             None,
+            false,
             vec!["--verbose".into()],
         )
         .unwrap();
@@ -10169,6 +10687,7 @@ mod tests {
                 fork: false,
             },
             None,
+            false,
             vec![],
         )
         .unwrap();
@@ -10208,8 +10727,14 @@ mod tests {
         let usage = claude_usage;
         let refuse = |id: &str| {
             let ctx = f.ctx(&usage);
-            launch_with_ctx(&ctx, LaunchTarget::Resume { id, fork: false }, None, vec![])
-                .unwrap_err()
+            launch_with_ctx(
+                &ctx,
+                LaunchTarget::Resume { id, fork: false },
+                None,
+                false,
+                vec![],
+            )
+            .unwrap_err()
         };
 
         let err = refuse("never-recorded");
@@ -10275,6 +10800,7 @@ mod tests {
                 fork: false,
             },
             Some("team04"),
+            false,
             vec![],
         )
         .unwrap();
@@ -10292,6 +10818,7 @@ mod tests {
                 fork: false,
             },
             Some("team05"),
+            false,
             vec![],
         )
         .unwrap_err();
@@ -10323,6 +10850,7 @@ mod tests {
                 fork: true,
             },
             None,
+            false,
             vec![],
         )
         .unwrap();
@@ -10369,6 +10897,7 @@ mod tests {
                 fork: true,
             },
             None,
+            false,
             vec![],
         )
         .unwrap();
@@ -10404,6 +10933,7 @@ mod tests {
                 fork: true,
             },
             None,
+            false,
             vec![],
         )
         .unwrap();
@@ -10443,6 +10973,7 @@ mod tests {
                 fork: true,
             },
             None,
+            false,
             vec![],
         )
         .unwrap();
@@ -10456,6 +10987,7 @@ mod tests {
                 fork: false,
             },
             None,
+            false,
             vec![],
         )
         .unwrap_err();
@@ -10482,6 +11014,7 @@ mod tests {
                 fork: true,
             },
             None,
+            false,
             vec![],
         )
         .unwrap();
@@ -12330,6 +12863,7 @@ mod tests {
                 allow_exec: &[],
             },
             None,
+            false,
             vec![],
         )
         .unwrap();
@@ -12377,6 +12911,7 @@ mod tests {
                 allow_exec: &[],
             },
             None,
+            false,
             vec![],
         )
         .unwrap();
@@ -12419,6 +12954,7 @@ mod tests {
                 allow_exec: &[],
             },
             None,
+            false,
             vec![],
         )
         .unwrap();
@@ -12851,6 +13387,7 @@ mod tests {
                 let e = launch_in(
                     LaunchTarget::Resume { id: arg, fork },
                     None,
+                    false,
                     vec![],
                     &env,
                     || panic!("configuration loaded before resolution"),
@@ -13232,6 +13769,7 @@ mod tests {
             let code = launch_in(
                 LaunchTarget::Resume { id: &token, fork },
                 None,
+                false,
                 vec![],
                 &f.env,
                 || Ok(f.cfg.clone()),
@@ -13334,6 +13872,7 @@ mod tests {
                 fork: false,
             },
             None,
+            false,
             vec![],
             &f.env,
             || Ok(f.cfg.clone()),
@@ -14365,8 +14904,8 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             start_launch(self);
             let usage = || UsageSource::Unavailable("not consulted".into());
-            let completion =
-                launch_with_ctx(&self.ctx(&usage), target, None, vec![]).map_err(|e| e.error)?;
+            let completion = launch_with_ctx(&self.ctx(&usage), target, None, false, vec![])
+                .map_err(|e| e.error)?;
             let end = completion.end.clone();
             record_completion(self, completion);
             Ok(end)
@@ -14709,6 +15248,7 @@ mod tests {
                 fork: true,
             },
             None,
+            false,
             vec![],
             &f.env,
             || Ok(f.cfg.clone()),
