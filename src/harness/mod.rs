@@ -526,6 +526,7 @@ mod tests {
     fn unusable_errors_carry_what_was_being_run() {
         use crate::agents::Sandbox;
         let r = crate::resolve::Resolved {
+            cache_ttl: None,
             agent: Some("explorer".into()),
             description: "d".into(),
             harness: Harness::Codex,
@@ -565,6 +566,7 @@ mod tests {
         i.args.push("x".repeat(5000));
         let r = RunContext::new(
             &crate::resolve::Resolved {
+                cache_ttl: None,
                 agent: Some("a".into()),
                 description: "d".into(),
                 harness: Harness::Codex,

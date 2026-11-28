@@ -226,6 +226,42 @@ impl std::fmt::Display for Effort {
     }
 }
 
+/// Claude Code's prompt-cache TTL, set in a Claude child as
+/// `CLAUDE_CODE_PROMPT_CACHE_TTL`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+pub enum CacheTtl {
+    #[serde(rename = "5m")]
+    FiveMinutes,
+    #[serde(rename = "1h")]
+    OneHour,
+}
+
+impl CacheTtl {
+    /// The value as written in config and in the environment: `5m` or `1h`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CacheTtl::FiveMinutes => "5m",
+            CacheTtl::OneHour => "1h",
+        }
+    }
+
+    /// Parses `5m` or `1h`, case-insensitive and ignoring surrounding
+    /// whitespace; anything else is an error.
+    pub fn parse(s: &str) -> Result<CacheTtl> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "5m" => Ok(CacheTtl::FiveMinutes),
+            "1h" => Ok(CacheTtl::OneHour),
+            other => anyhow::bail!("unknown cache TTL {other:?} (expected 5m or 1h)"),
+        }
+    }
+}
+
+impl std::fmt::Display for CacheTtl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// The site config and the agents config composed, with defaults applied.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -335,6 +371,8 @@ pub struct AgentOverrides {
     pub harness: Option<Harness>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// Claude only: the prompt-cache TTL, parsed at resolve time.
+    pub cache_ttl: Option<String>,
     pub codex_model: Option<String>,
     pub codex_effort: Option<String>,
     pub goose_model: Option<String>,
@@ -1738,6 +1776,41 @@ effort = "low"
         assert!(Effort::parse("lo").is_err());
         assert_eq!(Effort::parse(" XHigh ").unwrap(), Effort::XHigh);
         assert_eq!(Effort::Max.as_str(), "max");
+    }
+
+    #[test]
+    fn cache_ttl_parses_its_two_values_and_serialises_as_them() {
+        for (text, ttl) in [
+            ("5m", CacheTtl::FiveMinutes),
+            (" 5M ", CacheTtl::FiveMinutes),
+            ("1h", CacheTtl::OneHour),
+            ("\t1H\n", CacheTtl::OneHour),
+        ] {
+            assert_eq!(CacheTtl::parse(text).unwrap(), ttl, "{text:?}");
+        }
+        for bad in ["10m", "", "1hour", "5"] {
+            let err = CacheTtl::parse(bad).unwrap_err().to_string();
+            assert!(err.contains("5m") && err.contains("1h"), "{err}");
+        }
+        assert_eq!(
+            serde_json::to_string(&CacheTtl::FiveMinutes).unwrap(),
+            "\"5m\""
+        );
+        assert_eq!(serde_json::to_string(&CacheTtl::OneHour).unwrap(), "\"1h\"");
+        assert_eq!(
+            serde_json::from_str::<CacheTtl>("\"1h\"").unwrap(),
+            CacheTtl::OneHour
+        );
+        assert_eq!(CacheTtl::OneHour.to_string(), "1h");
+    }
+
+    #[test]
+    fn agent_overrides_accept_cache_ttl_and_a_blank_one_is_absent_downstream() {
+        let c =
+            agents_cfg("[agents.explorer]\ncache_ttl = \"5m\"\n[agents.\"*\"]\ncache_ttl = \"\"\n")
+                .unwrap();
+        assert_eq!(c.agents["explorer"].cache_ttl.as_deref(), Some("5m"));
+        assert_eq!(blank_to_none(c.agents["*"].cache_ttl.clone()), None);
     }
 
     #[test]

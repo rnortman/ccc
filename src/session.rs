@@ -12,7 +12,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::agents::Sandbox;
-use crate::config::{ClaudeAuth, Effort, EnvSource, Harness};
+use crate::config::{CacheTtl, ClaudeAuth, Effort, EnvSource, Harness};
 use crate::goose_policy::GoosePolicy;
 
 /// One recorded session.
@@ -25,6 +25,10 @@ pub struct SessionRecord {
     pub model: String,
     #[serde(default)]
     pub effort: Option<Effort>,
+    /// Claude only: the prompt-cache TTL a one-shot resume runs on; `None`
+    /// leaves Claude Code's own default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl: Option<CacheTtl>,
     /// The Claude profile the last turn ran under; it does not constrain the
     /// account a later resume selects.
     #[serde(default)]
@@ -138,6 +142,7 @@ mod tests {
 
     fn record() -> SessionRecord {
         SessionRecord {
+            cache_ttl: None,
             harness: Harness::Codex,
             agent: Some("explorer".into()),
             model: "gpt-5.6-luna".into(),
@@ -313,6 +318,23 @@ mod tests {
         std::fs::create_dir_all(dir.path()).unwrap();
         std::fs::write(dir.path().join("plain.json"), value.to_string()).unwrap();
         assert_eq!(load_from(dir.path(), "plain").unwrap().forked_from, None);
+    }
+
+    #[test]
+    fn cache_ttl_round_trips_and_a_sidecar_without_it_has_none() {
+        let dir = TempDir::new("sessions-cache-ttl");
+        let mut r = record();
+        r.harness = Harness::Claude;
+        r.cache_ttl = Some(CacheTtl::FiveMinutes);
+        save_in(dir.path(), "five", &r).unwrap();
+        let text = std::fs::read_to_string(dir.path().join("five.json")).unwrap();
+        assert!(text.contains("\"cache_ttl\": \"5m\""), "{text}");
+        assert_eq!(load_from(dir.path(), "five").unwrap(), r);
+
+        save_in(dir.path(), "plain", &record()).unwrap();
+        let text = std::fs::read_to_string(dir.path().join("plain.json")).unwrap();
+        assert!(!text.contains("cache_ttl"), "{text}");
+        assert_eq!(load_from(dir.path(), "plain").unwrap().cache_ttl, None);
     }
 
     #[test]

@@ -17,7 +17,7 @@ use crate::audit::{
 };
 use crate::budget::Accounts;
 use crate::bus::{Bus, Live};
-use crate::config::{ApiKeyConfig, Config, Effort, EnvSource, Harness, ProcessEnv};
+use crate::config::{ApiKeyConfig, CacheTtl, Config, Effort, EnvSource, Harness, ProcessEnv};
 use crate::harness::claude::{Account, ClaudeDriver};
 use crate::harness::codex::{self, CodexDriver};
 use crate::harness::goose::GooseDriver;
@@ -236,6 +236,10 @@ impl GooseFlags {
 }
 
 /// A one-shot turn for `agent`.
+// TODO(exec-invocation-flags): the per-invocation flags (`profile`,
+// `cli_harness`, `cache_ttl`, `goose`, …) travel as separate positionals
+// through every run, resume and launch entry point; one parameter object
+// would replace them.
 // TODO(ccc-detach): a parent whose shell tool times out before a long
 // subagent finishes needs a `--detach` / `ccc wait` pair writing the
 // output to a file; background execution covers it for now.
@@ -247,6 +251,7 @@ pub fn run(
     prompt_file: Option<&str>,
     profile: Option<&str>,
     cli_harness: Option<Harness>,
+    cache_ttl: Option<CacheTtl>,
     goose: &GooseFlags,
     as_json: bool,
 ) -> Result<i32> {
@@ -259,6 +264,7 @@ pub fn run(
         prompt_file,
         profile,
         cli_harness,
+        cache_ttl,
         goose,
         as_json,
         &ProcessEnv,
@@ -278,6 +284,7 @@ fn run_from<L>(
     prompt_file: Option<&str>,
     profile: Option<&str>,
     cli_harness: Option<Harness>,
+    cache_ttl: Option<CacheTtl>,
     as_json: bool,
     env: &dyn EnvSource,
     load_config: L,
@@ -294,6 +301,7 @@ where
         prompt_file,
         profile,
         cli_harness,
+        cache_ttl,
         &GooseFlags::default(),
         as_json,
         env,
@@ -312,6 +320,7 @@ fn run_from_report<L>(
     prompt_file: Option<&str>,
     profile: Option<&str>,
     cli_harness: Option<Harness>,
+    cache_ttl: Option<CacheTtl>,
     goose: &GooseFlags,
     as_json: bool,
     env: &dyn EnvSource,
@@ -339,6 +348,7 @@ where
         prompt: prompt_result.as_ref().ok().cloned(),
         passthrough: vec![],
         fork: false,
+        cache_ttl_arg: cache_ttl,
     };
     let completion =
         audited_with_recorder_in(
@@ -354,6 +364,7 @@ where
                     prompt,
                     profile,
                     cli_harness,
+                    cache_ttl,
                     goose,
                     as_json,
                     output,
@@ -374,6 +385,7 @@ fn run_with(
     prompt: String,
     profile: Option<&str>,
     cli_harness: Option<Harness>,
+    cache_ttl: Option<CacheTtl>,
     as_json: bool,
     out: &mut dyn Write,
 ) -> std::result::Result<Completion, OperationError> {
@@ -384,6 +396,7 @@ fn run_with(
         prompt,
         profile,
         cli_harness,
+        cache_ttl,
         &GooseFlags::default(),
         as_json,
         out,
@@ -399,12 +412,13 @@ fn run_with_report(
     prompt: String,
     profile: Option<&str>,
     cli_harness: Option<Harness>,
+    cache_ttl: Option<CacheTtl>,
     goose: &GooseFlags,
     as_json: bool,
     out: &mut dyn Write,
     report: &(dyn Fn(String) + Send + Sync),
 ) -> std::result::Result<Completion, OperationError> {
-    let prepared = prepare(ctx, agent, cwd, profile, cli_harness, goose)?;
+    let prepared = prepare(ctx, agent, cwd, profile, cli_harness, cache_ttl, goose)?;
     let Prepared {
         r,
         cwd,
@@ -637,6 +651,7 @@ fn retry_on_limit(
         session,
         false,
         AccountPick::Chosen(selected(choice)),
+        r.cache_ttl,
         LIMIT_RETRY_PROMPT.to_string(),
         as_json,
         out,
@@ -727,6 +742,7 @@ pub fn resume(
     session_id: &str,
     fork: bool,
     profile: Option<&str>,
+    cache_ttl: Option<CacheTtl>,
     positional: Option<&str>,
     prompt_file: Option<&str>,
     as_json: bool,
@@ -737,6 +753,7 @@ pub fn resume(
         session_id,
         fork,
         profile,
+        cache_ttl,
         positional,
         prompt_file,
         as_json,
@@ -753,6 +770,7 @@ fn resume_from<L>(
     session_id: &str,
     fork: bool,
     profile: Option<&str>,
+    cache_ttl: Option<CacheTtl>,
     positional: Option<&str>,
     prompt_file: Option<&str>,
     as_json: bool,
@@ -783,6 +801,7 @@ where
         prompt: prompt_result.as_ref().ok().cloned(),
         passthrough: vec![],
         fork,
+        cache_ttl_arg: cache_ttl,
     };
     let completion =
         audited_with_recorder_in(
@@ -791,7 +810,9 @@ where
             env,
             load_config,
             |ctx| match prompt_result {
-                Ok(prompt) => resume_with(ctx, session_id, fork, profile, prompt, as_json, output),
+                Ok(prompt) => resume_with(
+                    ctx, session_id, fork, profile, cache_ttl, prompt, as_json, output,
+                ),
                 Err(e) => Err(e.into()),
             },
         )?;
@@ -1013,11 +1034,13 @@ fn resume_prologue(ctx: &Ctx, id: &str, fork: bool, pick: AccountPick) -> Result
 }
 
 /// [`resume`] against an explicit context and output sink.
+#[allow(clippy::too_many_arguments)]
 fn resume_with(
     ctx: &Ctx,
     session_id: &str,
     fork: bool,
     profile: Option<&str>,
+    cache_ttl: Option<CacheTtl>,
     prompt: String,
     as_json: bool,
     out: &mut dyn Write,
@@ -1027,6 +1050,7 @@ fn resume_with(
         session_id,
         fork,
         AccountPick::Requested(profile),
+        cache_ttl,
         prompt,
         as_json,
         out,
@@ -1034,11 +1058,13 @@ fn resume_with(
 }
 
 /// Runs one resumed turn of `session_id` on the account `pick` names.
+#[allow(clippy::too_many_arguments)]
 fn resume_turn(
     ctx: &Ctx,
     session_id: &str,
     fork: bool,
     pick: AccountPick,
+    cache_ttl: Option<CacheTtl>,
     prompt: String,
     as_json: bool,
     out: &mut dyn Write,
@@ -1049,11 +1075,15 @@ fn resume_turn(
         AccountPick::Chosen(_) => Some(ALREADY_CONTINUED),
     };
     let ResumePrepared {
-        r,
+        mut r,
         account,
-        notes,
+        mut notes,
         record,
     } = resume_prologue(ctx, session_id, fork, pick)?;
+    // The flag replaces the recorded TTL for this turn only.
+    if let Some(flag) = cache_ttl {
+        override_cache_ttl(&mut r, flag, &mut notes);
+    }
 
     let common = Common {
         cwd: record.cwd.clone(),
@@ -1175,12 +1205,14 @@ pub fn launch(
     target: LaunchTarget,
     profile: Option<&str>,
     force_unbudgeted: bool,
+    cache_ttl: Option<CacheTtl>,
     passthrough: Vec<String>,
 ) -> Result<i32> {
     launch_in(
         target,
         profile,
         force_unbudgeted,
+        cache_ttl,
         passthrough,
         &ProcessEnv,
         Config::load,
@@ -1188,10 +1220,12 @@ pub fn launch(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn launch_in<L>(
     target: LaunchTarget,
     profile: Option<&str>,
     force_unbudgeted: bool,
+    cache_ttl: Option<CacheTtl>,
     passthrough: Vec<String>,
     env: &dyn EnvSource,
     load_config: L,
@@ -1212,9 +1246,16 @@ where
         other => other,
     };
     let recorder = Recorder::new(env)?;
-    let start = launch_start(target, profile, &passthrough);
+    let start = launch_start(target, profile, cache_ttl, &passthrough);
     let completion = audited_with_recorder_in(recorder, start, env, load_config, |ctx| {
-        launch_with_ctx(ctx, target, profile, force_unbudgeted, passthrough)
+        launch_with_ctx(
+            ctx,
+            target,
+            profile,
+            force_unbudgeted,
+            cache_ttl,
+            passthrough,
+        )
     })?;
     Ok(completion.code)
 }
@@ -1223,6 +1264,7 @@ where
 fn launch_start(
     target: LaunchTarget,
     profile: Option<&str>,
+    cache_ttl: Option<CacheTtl>,
     passthrough: &[String],
 ) -> StartPayload {
     let (agent, session, cwd_arg, harness_arg, fork) = match target {
@@ -1255,6 +1297,7 @@ fn launch_start(
         prompt: None,
         passthrough: passthrough.to_vec(),
         fork,
+        cache_ttl_arg: cache_ttl,
     }
 }
 
@@ -1263,6 +1306,7 @@ fn launch_with_ctx(
     target: LaunchTarget,
     profile: Option<&str>,
     force_unbudgeted: bool,
+    cache_ttl: Option<CacheTtl>,
     passthrough: Vec<String>,
 ) -> std::result::Result<Completion, OperationError> {
     let key = profile.and_then(|p| ctx.cfg.claude.api_keys.get_key_value(p));
@@ -1318,6 +1362,7 @@ fn launch_with_ctx(
                 cwd,
                 profile,
                 cli_harness,
+                None,
                 &GooseFlags {
                     allow_read: allow_read.to_vec(),
                     allow_write: allow_write.to_vec(),
@@ -1325,6 +1370,7 @@ fn launch_with_ctx(
                     nested: false,
                 },
             )?,
+            cache_ttl,
             passthrough,
         )?,
         LaunchTarget::Roleless { cwd, model, effort } => launch_invocation(
@@ -1336,10 +1382,11 @@ fn launch_with_ctx(
                 cwd,
                 profile,
             )?,
+            cache_ttl,
             passthrough,
         )?,
         LaunchTarget::Resume { id, fork } => {
-            launch_resume_invocation(ctx, id, fork, profile, passthrough)?
+            launch_resume_invocation(ctx, id, fork, profile, cache_ttl, passthrough)?
         }
     };
     inv.env_set.extend(ctx.audit.lineage().child_env());
@@ -1600,14 +1647,16 @@ fn trust_cwd(account: Option<&Account>, env: &dyn EnvSource, cwd: &Path) {
 fn launch_invocation(
     ctx: &Ctx,
     prepared: Prepared,
+    cache_ttl: Option<CacheTtl>,
     passthrough: Vec<String>,
 ) -> Result<LaunchPrepared> {
     let Prepared {
-        r,
+        mut r,
         cwd,
         account,
-        notes,
+        mut notes,
     } = prepared;
+    launch_cache_ttl(&mut r, cache_ttl, &mut notes);
 
     // Configured arguments first, then what the caller typed, so the caller's
     // copy of a repeated flag is the one the harness sees last.
@@ -1647,14 +1696,17 @@ fn launch_resume_invocation(
     id: &str,
     fork: bool,
     profile: Option<&str>,
+    cache_ttl: Option<CacheTtl>,
     passthrough: Vec<String>,
 ) -> Result<LaunchPrepared> {
     let ResumePrepared {
-        r,
+        mut r,
         account,
-        notes,
+        mut notes,
         mut record,
     } = resume_prologue(ctx, id, fork, AccountPick::Requested(profile))?;
+    // The recorded TTL governs one-shot resumes only; it stays in the record.
+    launch_cache_ttl(&mut r, cache_ttl, &mut notes);
     // Saved with the mark only once the spawn prologue has passed.
     record.opened_at_terminal |= record.harness == Harness::Goose;
     let mut extra = extra_args(ctx.cfg, r.harness);
@@ -1684,6 +1736,25 @@ fn launch_resume_invocation(
     })
 }
 
+/// Replaces the TTL of a resolution made without `--cache-ttl` by the flag's,
+/// printing and noting that the flag is ignored on a harness without one.
+fn override_cache_ttl(r: &mut Resolved, flag: CacheTtl, notes: &mut Vec<String>) {
+    let before = notes.len();
+    r.cache_ttl = resolve::cache_ttl_flag(r.harness, flag, notes);
+    for note in &notes[before..] {
+        eprintln!("note: {note}");
+    }
+}
+
+/// Gives a launch the TTL of `--cache-ttl` and nothing else: with no flag,
+/// Claude Code's own default.
+fn launch_cache_ttl(r: &mut Resolved, flag: Option<CacheTtl>, notes: &mut Vec<String>) {
+    r.cache_ttl = None;
+    if let Some(flag) = flag {
+        override_cache_ttl(r, flag, notes);
+    }
+}
+
 /// The startup every entry point shares: resolve the agent, pick a working
 /// directory, and mint a Claude account when applicable.
 fn prepare(
@@ -1692,10 +1763,11 @@ fn prepare(
     cwd: Option<&str>,
     profile: Option<&str>,
     cli_harness: Option<Harness>,
+    cache_ttl: Option<CacheTtl>,
     goose: &GooseFlags,
 ) -> Result<Prepared> {
     let def = AgentDef::load(&ctx.cfg.agents_dir_in(ctx.env), agent)?;
-    let (r, notes) = resolve::resolve(ctx.cfg, ctx.env, &def, cli_harness)?;
+    let (r, notes) = resolve::resolve(ctx.cfg, ctx.env, &def, cli_harness, cache_ttl)?;
     for note in &notes {
         eprintln!("note: {note}");
     }
@@ -2367,6 +2439,7 @@ fn spawn_payload(
         harness: r.harness,
         model: r.model.clone(),
         effort: r.effort,
+        cache_ttl: r.cache_ttl,
         profile: account.map(|a| a.profile.clone()),
         auth: account.map(|a| a.auth),
         sandbox: r.sandbox,
@@ -2697,6 +2770,7 @@ pub fn record_of(
         agent: r.agent.clone(),
         model: r.model.clone(),
         effort: r.effort,
+        cache_ttl: r.cache_ttl,
         profile: account.map(|a| a.profile.clone()),
         auth: account.map(|a| a.auth),
         cwd: cwd.to_path_buf(),
@@ -2722,6 +2796,7 @@ pub fn resolved_from(record: &SessionRecord, def: Option<&AgentDef>) -> Resolved
         harness: record.harness,
         model: record.model.clone(),
         effort: record.effort,
+        cache_ttl: record.cache_ttl,
         tools: record.tools.clone(),
         sandbox: record.sandbox,
         body: def
@@ -2876,6 +2951,7 @@ mod tests {
 
     fn resolved() -> Resolved {
         Resolved {
+            cache_ttl: None,
             agent: Some("explorer".into()),
             description: "Investigates".into(),
             harness: Harness::Claude,
@@ -3792,6 +3868,7 @@ mod tests {
                 "hi".into(),
                 Some("team"),
                 None,
+                None,
                 false,
                 &mut out,
             )
@@ -3856,6 +3933,7 @@ mod tests {
             "hi".into(),
             Some("team"),
             None,
+            None,
             false,
             &mut out,
         )
@@ -3886,6 +3964,7 @@ mod tests {
             Some(&f.work()),
             "hi".into(),
             Some(profile),
+            None,
             None,
             false,
             &mut out,
@@ -3967,6 +4046,7 @@ mod tests {
             None,
             Some("team"),
             None,
+            None,
             false,
             &f.env,
             || Ok(f.cfg.clone()),
@@ -4000,6 +4080,7 @@ mod tests {
             Some(&prompt),
             None,
             Some("team"),
+            None,
             None,
             &GooseFlags::default(),
             false,
@@ -4333,8 +4414,8 @@ mod tests {
             },
         ];
         for target in targets {
-            let err =
-                launch_with_ctx(&f.ctx(&usage), target, Some("team"), false, vec![]).unwrap_err();
+            let err = launch_with_ctx(&f.ctx(&usage), target, Some("team"), false, None, vec![])
+                .unwrap_err();
             let message = format!("{:#}", err.error);
             assert!(
                 message.contains("API key account team is not budgeted at the terminal")
@@ -4376,7 +4457,7 @@ mod tests {
             _ => start_launch(f),
         }
         let usage = || -> UsageSource { panic!("selection consulted for a forced launch") };
-        launch_with_ctx(&f.ctx(&usage), target, Some("team"), true, vec![]).unwrap()
+        launch_with_ctx(&f.ctx(&usage), target, Some("team"), true, None, vec![]).unwrap()
     }
 
     #[cfg(unix)]
@@ -4504,6 +4585,7 @@ mod tests {
             fresh_target(&work),
             Some("team"),
             true,
+            None,
             vec![],
         )
         .unwrap();
@@ -4540,7 +4622,7 @@ mod tests {
         let usage = || -> UsageSource { panic!("selection consulted for a forced launch") };
         let ctx = f.ctx_with_bus(&usage, &no_accounts, &bus, &OFF);
         let completion =
-            launch_with_ctx(&ctx, fresh_target(&work), Some("team"), true, vec![]).unwrap();
+            launch_with_ctx(&ctx, fresh_target(&work), Some("team"), true, None, vec![]).unwrap();
         assert_eq!(completion.code, 0);
         let levels: Vec<_> = bus
             .calls()
@@ -4618,6 +4700,7 @@ mod tests {
             fresh_target(&work),
             Some("team"),
             true,
+            None,
             vec![],
         )
         .unwrap();
@@ -4681,6 +4764,7 @@ mod tests {
             fresh_target(&work),
             Some("team03"),
             true,
+            None,
             vec![],
         )
         .unwrap_err();
@@ -4718,7 +4802,8 @@ mod tests {
             allow_write: &[],
             allow_exec: &[],
         };
-        let err = launch_with_ctx(&f.ctx(&usage), target, Some("team"), true, vec![]).unwrap_err();
+        let err =
+            launch_with_ctx(&f.ctx(&usage), target, Some("team"), true, None, vec![]).unwrap_err();
         let message = format!("{:#}", err.error);
         assert!(
             message.contains("API key account team cannot be used by a codex session"),
@@ -4746,6 +4831,7 @@ mod tests {
                 },
                 Some("team"),
                 true,
+                None,
                 vec![],
             )
             .unwrap_err();
@@ -4765,6 +4851,7 @@ mod tests {
     fn start_launch(f: &Fixture) {
         f.audit
             .start(StartPayload {
+                cache_ttl_arg: None,
                 pid: std::process::id(),
                 cmd: AuditCommand::Launch,
                 agent: Some("explorer".into()),
@@ -4800,6 +4887,7 @@ mod tests {
     ) {
         f.audit
             .start(StartPayload {
+                cache_ttl_arg: None,
                 pid: std::process::id(),
                 cmd: AuditCommand::Run,
                 agent: Some("explorer".into()),
@@ -4821,6 +4909,7 @@ mod tests {
     fn start_resume(f: &Fixture, session: &str) {
         f.audit
             .start(StartPayload {
+                cache_ttl_arg: None,
                 pid: std::process::id(),
                 cmd: AuditCommand::Resume,
                 agent: None,
@@ -4931,6 +5020,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             &f.env,
             || Ok(f.cfg.clone()),
@@ -4977,6 +5067,7 @@ mod tests {
             "explorer",
             Some(&f.work()),
             Some("prompt"),
+            None,
             None,
             None,
             None,
@@ -5028,6 +5119,7 @@ mod tests {
         let code = resume_from(
             "resume-session",
             false,
+            None,
             None,
             Some("prompt"),
             None,
@@ -5084,6 +5176,7 @@ mod tests {
             },
             None,
             false,
+            None,
             vec![],
         )
         .unwrap();
@@ -5140,6 +5233,7 @@ mod tests {
             "go".into(),
             None,
             None,
+            None,
             false,
             &mut out,
         )
@@ -5176,6 +5270,7 @@ mod tests {
             "explorer",
             Some(&f.work()),
             "go and look".into(),
+            None,
             None,
             None,
             false,
@@ -5305,6 +5400,7 @@ mod tests {
                 prompt.into(),
                 None,
                 None,
+                None,
                 false,
                 &mut out,
             )
@@ -5391,6 +5487,7 @@ mod tests {
                 "9f22dd1b-aaaa",
                 false,
                 None,
+                None,
                 "again".into(),
                 as_json,
                 &mut out,
@@ -5446,6 +5543,7 @@ mod tests {
             },
             None,
             false,
+            None,
             vec![],
         )
         .unwrap();
@@ -5485,6 +5583,7 @@ mod tests {
             },
             None,
             false,
+            None,
             vec![],
         )
         .unwrap();
@@ -5526,6 +5625,7 @@ mod tests {
             },
             None,
             false,
+            None,
             vec![],
         )
         .unwrap();
@@ -5562,6 +5662,7 @@ mod tests {
             },
             None,
             false,
+            None,
             vec![],
         )
         .unwrap();
@@ -5601,6 +5702,7 @@ mod tests {
             },
             None,
             false,
+            None,
             vec![],
         )
         .unwrap();
@@ -5632,6 +5734,7 @@ mod tests {
             },
             None,
             false,
+            None,
             vec![],
         )
         .unwrap();
@@ -5882,6 +5985,7 @@ mod tests {
             "9f22dd1b-aaaa",
             false,
             None,
+            None,
             "again".into(),
             true,
             &mut out,
@@ -5916,7 +6020,8 @@ mod tests {
         seed_roleless(&f, "9f22dd1b-aaaa");
         let usage = || report(vec![snapshot(Timestamp::now(), "team03", 0.0, 10.0)]);
         let ctx = f.ctx(&usage);
-        let prepared = launch_resume_invocation(&ctx, "9f22dd1b-aaaa", true, None, vec![]).unwrap();
+        let prepared =
+            launch_resume_invocation(&ctx, "9f22dd1b-aaaa", true, None, None, vec![]).unwrap();
         assert_eq!(prepared.r.agent, None);
         assert_eq!(prepared.record.agent, None);
         assert_eq!(prepared.inv.value_of("--resume"), Some("9f22dd1b-aaaa"));
@@ -5942,6 +6047,7 @@ mod tests {
             &ctx,
             "explorer",
             Some(&f.work()),
+            None,
             None,
             None,
             &GooseFlags::default(),
@@ -7285,6 +7391,7 @@ mod tests {
         let inv = recorder.lineage().invocation_id.clone();
         recorder
             .start(StartPayload {
+                cache_ttl_arg: None,
                 pid: supervisor_identity.pid,
                 cmd: audit::Command::Run,
                 agent: Some("explorer".into()),
@@ -7489,6 +7596,7 @@ mod tests {
             "go and look".to_string(),
             profile,
             None,
+            None,
             false,
             &mut out,
         )
@@ -7672,12 +7780,13 @@ mod tests {
             Some(&f.work()),
             None,
             None,
+            None,
             &GooseFlags::default(),
         )
         .unwrap();
         assert!(prepared.notes.is_empty(), "{:?}", prepared.notes);
         let LaunchPrepared { inv, account, .. } =
-            launch_invocation(&ctx, prepared, vec![]).unwrap();
+            launch_invocation(&ctx, prepared, None, vec![]).unwrap();
         assert_eq!(account, None);
         assert!(inv.env_set.is_empty(), "{inv:?}");
         for var in ["CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"] {
@@ -7756,6 +7865,7 @@ mod tests {
             Some(&f.work()),
             Some("team03"),
             None,
+            None,
             &GooseFlags::default(),
         )
         .unwrap();
@@ -7765,6 +7875,7 @@ mod tests {
             "explorer",
             Some(&f.work()),
             Some("team04"),
+            None,
             None,
             &GooseFlags::default(),
         )
@@ -7788,6 +7899,7 @@ mod tests {
             "explorer",
             Some(&f.work()),
             "go and look".to_string(),
+            None,
             None,
             None,
             false,
@@ -7828,6 +7940,7 @@ mod tests {
             "9f22dd1b-aaaa",
             false,
             None,
+            None,
             "again".into(),
             false,
             &mut out,
@@ -7867,6 +7980,7 @@ mod tests {
                 "explorer",
                 Some(&f.work()),
                 "go and look".to_string(),
+                None,
                 None,
                 None,
                 false,
@@ -7933,6 +8047,7 @@ mod tests {
             "go and look".to_string(),
             None,
             None,
+            None,
             false,
             &mut out,
         )
@@ -7966,6 +8081,7 @@ mod tests {
             "explorer",
             Some(&f.work()),
             "go and look".to_string(),
+            None,
             None,
             None,
             false,
@@ -8047,6 +8163,7 @@ mod tests {
     /// the start payload.
     fn bus_start(f: &Fixture, prompt: &str) -> StartPayload {
         let start = StartPayload {
+            cache_ttl_arg: None,
             pid: std::process::id(),
             cmd: AuditCommand::Run,
             agent: Some("explorer".into()),
@@ -8095,6 +8212,7 @@ mod tests {
             Some(&f.work()),
             "go and look".into(),
             profile,
+            None,
             None,
             false,
             &mut out,
@@ -8323,6 +8441,7 @@ mod tests {
         assert_eq!(pinned_run(&f, "team"), 0);
 
         let start = StartPayload {
+            cache_ttl_arg: None,
             pid: std::process::id(),
             cmd: AuditCommand::Run,
             agent: Some("explorer".into()),
@@ -8356,6 +8475,7 @@ mod tests {
             "9f22dd1b-aaaa",
             false,
             Some("team"),
+            None,
             "again".to_string(),
             false,
             &mut out,
@@ -8427,6 +8547,7 @@ mod tests {
             "explorer",
             Some(&f.work()),
             "go and look".into(),
+            None,
             None,
             None,
             false,
@@ -8659,16 +8780,20 @@ mod tests {
     #[test]
     fn a_limited_resume_continues_once_on_another_usable_profile() {
         let _lock = test_io_lock();
+        use CacheTtl::{FiveMinutes as M5, OneHour as H1};
         let mut f = Fixture::new("resume-limited-retry");
         f.token("team03");
         f.token("team04");
-        claude_turns(
+        write_ttl_explorer(&f, "5m");
+        let ttls = f.path("calls").join("ttl");
+        claude_turns_after(
             &mut f,
             &[
                 OK_RESULT.to_string(),
                 limited_turn("9f22dd1b-aaaa"),
                 OK_RESULT.to_string(),
             ],
+            &format!("echo \"${{{TTL_VAR}-unset}}\" >> '{}'", ttls.display()),
         );
         let (completion, _) = limited_run(&f, &two_usable_profiles, None);
         assert_eq!(completion, 0);
@@ -8680,6 +8805,7 @@ mod tests {
             "9f22dd1b-aaaa",
             false,
             None,
+            Some(H1),
             "again".to_string(),
             false,
             &mut out,
@@ -8690,6 +8816,17 @@ mod tests {
         assert!(text.contains("profile=team04"), "{text}");
         assert_eq!(f.call("prompt-2"), "again");
         assert_eq!(f.call("prompt-3"), LIMIT_RETRY_PROMPT);
+
+        // The continuation keeps the resume's flag, not the recorded TTL.
+        assert_eq!(f.call("ttl"), "5m\n1h\n1h\n");
+        let spawned: Vec<Option<CacheTtl>> = launch_records(&f)
+            .into_iter()
+            .filter_map(|r| match r {
+                audit::Record::Spawn(s) => Some(s.payload.cache_ttl),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(spawned, vec![Some(M5), Some(H1), Some(H1)]);
     }
 
     #[cfg(unix)]
@@ -8790,6 +8927,7 @@ mod tests {
             "go and look".to_string(),
             None,
             None,
+            None,
             false,
             &mut ClosedSink,
         ) {
@@ -8833,6 +8971,7 @@ mod tests {
             "9f22dd1b-aaaa",
             true,
             None,
+            None,
             "branch off".to_string(),
             false,
             &mut out,
@@ -8866,6 +9005,7 @@ mod tests {
             &ctx,
             "9f22dd1b-aaaa",
             true,
+            None,
             None,
             "branch off".to_string(),
             false,
@@ -9307,6 +9447,7 @@ mod tests {
             "go and look".to_string(),
             None,
             None,
+            None,
             false,
             &mut out,
         )
@@ -9364,6 +9505,7 @@ mod tests {
             "first".to_string(),
             None,
             None,
+            None,
             false,
             &mut out,
         )
@@ -9377,6 +9519,7 @@ mod tests {
             &ctx,
             "9f22dd1b-aaaa",
             false,
+            None,
             None,
             "again".to_string(),
             false,
@@ -9401,6 +9544,268 @@ mod tests {
         assert_eq!(second.auth, Some(ClaudeAuth::Token));
     }
 
+    const TTL_VAR: &str = "CLAUDE_CODE_PROMPT_CACHE_TTL";
+
+    /// The newest trace's start-record flag and spawn-record TTL.
+    #[cfg(unix)]
+    fn latest_cache_ttls(env: &BTreeMap<String, String>) -> (Option<CacheTtl>, Option<CacheTtl>) {
+        let records = latest_records(env);
+        let start = records
+            .iter()
+            .find_map(|r| match r {
+                audit::Record::Start(s) => Some(s.payload.cache_ttl_arg),
+                _ => None,
+            })
+            .expect("a start record");
+        let spawn = records
+            .iter()
+            .find_map(|r| match r {
+                audit::Record::Spawn(s) => Some(s.payload.cache_ttl),
+                _ => None,
+            })
+            .expect("a spawn record");
+        (start, spawn)
+    }
+
+    /// The TTL variable in the environment the fake Claude last ran with.
+    #[cfg(unix)]
+    fn child_cache_ttl(f: &Fixture) -> Option<String> {
+        f.call("env")
+            .lines()
+            .find_map(|l| l.strip_prefix("CLAUDE_CODE_PROMPT_CACHE_TTL="))
+            .map(String::from)
+    }
+
+    fn write_ttl_explorer(f: &Fixture, cache_ttl: &str) {
+        std::fs::write(
+            f.path("agents/explorer.md"),
+            format!(
+                "---\nname: explorer\ndescription: Investigates\nmodel: claude-haiku-4-5\ncache_ttl: {cache_ttl}\n---\nthe system prompt\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_run_records_its_cache_ttl_and_a_resume_flag_replaces_it_for_one_turn() {
+        use CacheTtl::{FiveMinutes as M5, OneHour as H1};
+        let mut f = Fixture::new("cache-ttl-run-resume");
+        f.token("team03");
+        f.cfg.claude.profiles = vec!["team03".into()];
+        write_ttl_explorer(&f, "5m");
+        f.claude_script(OK_RESULT);
+        let id = "9f22dd1b-aaaa";
+
+        let code = run_from(
+            "explorer",
+            Some(&f.work()),
+            Some("go"),
+            None,
+            None,
+            None,
+            None,
+            false,
+            &f.env,
+            || Ok(f.cfg.clone()),
+            &mut "".as_bytes(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(child_cache_ttl(&f).as_deref(), Some("5m"));
+        assert_eq!(latest_cache_ttls(&f.env), (None, Some(M5)));
+        let saved = || session::load_from(&f.sessions_dir(), id).unwrap().cache_ttl;
+        assert_eq!(saved(), Some(M5));
+
+        let resume = |ttl| {
+            resume_from(
+                id,
+                false,
+                None,
+                ttl,
+                Some("again"),
+                None,
+                false,
+                &f.env,
+                || Ok(f.cfg.clone()),
+                &mut "".as_bytes(),
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .unwrap()
+        };
+        assert_eq!(resume(Some(H1)), 0);
+        assert_eq!(child_cache_ttl(&f).as_deref(), Some("1h"));
+        assert_eq!(latest_cache_ttls(&f.env), (Some(H1), Some(H1)));
+        assert_eq!(saved(), Some(M5));
+
+        assert_eq!(resume(None), 0);
+        assert_eq!(child_cache_ttl(&f).as_deref(), Some("5m"));
+        assert_eq!(latest_cache_ttls(&f.env), (None, Some(M5)));
+    }
+
+    #[test]
+    fn a_resume_takes_the_recorded_cache_ttl_and_a_launch_resume_the_flag_alone() {
+        use CacheTtl::{FiveMinutes as M5, OneHour as H1};
+        let mut f = Fixture::new("cache-ttl-launch-resume");
+        f.token("team03");
+        f.cfg.claude.profiles = vec!["team03".into()];
+        let mut parent = claude_record(&f, Some("team03"), ClaudeAuth::Token);
+        parent.cache_ttl = Some(M5);
+        let id = "9f22dd1b-aaaa";
+        save_record(&f, id, &parent);
+        let usage = || report(vec![snapshot(Timestamp::now(), "team03", 0.0, 10.0)]);
+
+        // Each launch in a context of its own, so its session lock is
+        // released before the next.
+        let launch = |fork: bool, ttl: Option<CacheTtl>| {
+            let ctx = f.ctx(&usage);
+            launch_resume_invocation(&ctx, id, fork, None, ttl, vec![]).unwrap()
+        };
+
+        let p = launch(false, None);
+        assert!(p.inv.env_values(TTL_VAR).is_empty());
+        assert!(p.inv.env_remove.iter().any(|k| k == TTL_VAR));
+        assert_eq!(p.r.cache_ttl, None);
+        assert_eq!(p.record.cache_ttl, Some(M5));
+        assert_eq!(
+            session::load_from(&f.sessions_dir(), id).unwrap().cache_ttl,
+            Some(M5)
+        );
+        // A one-shot resume after it is back on the recorded value.
+        let next = prologue_account(&f, &usage, id, false, None).unwrap();
+        assert_eq!(next.r.cache_ttl, Some(M5));
+
+        let p = launch(false, Some(H1));
+        assert_eq!(p.inv.env_values(TTL_VAR), ["1h"]);
+        assert_eq!(p.record.cache_ttl, Some(M5));
+
+        // A fork's record takes the parent's value, with or without the flag.
+        let fork = prologue_account(&f, &usage, id, true, None).unwrap();
+        assert_eq!(fork.r.cache_ttl, Some(M5));
+        assert_eq!(fork.record.cache_ttl, Some(M5));
+        let p = launch(true, Some(H1));
+        assert_eq!(p.inv.env_values(TTL_VAR), ["1h"]);
+        assert_eq!(p.record.cache_ttl, Some(M5));
+        let p = launch(true, None);
+        assert!(p.inv.env_remove.iter().any(|k| k == TTL_VAR));
+        assert_eq!(p.record.cache_ttl, Some(M5));
+    }
+
+    #[test]
+    fn the_cache_ttl_flag_on_a_recorded_codex_session_is_ignored_with_a_note() {
+        let f = Fixture::new("cache-ttl-codex-resume");
+        let mut r = resolved();
+        r.harness = Harness::Codex;
+        r.model = "gpt-5.6-luna".into();
+        r.tools = None;
+        let record = record_of(&r, Path::new(&f.work()), None, f.now);
+        save_record(&f, "codex-1", &record);
+        let ctx = f.ctx(&usage_not_consulted);
+        let p = launch_resume_invocation(
+            &ctx,
+            "codex-1",
+            false,
+            None,
+            Some(CacheTtl::FiveMinutes),
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(p.r.cache_ttl, None);
+        assert!(
+            p.notes
+                .contains(&"--cache-ttl ignored: codex has no prompt-cache TTL".to_string()),
+            "{:?}",
+            p.notes
+        );
+        assert!(!p.inv.env_set.iter().any(|(k, _)| k == TTL_VAR));
+        assert!(!p.inv.env_remove.iter().any(|k| k == TTL_VAR));
+    }
+
+    #[test]
+    fn a_launch_takes_its_cache_ttl_from_the_flag_alone() {
+        use CacheTtl::{FiveMinutes as M5, OneHour as H1};
+        let mut f = Fixture::new("cache-ttl-launch");
+        f.token("team03");
+        f.cfg.claude.profiles = vec!["team03".into()];
+        write_ttl_explorer(&f, "5m");
+        f.env.insert("CCC_CACHE_TTL_ALL".into(), "5m".into());
+        let usage = || report(vec![snapshot(Timestamp::now(), "team03", 0.0, 10.0)]);
+        let ctx = f.ctx(&usage);
+        let work = f.work();
+        let fresh = |ttl| {
+            let prepared = prepare(
+                &ctx,
+                "explorer",
+                Some(&work),
+                None,
+                None,
+                None,
+                &GooseFlags::default(),
+            )?;
+            launch_invocation(&ctx, prepared, ttl, vec![])
+        };
+
+        let p = fresh(None).unwrap();
+        assert!(p.inv.env_values(TTL_VAR).is_empty());
+        assert!(p.inv.env_remove.iter().any(|k| k == TTL_VAR));
+        assert_eq!(p.record.cache_ttl, None);
+
+        let p = fresh(Some(M5)).unwrap();
+        assert_eq!(p.inv.env_values(TTL_VAR), ["5m"]);
+        assert!(!p.inv.env_remove.iter().any(|k| k == TTL_VAR));
+        assert_eq!(p.record.cache_ttl, Some(M5));
+
+        let roleless = |ttl| {
+            let r = resolve::resolve_roleless(ctx.cfg, None, None).unwrap();
+            let prepared = prepare_resolved(&ctx, r, Vec::new(), Some(&work), None).unwrap();
+            launch_invocation(&ctx, prepared, ttl, vec![]).unwrap()
+        };
+        let p = roleless(None);
+        assert!(p.inv.env_remove.iter().any(|k| k == TTL_VAR));
+        assert_eq!(p.record.cache_ttl, None);
+        let p = roleless(Some(H1));
+        assert_eq!(p.inv.env_values(TTL_VAR), ["1h"]);
+        assert_eq!(p.record.cache_ttl, Some(H1));
+
+        // A bad value the launch would not use still refuses it.
+        f.env.remove("CCC_CACHE_TTL_ALL");
+        write_ttl_explorer(&f, "10m");
+        let ctx = f.ctx(&usage);
+        let fresh = |ttl| {
+            let prepared = prepare(
+                &ctx,
+                "explorer",
+                Some(&work),
+                None,
+                None,
+                None,
+                &GooseFlags::default(),
+            )?;
+            launch_invocation(&ctx, prepared, ttl, vec![])
+        };
+        let err = format!("{:#}", fresh(Some(M5)).err().unwrap());
+        assert!(
+            err.contains("cache_ttl") && err.contains("explorer"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn launch_start_records_the_cache_ttl_flag() {
+        let target = LaunchTarget::Roleless {
+            cwd: None,
+            model: None,
+            effort: None,
+        };
+        assert_eq!(
+            launch_start(target, None, Some(CacheTtl::OneHour), &[]).cache_ttl_arg,
+            Some(CacheTtl::OneHour)
+        );
+        assert_eq!(launch_start(target, None, None, &[]).cache_ttl_arg, None);
+    }
+
     #[cfg(unix)]
     #[test]
     fn fresh_claude_sidecar_precedes_harness_and_lock_is_held_during_turn() {
@@ -9418,6 +9823,7 @@ mod tests {
             "explorer",
             Some(&f.work()),
             Some("go"),
+            None,
             None,
             None,
             None,
@@ -9460,6 +9866,7 @@ mod tests {
             "explorer",
             Some(&f.work()),
             Some("go"),
+            None,
             None,
             None,
             None,
@@ -9514,6 +9921,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 false,
                 &normal.env,
                 || Ok(normal.cfg.clone()),
@@ -9548,6 +9956,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             &sidecar.env,
             || Ok(sidecar.cfg.clone()),
@@ -9579,6 +9988,7 @@ mod tests {
             "explorer",
             Some(&audit_failure.work()),
             Some("go"),
+            None,
             None,
             None,
             None,
@@ -9626,6 +10036,7 @@ mod tests {
             "resume-prewrite",
             false,
             None,
+            None,
             "again".into(),
             false,
             &mut output,
@@ -9643,6 +10054,7 @@ mod tests {
             &ctx,
             "resume-prewrite",
             false,
+            None,
             None,
             "again".into(),
             false,
@@ -9678,6 +10090,7 @@ mod tests {
                 "locked-session",
                 false,
                 None,
+                None,
                 "again".into(),
                 false,
                 &mut Vec::new(),
@@ -9702,6 +10115,7 @@ mod tests {
                 &ctx,
                 "locked-session",
                 false,
+                None,
                 None,
                 "again".into(),
                 false,
@@ -9730,6 +10144,7 @@ mod tests {
             &ctx,
             "9f22dd1b-aaaa",
             true,
+            None,
             None,
             "again".into(),
             false,
@@ -9777,6 +10192,7 @@ mod tests {
             "9f22dd1b-aaaa",
             true,
             None,
+            None,
             "again".into(),
             false,
             &mut Vec::new(),
@@ -9804,6 +10220,7 @@ mod tests {
             &ctx,
             "9f22dd1b-aaaa",
             true,
+            None,
             None,
             "again".into(),
             false,
@@ -9842,6 +10259,7 @@ mod tests {
         let code = resume_from(
             "9f22dd1b-aaaa",
             true,
+            None,
             None,
             Some("again"),
             None,
@@ -9898,6 +10316,7 @@ mod tests {
             "9f22dd1b-aaaa",
             true,
             None,
+            None,
             "again".into(),
             false,
             &mut Vec::new(),
@@ -9926,6 +10345,7 @@ mod tests {
             &ctx,
             "thread-parent",
             true,
+            None,
             None,
             "again".into(),
             false,
@@ -9991,6 +10411,7 @@ mod tests {
             "thread-parent",
             true,
             None,
+            None,
             "again".into(),
             false,
             &mut Vec::new(),
@@ -10037,6 +10458,7 @@ mod tests {
             "9f22dd1b-aaaa",
             true,
             None,
+            None,
             "again".into(),
             false,
             &mut Vec::new(),
@@ -10049,6 +10471,7 @@ mod tests {
             &ctx,
             "9f22dd1b-aaaa",
             false,
+            None,
             None,
             "again".into(),
             false,
@@ -10126,6 +10549,7 @@ mod tests {
             "9f22dd1b-aaaa",
             true,
             None,
+            None,
             "again".into(),
             false,
             &mut Vec::new(),
@@ -10149,6 +10573,7 @@ mod tests {
     fn start_launch_resume(f: &Fixture, session: &str, fork: bool) {
         f.audit
             .start(StartPayload {
+                cache_ttl_arg: None,
                 pid: std::process::id(),
                 cmd: AuditCommand::Launch,
                 agent: None,
@@ -10262,6 +10687,7 @@ mod tests {
             },
             None,
             false,
+            None,
             vec![],
         )
         .unwrap();
@@ -10313,7 +10739,7 @@ mod tests {
         };
         let passthrough = vec!["--verbose".to_string()];
         f.audit
-            .start(launch_start(target, None, &passthrough))
+            .start(launch_start(target, None, None, &passthrough))
             .unwrap();
         // Only team04 publishes a Fable window, so only it can run Fable,
         // though team03 has more of every other bucket left.
@@ -10327,7 +10753,8 @@ mod tests {
             });
             report(vec![snapshot(now, "team03", 0.0, 0.0), team04])
         };
-        let completion = launch_with_ctx(&f.ctx(&usage), target, None, false, passthrough).unwrap();
+        let completion =
+            launch_with_ctx(&f.ctx(&usage), target, None, false, None, passthrough).unwrap();
         assert_eq!(completion.code, 0);
 
         let args: Vec<String> = std::fs::read_to_string(&argv)
@@ -10388,6 +10815,7 @@ mod tests {
             },
             None,
             false,
+            None,
             vec![],
         )
         .expect_err("a bad [launch] effort is an error");
@@ -10400,7 +10828,7 @@ mod tests {
     fn launch_start_records_each_target() {
         let passthrough = vec!["--verbose".to_string()];
         let fields = |target| {
-            let s = launch_start(target, Some("p"), &passthrough);
+            let s = launch_start(target, Some("p"), None, &passthrough);
             assert_eq!(s.cmd, AuditCommand::Launch);
             assert_eq!(s.profile_arg.as_deref(), Some("p"));
             assert_eq!(s.passthrough, passthrough);
@@ -10468,6 +10896,7 @@ mod tests {
             },
             None,
             false,
+            None,
             vec![],
         )
         .unwrap();
@@ -10518,6 +10947,7 @@ mod tests {
             },
             None,
             false,
+            None,
             vec![],
         )
         .unwrap();
@@ -10554,6 +10984,7 @@ mod tests {
             },
             None,
             false,
+            None,
             vec![],
         )
         .unwrap();
@@ -10630,6 +11061,7 @@ mod tests {
             },
             None,
             false,
+            None,
             vec!["--verbose".into()],
         )
         .unwrap();
@@ -10688,6 +11120,7 @@ mod tests {
             },
             None,
             false,
+            None,
             vec![],
         )
         .unwrap();
@@ -10732,6 +11165,7 @@ mod tests {
                 LaunchTarget::Resume { id, fork: false },
                 None,
                 false,
+                None,
                 vec![],
             )
             .unwrap_err()
@@ -10801,6 +11235,7 @@ mod tests {
             },
             Some("team04"),
             false,
+            None,
             vec![],
         )
         .unwrap();
@@ -10819,6 +11254,7 @@ mod tests {
             },
             Some("team05"),
             false,
+            None,
             vec![],
         )
         .unwrap_err();
@@ -10851,6 +11287,7 @@ mod tests {
             },
             None,
             false,
+            None,
             vec![],
         )
         .unwrap();
@@ -10898,6 +11335,7 @@ mod tests {
             },
             None,
             false,
+            None,
             vec![],
         )
         .unwrap();
@@ -10934,6 +11372,7 @@ mod tests {
             },
             None,
             false,
+            None,
             vec![],
         )
         .unwrap();
@@ -10974,6 +11413,7 @@ mod tests {
             },
             None,
             false,
+            None,
             vec![],
         )
         .unwrap();
@@ -10988,6 +11428,7 @@ mod tests {
             },
             None,
             false,
+            None,
             vec![],
         )
         .unwrap_err();
@@ -11015,6 +11456,7 @@ mod tests {
             },
             None,
             false,
+            None,
             vec![],
         )
         .unwrap();
@@ -11257,6 +11699,7 @@ mod tests {
             "9f22dd1b-aaaa",
             false,
             None,
+            None,
             "again".to_string(),
             false,
             &mut out,
@@ -11286,6 +11729,7 @@ mod tests {
             &f.ctx(&usage),
             "9f22dd1b-aaaa",
             false,
+            None,
             None,
             "again".to_string(),
             false,
@@ -11317,6 +11761,7 @@ mod tests {
             "explorer",
             Some(&f.work()),
             "go".to_string(),
+            None,
             None,
             None,
             false,
@@ -11359,6 +11804,7 @@ mod tests {
             "go".into(),
             None,
             None,
+            None,
             false,
             &mut out,
         )
@@ -11382,6 +11828,7 @@ mod tests {
             "does-not-exist",
             Some(&unknown.work()),
             "go".into(),
+            None,
             None,
             None,
             false,
@@ -11414,6 +11861,7 @@ mod tests {
             &f.ctx(&usage),
             "9f22dd1b-aaaa",
             false,
+            None,
             None,
             "again".into(),
             false,
@@ -11462,6 +11910,7 @@ mod tests {
             "go".to_string(),
             None,
             None,
+            None,
             false,
             &mut out,
         )
@@ -11490,9 +11939,11 @@ mod tests {
                 Some(&f.work()),
                 None,
                 None,
+                None,
                 &GooseFlags::default(),
             )
             .unwrap(),
+            None,
             vec!["--foo".into()],
         )
         .unwrap();
@@ -11741,6 +12192,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             &f.env,
             || Ok(f.cfg.clone()),
@@ -11819,6 +12271,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             &f.env,
             || Ok(f.cfg.clone()),
@@ -11892,13 +12345,14 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 &GooseFlags::default(),
                 false,
                 &short.env,
                 || Ok(short.cfg.clone()),
                 &mut short_input,
                 &mut short_output,
-                &move |message| short_warnings_for_report.lock().unwrap().push(message),
+                &move |message| short_warnings_for_report.lock().unwrap().push(message)
             )
             .unwrap(),
             3
@@ -11947,11 +12401,12 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 true,
                 &complete.env,
                 || Ok(complete.cfg.clone()),
                 &mut complete_input,
-                &mut complete_output,
+                &mut complete_output
             )
             .unwrap(),
             0
@@ -11972,11 +12427,12 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 true,
                 &failed.env,
                 || Ok(failed.cfg.clone()),
                 &mut failed_input,
-                &mut failed_output,
+                &mut failed_output
             )
             .unwrap(),
             1
@@ -12212,6 +12668,7 @@ mod tests {
 
     fn start_payload_for_test(cmd: AuditCommand) -> StartPayload {
         StartPayload {
+            cache_ttl_arg: None,
             pid: std::process::id(),
             cmd,
             agent: Some("explorer".into()),
@@ -12296,6 +12753,7 @@ mod tests {
             "go".into(),
             None,
             None,
+            None,
             false,
             &mut out,
         )
@@ -12363,6 +12821,7 @@ mod tests {
                 Some(&f.work()),
                 positional,
                 prompt_path.as_deref(),
+                None,
                 None,
                 None,
                 false,
@@ -12453,6 +12912,7 @@ mod tests {
                 file_path.as_deref(),
                 None,
                 None,
+                None,
                 false,
                 &f.env,
                 || Ok(cfg),
@@ -12537,6 +12997,7 @@ mod tests {
                 requested,
                 false,
                 None,
+                None,
                 positional,
                 file_path.as_deref(),
                 false,
@@ -12600,6 +13061,7 @@ mod tests {
                 "9f22dd1b-aaaa",
                 false,
                 None,
+                None,
                 positional,
                 file,
                 false,
@@ -12607,7 +13069,7 @@ mod tests {
                 || Ok(cfg),
                 &mut input,
                 &mut output,
-                &mut Vec::new(),
+                &mut Vec::new()
             )
             .is_err());
             let records = trace_records_for(&f.env);
@@ -12651,6 +13113,7 @@ mod tests {
             "explorer",
             Some(&f.work()),
             Some("go"),
+            None,
             None,
             None,
             None,
@@ -12699,6 +13162,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             &f.env,
             || Ok(cfg),
@@ -12740,6 +13204,7 @@ mod tests {
         let err = resume_from(
             "9f22dd1b-aaaa",
             false,
+            None,
             None,
             Some("again"),
             None,
@@ -12813,6 +13278,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             &f.env,
             || Ok(cfg),
@@ -12864,6 +13330,7 @@ mod tests {
             },
             None,
             false,
+            None,
             vec![],
         )
         .unwrap();
@@ -12912,6 +13379,7 @@ mod tests {
             },
             None,
             false,
+            None,
             vec![],
         )
         .unwrap();
@@ -12955,6 +13423,7 @@ mod tests {
             },
             None,
             false,
+            None,
             vec![],
         )
         .unwrap();
@@ -13081,6 +13550,7 @@ mod tests {
             "explorer",
             Some(&requested_cwd),
             Some("prompt"),
+            None,
             None,
             None,
             None,
@@ -13330,6 +13800,7 @@ mod tests {
                 "cccccccc",
                 false,
                 None,
+                None,
                 Some("-"),
                 None,
                 json,
@@ -13388,6 +13859,7 @@ mod tests {
                     LaunchTarget::Resume { id: arg, fork },
                     None,
                     false,
+                    None,
                     vec![],
                     &env,
                     || panic!("configuration loaded before resolution"),
@@ -13508,6 +13980,7 @@ mod tests {
             &token,
             false,
             Some("team09"),
+            None,
             Some("again"),
             None,
             true,
@@ -13555,6 +14028,7 @@ mod tests {
         let code = resume_from(
             &token,
             false,
+            None,
             None,
             Some("again"),
             None,
@@ -13643,6 +14117,7 @@ mod tests {
             &token,
             true,
             None,
+            None,
             Some("again"),
             None,
             true,
@@ -13700,6 +14175,7 @@ mod tests {
         let code = resume_from(
             &token,
             true,
+            None,
             None,
             Some("again"),
             None,
@@ -13770,6 +14246,7 @@ mod tests {
                 LaunchTarget::Resume { id: &token, fork },
                 None,
                 false,
+                None,
                 vec![],
                 &f.env,
                 || Ok(f.cfg.clone()),
@@ -13842,6 +14319,7 @@ mod tests {
             &token,
             false,
             None,
+            None,
             Some("again"),
             None,
             false,
@@ -13873,6 +14351,7 @@ mod tests {
             },
             None,
             false,
+            None,
             vec![],
             &f.env,
             || Ok(f.cfg.clone()),
@@ -13938,6 +14417,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 flags,
                 false,
                 &self.env,
@@ -13955,6 +14435,7 @@ mod tests {
             let code = resume_from(
                 id,
                 fork,
+                None,
                 None,
                 Some("again"),
                 None,
@@ -14615,7 +15096,8 @@ mod tests {
             nested: true,
             ..GooseFlags::default()
         };
-        let prepared = prepare(&ctx, "explorer", Some(&f.work()), None, None, &flags).unwrap();
+        let prepared =
+            prepare(&ctx, "explorer", Some(&f.work()), None, None, None, &flags).unwrap();
         assert_eq!(prepared.r.harness, Harness::Claude);
         assert_eq!(prepared.r.goose, None);
     }
@@ -14904,7 +15386,7 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             start_launch(self);
             let usage = || UsageSource::Unavailable("not consulted".into());
-            let completion = launch_with_ctx(&self.ctx(&usage), target, None, false, vec![])
+            let completion = launch_with_ctx(&self.ctx(&usage), target, None, false, None, vec![])
                 .map_err(|e| e.error)?;
             let end = completion.end.clone();
             record_completion(self, completion);
@@ -15249,6 +15731,7 @@ mod tests {
             },
             None,
             false,
+            None,
             vec![],
             &f.env,
             || Ok(f.cfg.clone()),
@@ -15297,10 +15780,12 @@ mod tests {
             Some(&f.work()),
             None,
             cli_harness,
+            None,
             &GooseFlags::default(),
         )
         .unwrap();
-        let LaunchPrepared { inv, r, .. } = launch_invocation(&ctx, prepared, vec![]).unwrap();
+        let LaunchPrepared { inv, r, .. } =
+            launch_invocation(&ctx, prepared, None, vec![]).unwrap();
         assert_eq!(r.harness, harness);
         inv
     }

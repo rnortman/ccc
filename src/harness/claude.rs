@@ -39,6 +39,11 @@ const CONFIG_DIR_VAR: &str = "CLAUDE_CONFIG_DIR";
 /// deadlines are off), so at `0` a child left running one does not exit until
 /// it ends or `ccc kill` stops the child.
 const BG_WAIT_CEILING_VAR: &str = "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS";
+/// Claude Code's prompt-cache TTL for the main conversation, `5m` or `1h`
+/// (semantics checked against Claude Code 2.1.332). Set from the resolved
+/// cache TTL, or removed when there is none, so a child never runs on a TTL
+/// inherited from the agent or shell above it.
+const PROMPT_CACHE_TTL_VAR: &str = "CLAUDE_CODE_PROMPT_CACHE_TTL";
 
 /// The native field `parse` writes with the process's cost in USD: the sum
 /// of the costs its `result` events state, or `null` when none states one.
@@ -404,12 +409,16 @@ fn build(r: &Resolved, c: &Common, d: &ClaudeDriver) -> Result<Invocation> {
     }
     args.extend(c.extra_args.iter().cloned());
 
-    let (mut env_set, env_remove) = match &d.account {
+    let (mut env_set, mut env_remove) = match &d.account {
         Some(acct) => acct.env_edits()?,
         None => ambient_env_edits(),
     };
     if one_shot {
         env_set.push((BG_WAIT_CEILING_VAR.into(), "0".into()));
+    }
+    match r.cache_ttl {
+        Some(ttl) => env_set.push((PROMPT_CACHE_TTL_VAR.into(), ttl.as_str().into())),
+        None => env_remove.push(PROMPT_CACHE_TTL_VAR.into()),
     }
 
     Ok(Invocation {
@@ -638,7 +647,7 @@ fn parse(stdout: &str, stderr: &str) -> Result<Outcome, HarnessError> {
 mod tests {
     use super::*;
     use crate::agents::Sandbox;
-    use crate::config::{Effort, Harness};
+    use crate::config::{CacheTtl, Effort, Harness};
     use crate::harness::modes::{interactive, one_shot, resumed, run_mode};
     use crate::harness::{Io, Mode, Origin};
     use crate::testutil::TempDir;
@@ -646,6 +655,7 @@ mod tests {
 
     fn resolved() -> Resolved {
         Resolved {
+            cache_ttl: None,
             agent: Some("explorer".into()),
             description: "Investigates".into(),
             harness: Harness::Claude,
@@ -933,6 +943,65 @@ mod tests {
                 !i.env_remove.iter().any(|k| k == BG_WAIT_CEILING_VAR),
                 "{label}"
             );
+        }
+    }
+
+    #[test]
+    fn the_prompt_cache_ttl_is_set_or_removed_in_every_account_and_mode() {
+        let dir = TempDir::new("claude-cache-ttl");
+        dir.write_file("team03.token", "sk-ant-oat-secret\n", 0o600);
+        dir.write_file("team.key", "sk-ant-api-secret\n", 0o600);
+        let token = Account {
+            profile: "team03".into(),
+            auth: ClaudeAuth::Token,
+            token_dir: dir.path().to_path_buf(),
+            profiles_dir: PathBuf::from("/nope"),
+            key_file: None,
+        };
+        let config_dir = Account {
+            profile: "personal".into(),
+            auth: ClaudeAuth::ConfigDir,
+            token_dir: PathBuf::from("/tokens"),
+            profiles_dir: PathBuf::from("/profiles"),
+            key_file: None,
+        };
+        let key = Account::for_key(&key_config(&dir), "team", &env(&[])).unwrap();
+
+        // The driver's env carries another value, as a child of an agent or
+        // a shell that exported one would.
+        let e = env(&[(PROMPT_CACHE_TTL_VAR, "1h")]);
+        for account in [Some(token), Some(config_dir), Some(key), None] {
+            for mode in [
+                run_mode(),
+                one_shot(resumed("9f22dd1b", false)),
+                interactive("/ccc", Origin::Fresh),
+                interactive("/ccc", resumed("9f22dd1b", true)),
+            ] {
+                let label = format!("{:?} {mode:?}", account.as_ref().map(|a| a.auth));
+                let mut d = driver(&e);
+                d.account = account.clone();
+
+                let mut r = resolved();
+                r.cache_ttl = Some(CacheTtl::FiveMinutes);
+                let i = d.build(&r, &common(mode.clone())).unwrap();
+                assert_eq!(i.env_values(PROMPT_CACHE_TTL_VAR), ["5m"], "{label}");
+                assert!(
+                    !i.env_remove.iter().any(|k| k == PROMPT_CACHE_TTL_VAR),
+                    "{label}"
+                );
+
+                r.cache_ttl = None;
+                let i = d.build(&r, &common(mode)).unwrap();
+                assert!(i.env_values(PROMPT_CACHE_TTL_VAR).is_empty(), "{label}");
+                assert_eq!(
+                    i.env_remove
+                        .iter()
+                        .filter(|k| *k == PROMPT_CACHE_TTL_VAR)
+                        .count(),
+                    1,
+                    "{label}"
+                );
+            }
         }
     }
 

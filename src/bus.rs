@@ -1171,6 +1171,7 @@ mod tests {
 
     fn start(prompt: Option<&str>) -> StartPayload {
         StartPayload {
+            cache_ttl_arg: None,
             pid: 4242,
             cmd: crate::audit::Command::Resume,
             agent: None,
@@ -1249,6 +1250,7 @@ mod tests {
             now(),
         );
         let spawn = |harness, profile: Option<&str>, auth| SpawnPayload {
+            cache_ttl: None,
             harness,
             model: "m".into(),
             effort: Some(crate::config::Effort::High),

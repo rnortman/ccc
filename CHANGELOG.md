@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- **Choose Claude's prompt-cache lifetime per agent.** Claude Code keeps a
+  prompt cache that expires after 5 minutes by default; a new `cache_ttl`
+  setting (`5m` or `1h`) chooses it per agent. Set it in the agent
+  definition's frontmatter, in `[agents.<type>]` or `[agents."*"]` config,
+  with `CCC_CACHE_TTL_<AGENT>` / `CCC_CACHE_TTL_ALL`, or per run with
+  `--cache-ttl` on `ccc run`. `ccc resume` reuses the session's value
+  (`--cache-ttl` overrides it). `ccc launch` takes only `--cache-ttl` — an
+  interactive session paced by a human is where the 1-hour cache pays off.
+  Codex and Goose ignore the setting. `ccc which`, the audit log and the
+  trace index now show the TTL in effect.
+  **Changed:** a Claude child no longer inherits
+  `CLAUDE_CODE_PROMPT_CACHE_TTL` from `ccc`'s environment. If you exported
+  it, use `CCC_CACHE_TTL_ALL` for one-shot runs and `--cache-ttl` for
+  `ccc launch`. Older `ccc` versions refuse a definition carrying
+  `cache_ttl` as an unknown field.
+
 - **`ccc launch` can run an interactive session on an API key account, when
   forced.** `ccc launch --profile <key>` used to be refused outright, because
   `ccc` cannot measure what an interactive session spends. It is still

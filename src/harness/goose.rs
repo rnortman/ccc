@@ -569,6 +569,7 @@ mod tests {
 
     fn resolved() -> Resolved {
         Resolved {
+            cache_ttl: None,
             agent: Some("explorer".into()),
             description: "Reads".into(),
             harness: Harness::Goose,

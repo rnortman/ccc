@@ -43,6 +43,8 @@ struct Frontmatter {
     model: Option<String>,
     #[serde(default)]
     effort: Option<String>,
+    #[serde(default)]
+    cache_ttl: Option<String>,
     #[serde(default, deserialize_with = "deserialize_tools")]
     tools: Option<StringList>,
     #[serde(default, deserialize_with = "deserialize_harness")]
@@ -181,6 +183,8 @@ pub struct AgentDef {
     pub description: String,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// Claude only: the prompt-cache TTL, parsed at resolve time.
+    pub cache_ttl: Option<String>,
     pub tools: Option<Vec<String>>,
     pub codex_model: Option<String>,
     pub codex_effort: Option<String>,
@@ -271,6 +275,7 @@ impl AgentDef {
 
         let model = blank_to_none(fm.model);
         let effort = blank_to_none(fm.effort);
+        let cache_ttl = blank_to_none(fm.cache_ttl);
         let codex_model = blank_to_none(fm.codex_model);
         let codex_effort = blank_to_none(fm.codex_effort);
         let goose_model = blank_to_none(fm.goose_model);
@@ -356,6 +361,7 @@ impl AgentDef {
             description: fm.description,
             model,
             effort,
+            cache_ttl,
             tools: fm.tools.and_then(StringList::into_vec),
             codex_model,
             codex_effort,

@@ -387,6 +387,7 @@ mod tests {
 
     fn resolved() -> Resolved {
         Resolved {
+            cache_ttl: None,
             agent: Some("scribe".into()),
             description: "Writes files".into(),
             harness: Harness::Codex,

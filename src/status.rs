@@ -1620,6 +1620,7 @@ mod tests {
             inv: inv.into(),
             parent: parent.map(str::to_string),
             payload: StartPayload {
+                cache_ttl_arg: None,
                 pid: u32::MAX,
                 cmd: Command::Run,
                 agent: Some("worker".into()),

@@ -2,13 +2,14 @@
 //!
 //! Per field the first hit wins: CLI flag, per-agent env, `_ALL` env,
 //! `[agents.<type>]`, `[agents."*"]`, the agent definition, the global default.
+//! The prompt-cache TTL has no global default: absent everywhere, it is unset.
 
 use anyhow::{bail, Context, Result};
 
 use crate::agents::{AgentDef, Sandbox};
 use crate::config::{
-    blank_to_none, env_agent_key, env_override, env_value, AgentOverrides, Config, Effort,
-    EnvSource, Harness,
+    blank_to_none, env_agent_key, env_override, env_value, AgentOverrides, CacheTtl, Config,
+    Effort, EnvSource, Harness,
 };
 use crate::goose_policy::GoosePolicy;
 
@@ -21,6 +22,9 @@ pub struct Resolved {
     pub harness: Harness,
     pub model: String,
     pub effort: Option<Effort>,
+    /// Claude only: the prompt-cache TTL the child is given; `None` leaves
+    /// Claude Code's own default.
+    pub cache_ttl: Option<CacheTtl>,
     /// Claude only; `None` means the harness default tool set.
     pub tools: Option<Vec<String>>,
     /// Codex only.
@@ -214,15 +218,36 @@ fn pick(
         .or_else(|| blank_to_none(from_def()))
 }
 
-/// Full resolution for `def`, whose `name` is the agent type.
+/// The TTL `--cache-ttl <flag>` gives a resolution on `harness`: the flag on
+/// Claude; none on another harness, which has no prompt-cache TTL, with a note
+/// in `notes` that the flag is ignored.
+pub fn cache_ttl_flag(
+    harness: Harness,
+    flag: CacheTtl,
+    notes: &mut Vec<String>,
+) -> Option<CacheTtl> {
+    match harness {
+        Harness::Claude => Some(flag),
+        Harness::Codex | Harness::Goose => {
+            notes.push(format!(
+                "--cache-ttl ignored: {harness} has no prompt-cache TTL"
+            ));
+            None
+        }
+    }
+}
+
+/// Full resolution for `def`, whose `name` is the agent type. `cli_cache_ttl`
+/// is the `--cache-ttl` flag, the first rung of the cache-TTL ladder.
 pub fn resolve(
     cfg: &Config,
     env: &dyn EnvSource,
     def: &AgentDef,
     cli_harness: Option<Harness>,
+    cli_cache_ttl: Option<CacheTtl>,
 ) -> Result<(Resolved, Vec<String>)> {
     let agent = def.name.as_str();
-    let (harness, _source, notes) = resolve_harness(cfg, env, def, cli_harness)?;
+    let (harness, _source, mut notes) = resolve_harness(cfg, env, def, cli_harness)?;
 
     let (model_env, model_key) = match harness {
         Harness::Claude => ("MODEL", "model"),
@@ -281,6 +306,23 @@ pub fn resolve(
         None => None,
     };
 
+    // Only Claude has a prompt-cache TTL, so only a Claude resolution reads
+    // or parses the rungs.
+    let cache_ttl = match (cli_cache_ttl, harness) {
+        (Some(flag), _) => cache_ttl_flag(harness, flag, &mut notes),
+        (None, Harness::Claude) => pick(
+            cfg,
+            env,
+            agent,
+            "CACHE_TTL",
+            |o| o.cache_ttl.clone(),
+            || def.cache_ttl.clone(),
+        )
+        .map(|t| CacheTtl::parse(&t).with_context(|| format!("cache_ttl for agent type {agent:?}")))
+        .transpose()?,
+        (None, Harness::Codex | Harness::Goose) => None,
+    };
+
     Ok((
         Resolved {
             agent: Some(agent.to_string()),
@@ -288,6 +330,7 @@ pub fn resolve(
             harness,
             model,
             effort,
+            cache_ttl,
             tools: def.tools.clone(),
             sandbox: def.codex_sandbox,
             body: def.body_for(harness).to_string(),
@@ -327,6 +370,7 @@ pub fn resolve_roleless(
         harness,
         model,
         effort,
+        cache_ttl: None,
         tools: None,
         sandbox: Sandbox::default(),
         body: String::new(),
@@ -443,7 +487,7 @@ mod tests {
 
     #[test]
     fn falls_back_to_definition_and_default_harness() {
-        let (r, _) = resolve(&agents_cfg(""), &env(&[]), &def(), None).unwrap();
+        let (r, _) = resolve(&agents_cfg(""), &env(&[]), &def(), None, None).unwrap();
         assert_eq!(r.harness, Harness::Claude);
         assert_eq!(r.model, "def-claude");
         assert_eq!(r.effort, Some(Effort::Low));
@@ -458,6 +502,7 @@ mod tests {
             &agents_cfg("default_harness = \"codex\""),
             &env(&[]),
             &def(),
+            None,
             None,
         )
         .unwrap();
@@ -590,15 +635,23 @@ mod tests {
             ]),
             &def(),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(r.model, "env-claude");
         assert_eq!(r.effort, Some(Effort::High));
         // _ALL env beats config.
-        let (r, _) = resolve(&c, &env(&[("CCC_MODEL_ALL", "all-claude")]), &def(), None).unwrap();
+        let (r, _) = resolve(
+            &c,
+            &env(&[("CCC_MODEL_ALL", "all-claude")]),
+            &def(),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(r.model, "all-claude");
         // Config per-agent beats wildcard.
-        let (r, _) = resolve(&c, &env(&[]), &def(), None).unwrap();
+        let (r, _) = resolve(&c, &env(&[]), &def(), None, None).unwrap();
         assert_eq!(r.model, "agent-claude");
         assert_eq!(r.effort, Some(Effort::Medium));
         // Codex side, same ladder.
@@ -607,6 +660,7 @@ mod tests {
             &env(&[("CCC_CODEX_MODEL_EXPLORER", "env-codex")]),
             &def(),
             Some(Harness::Codex),
+            None,
         )
         .unwrap();
         assert_eq!(r.model, "env-codex");
@@ -615,6 +669,7 @@ mod tests {
             &env(&[("CCC_CODEX_EFFORT_ALL", "xhigh")]),
             &def(),
             Some(Harness::Codex),
+            None,
         )
         .unwrap();
         assert_eq!(r.model, "agent-codex");
@@ -629,6 +684,7 @@ mod tests {
                 &agents_cfg(""),
                 &env(&[("CCC_EFFORT_ALL", "lo")]),
                 &def(),
+                None,
                 None
             )
             .unwrap_err()
@@ -643,7 +699,7 @@ mod tests {
         .unwrap();
         let err = format!(
             "{:#}",
-            resolve(&agents_cfg(""), &env(&[]), &d, None).unwrap_err()
+            resolve(&agents_cfg(""), &env(&[]), &d, None, None).unwrap_err()
         );
         assert!(err.contains("effort"), "{err}");
         assert!(err.contains("lo"), "{err}");
@@ -657,6 +713,7 @@ mod tests {
                 &agents_cfg(""),
                 &env(&[("CCC_EFFORT_ALL", "minimal")]),
                 &def(),
+                None,
                 None
             )
             .unwrap_err()
@@ -670,7 +727,8 @@ mod tests {
                 &agents_cfg(""),
                 &env(&[("CCC_CODEX_EFFORT_ALL", "max")]),
                 &def(),
-                Some(Harness::Codex)
+                Some(Harness::Codex),
+                None
             )
             .unwrap_err()
         );
@@ -681,7 +739,7 @@ mod tests {
     #[test]
     fn a_blank_override_does_not_shadow_the_definition() {
         let c = agents_cfg("[agents.\"*\"]\nmodel = \"\"\neffort = \"  \"\n");
-        let (r, _) = resolve(&c, &env(&[]), &def(), None).unwrap();
+        let (r, _) = resolve(&c, &env(&[]), &def(), None, None).unwrap();
         assert_eq!(r.model, "def-claude");
         assert_eq!(r.effort, Some(Effort::Low));
 
@@ -690,7 +748,7 @@ mod tests {
             "a",
         )
         .unwrap();
-        let err = resolve(&agents_cfg(""), &env(&[]), &d, Some(Harness::Codex))
+        let err = resolve(&agents_cfg(""), &env(&[]), &d, Some(Harness::Codex), None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("codex_model"), "{err}");
@@ -699,7 +757,7 @@ mod tests {
     #[test]
     fn wildcard_applies_to_unlisted_agents() {
         let c = agents_cfg("[agents.\"*\"]\nmodel = \"star-claude\"\n");
-        let (r, _) = resolve(&c, &env(&[]), &def(), None).unwrap();
+        let (r, _) = resolve(&c, &env(&[]), &def(), None, None).unwrap();
         assert_eq!(r.model, "star-claude");
     }
 
@@ -710,6 +768,7 @@ mod tests {
             &c,
             &env(&[("CCC_MODEL_EXPLORER", "inherit"), ("CCC_EFFORT_ALL", "-")]),
             &def(),
+            None,
             None,
         )
         .unwrap();
@@ -728,6 +787,7 @@ mod tests {
             &agents_cfg("default_harness = \"claude\""),
             &env(&[]),
             &d,
+            None,
             None,
         )
         .unwrap();
@@ -848,10 +908,11 @@ mod tests {
             &env(&[]),
             &d,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(r.body, "codex body");
-        let (r, _) = resolve(&agents_cfg(""), &env(&[]), &d, None).unwrap();
+        let (r, _) = resolve(&agents_cfg(""), &env(&[]), &d, None, None).unwrap();
         assert_eq!(r.body, "body");
     }
 
@@ -862,7 +923,7 @@ mod tests {
             "claude-only",
         )
         .unwrap();
-        let err = resolve(&agents_cfg(""), &env(&[]), &d, Some(Harness::Codex))
+        let err = resolve(&agents_cfg(""), &env(&[]), &d, Some(Harness::Codex), None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("codex_model"), "{err}");
@@ -872,6 +933,7 @@ mod tests {
             &env(&[("CCC_CODEX_MODEL_ALL", "gpt-5.6-luna")]),
             &d,
             Some(Harness::Codex),
+            None,
         )
         .unwrap();
         assert_eq!(r.model, "gpt-5.6-luna");
@@ -881,7 +943,7 @@ mod tests {
     fn effort_may_be_absent_everywhere() {
         let d =
             AgentDef::parse("---\nname: a\ndescription: d\nmodel: m\n---\nbody\n", "a").unwrap();
-        let (r, _) = resolve(&agents_cfg(""), &env(&[]), &d, None).unwrap();
+        let (r, _) = resolve(&agents_cfg(""), &env(&[]), &d, None, None).unwrap();
         assert_eq!(r.effort, None);
         assert_eq!(r.tools, None);
     }
@@ -901,7 +963,7 @@ mod tests {
         );
         let d = goose_def();
         let goose = |cfg: &Config, pairs: &[(&str, &str)], d: &AgentDef| {
-            resolve(cfg, &env(pairs), d, None).unwrap().0
+            resolve(cfg, &env(pairs), d, None, None).unwrap().0
         };
         let r = goose(
             &c,
@@ -933,12 +995,13 @@ mod tests {
             &env(&[("CCC_EFFORT_ALL", "max")]),
             &d,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(r.harness, Harness::Goose);
         assert_eq!(r.effort, None);
         assert_eq!(r.body, "goose body");
-        let (r, _) = resolve(&agents_cfg(""), &env(&[]), &d, Some(Harness::Claude)).unwrap();
+        let (r, _) = resolve(&agents_cfg(""), &env(&[]), &d, Some(Harness::Claude), None).unwrap();
         assert_eq!(r.model, "def-claude");
         assert_eq!(r.effort, Some(Effort::Low));
         assert_eq!(r.body, "body");
@@ -1002,5 +1065,158 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("no allowed fallback harness"), "{err}");
+    }
+
+    fn ttl_def(cache_ttl: &str) -> AgentDef {
+        AgentDef::parse(
+            &format!(
+                "---\nname: explorer\ndescription: d\nmodel: m\ncodex_model: g\ncache_ttl: {cache_ttl}\n---\nbody\n"
+            ),
+            "explorer",
+        )
+        .unwrap()
+    }
+
+    fn ttl(
+        cfg: &str,
+        pairs: &[(&str, &str)],
+        d: &AgentDef,
+        cli: Option<CacheTtl>,
+    ) -> Option<CacheTtl> {
+        resolve(&agents_cfg(cfg), &env(pairs), d, None, cli)
+            .unwrap()
+            .0
+            .cache_ttl
+    }
+
+    #[test]
+    fn cache_ttl_follows_every_rung_of_the_ladder() {
+        use CacheTtl::{FiveMinutes as M5, OneHour as H1};
+        let both = "[agents.explorer]\ncache_ttl = \"5m\"\n[agents.\"*\"]\ncache_ttl = \"1h\"\n";
+        let d = ttl_def("1h");
+        let all_env = [
+            ("CCC_CACHE_TTL_EXPLORER", "5m"),
+            ("CCC_CACHE_TTL_ALL", "1h"),
+        ];
+        // The flag over everything.
+        assert_eq!(ttl(both, &all_env, &d, Some(H1)), Some(H1));
+        // Per-agent env over `_ALL`.
+        assert_eq!(ttl(both, &all_env, &d, None), Some(M5));
+        // `_ALL` over `[agents.<type>]`.
+        assert_eq!(
+            ttl(both, &[("CCC_CACHE_TTL_ALL", "1h")], &d, None),
+            Some(H1)
+        );
+        // `[agents.<type>]` over `[agents."*"]`.
+        assert_eq!(ttl(both, &[], &d, None), Some(M5));
+        // `[agents."*"]` over the definition.
+        assert_eq!(
+            ttl("[agents.\"*\"]\ncache_ttl = \"5m\"\n", &[], &d, None),
+            Some(M5)
+        );
+        // The definition.
+        assert_eq!(ttl("", &[], &d, None), Some(H1));
+        // Nothing anywhere.
+        assert_eq!(ttl("", &[], &def(), None), None);
+    }
+
+    #[test]
+    fn cache_ttl_sentinels_and_blanks_fall_through() {
+        let d = ttl_def("5m");
+        for sentinel in ["inherit", "default", "-", "", "  "] {
+            assert_eq!(
+                ttl(
+                    "",
+                    &[
+                        ("CCC_CACHE_TTL_EXPLORER", sentinel),
+                        ("CCC_CACHE_TTL_ALL", sentinel)
+                    ],
+                    &d,
+                    None
+                ),
+                Some(CacheTtl::FiveMinutes),
+                "{sentinel:?}"
+            );
+        }
+        assert_eq!(
+            ttl("[agents.explorer]\ncache_ttl = \" \"\n", &[], &d, None),
+            Some(CacheTtl::FiveMinutes)
+        );
+        assert_eq!(ttl("", &[], &ttl_def("\"\""), None), None);
+    }
+
+    #[test]
+    fn a_bad_cache_ttl_fails_under_claude_naming_the_key_and_the_agent() {
+        let check = |cfg: &str, pairs: &[(&str, &str)], d: &AgentDef| {
+            let err = format!(
+                "{:#}",
+                resolve(&agents_cfg(cfg), &env(pairs), d, None, None).unwrap_err()
+            );
+            assert!(
+                err.contains("cache_ttl") && err.contains("explorer") && err.contains("10m"),
+                "{err}"
+            );
+        };
+        check("", &[("CCC_CACHE_TTL_ALL", "10m")], &def());
+        check("[agents.explorer]\ncache_ttl = \"10m\"\n", &[], &def());
+        check("", &[], &ttl_def("10m"));
+
+        // The same definition routed to Codex never reads it.
+        let (r, notes) = resolve(
+            &agents_cfg(""),
+            &env(&[("CCC_CACHE_TTL_ALL", "10m")]),
+            &ttl_def("10m"),
+            Some(Harness::Codex),
+            None,
+        )
+        .unwrap();
+        assert_eq!(r.harness, Harness::Codex);
+        assert_eq!(r.cache_ttl, None);
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    #[test]
+    fn the_cache_ttl_flag_off_claude_is_ignored_with_one_note() {
+        let (r, notes) = resolve(
+            &agents_cfg(""),
+            &env(&[]),
+            &ttl_def("5m"),
+            Some(Harness::Codex),
+            Some(CacheTtl::FiveMinutes),
+        )
+        .unwrap();
+        assert_eq!(r.cache_ttl, None);
+        assert_eq!(
+            notes,
+            vec!["--cache-ttl ignored: codex has no prompt-cache TTL".to_string()]
+        );
+        let (r, notes) = resolve(
+            &agents_cfg(""),
+            &env(&[]),
+            &goose_def(),
+            None,
+            Some(CacheTtl::OneHour),
+        )
+        .unwrap();
+        assert_eq!(r.harness, Harness::Goose);
+        assert_eq!(r.cache_ttl, None);
+        assert_eq!(
+            notes,
+            vec!["--cache-ttl ignored: goose has no prompt-cache TTL".to_string()]
+        );
+    }
+
+    #[test]
+    fn roleless_resolution_has_no_cache_ttl() {
+        let c = agents_cfg("[agents.\"*\"]\ncache_ttl = \"5m\"\n");
+        assert_eq!(resolve_roleless(&c, None, None).unwrap().cache_ttl, None);
+        // The roleless path takes no environment, so `CCC_CACHE_TTL_ALL`
+        // cannot reach it.
+        assert_eq!(
+            resolve_roleless(&agents_cfg(""), None, None)
+                .unwrap()
+                .cache_ttl,
+            None
+        );
     }
 }

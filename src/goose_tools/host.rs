@@ -992,6 +992,7 @@ mod tests {
 
     fn record(agent: &str, cwd: PathBuf, policy: Option<GoosePolicy>) -> SessionRecord {
         SessionRecord {
+            cache_ttl: None,
             harness: if policy.is_some() {
                 crate::config::Harness::Goose
             } else {

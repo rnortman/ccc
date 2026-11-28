@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::agents::Sandbox;
-use crate::config::{self, ClaudeAuth, Effort, EnvSource, Harness};
+use crate::config::{self, CacheTtl, ClaudeAuth, Effort, EnvSource, Harness};
 use crate::procs::ProcId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +183,9 @@ pub struct StartPayload {
     /// Whether the resumed `session` is forked into a new one.
     #[serde(default)]
     pub fork: bool,
+    /// `--cache-ttl` as given.
+    #[serde(default)]
+    pub cache_ttl_arg: Option<CacheTtl>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,6 +193,9 @@ pub struct SpawnPayload {
     pub harness: Harness,
     pub model: String,
     pub effort: Option<Effort>,
+    /// The prompt-cache TTL the child was built with.
+    #[serde(default)]
+    pub cache_ttl: Option<CacheTtl>,
     pub profile: Option<String>,
     pub auth: Option<ClaudeAuth>,
     pub sandbox: Sandbox,
@@ -376,6 +382,7 @@ fn override_name(key: &str) -> bool {
         "CODEX_MODEL_",
         "CODEX_EFFORT_",
         "GOOSE_MODEL_",
+        "CACHE_TTL_",
         "HARNESS_",
         "MODEL_",
         "EFFORT_",
@@ -1120,6 +1127,7 @@ mod tests {
 
     fn start() -> StartPayload {
         StartPayload {
+            cache_ttl_arg: None,
             pid: 42,
             cmd: Command::Run,
             agent: Some("scribe".into()),
@@ -1621,6 +1629,42 @@ mod tests {
         .unwrap();
         assert!(!json.contains("top-secret"));
         assert!(!json.contains("secret"));
+    }
+
+    #[test]
+    fn cache_ttl_overrides_are_recognised() {
+        let vars = vec![
+            ("CCC_CACHE_TTL_EXPLORER".into(), "5m".into()),
+            ("CCC_CACHE_TTL_ALL".into(), "1h".into()),
+            ("CCC_CACHE_TTL_".into(), "5m".into()),
+        ];
+        let (known, other) = classify_env(&vars);
+        assert_eq!(known.get("CCC_CACHE_TTL_EXPLORER").unwrap(), "5m");
+        assert_eq!(known.get("CCC_CACHE_TTL_ALL").unwrap(), "1h");
+        assert_eq!(other, vec!["CCC_CACHE_TTL_".to_string()]);
+    }
+
+    #[test]
+    fn start_and_spawn_records_without_the_cache_ttl_fields_parse() {
+        let mut start = serde_json::to_value(start()).unwrap();
+        start.as_object_mut().unwrap().remove("cache_ttl_arg");
+        let parsed: StartPayload = serde_json::from_value(start).unwrap();
+        assert_eq!(parsed.cache_ttl_arg, None);
+
+        let spawn = serde_json::json!({
+            "harness": "claude",
+            "model": "m",
+            "effort": null,
+            "profile": null,
+            "auth": null,
+            "sandbox": "read-only",
+            "tools": null,
+            "cwd": "/",
+            "session": null,
+            "selection_notes": [],
+        });
+        let parsed: SpawnPayload = serde_json::from_value(spawn).unwrap();
+        assert_eq!(parsed.cache_ttl, None);
     }
 
     #[test]

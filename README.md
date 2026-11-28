@@ -16,14 +16,14 @@ levels and window reset deadlines in each account.
 
 ```
 ccc run    <agent-type> [--cwd DIR] [--prompt-file F] [--profile NAME] [--harness claude|codex|goose]
-           [--allow-read DIR]... [--allow-write DIR]... [--allow-exec DIR]... [--json] [PROMPT | -]
-ccc resume <session-id | trace-prefix> [--fork] [--prompt-file F] [--profile NAME] [--json] [PROMPT | -]
+           [--cache-ttl 5m|1h] [--allow-read DIR]... [--allow-write DIR]... [--allow-exec DIR]... [--json] [PROMPT | -]
+ccc resume <session-id | trace-prefix> [--fork] [--prompt-file F] [--profile NAME] [--cache-ttl 5m|1h] [--json] [PROMPT | -]
 ccc status [--trace PREFIX] [--json]
 ccc kill   <TARGET>... [--all] [--trace PREFIX] [--now] [--grace SECS] [--no-wait] [--json]
 ccc which  <agent-type> [--harness H] [--json]
-ccc launch <agent-type> [--cwd DIR] [--profile NAME [--force-unbudgeted]] [--harness H] [--allow-read|--allow-write|--allow-exec DIR]... [-- harness args...]
-ccc launch --resume <session-id | trace-prefix> [--fork] [--profile NAME [--force-unbudgeted]] [-- harness args...]
-ccc launch [--cwd DIR] [--profile NAME [--force-unbudgeted]] [--model M] [--effort E] [-- harness args...]
+ccc launch <agent-type> [--cwd DIR] [--profile NAME [--force-unbudgeted]] [--harness H] [--cache-ttl 5m|1h] [--allow-read|--allow-write|--allow-exec DIR]... [-- harness args...]
+ccc launch --resume <session-id | trace-prefix> [--fork] [--profile NAME [--force-unbudgeted]] [--cache-ttl 5m|1h] [-- harness args...]
+ccc launch [--cwd DIR] [--profile NAME [--force-unbudgeted]] [--model M] [--effort E] [--cache-ttl 5m|1h] [-- harness args...]
 ccc log    [TRACE-PREFIX | --latest] [--flat] [--verbose] [--json]
 ```
 
@@ -156,7 +156,8 @@ object: `{session, harness, model, effort, profile, agent, cwd, result, native}`
 
 Feed a follow-up question to the same context with `ccc resume <session-id>`
 (or a trace prefix from `ccc log`, see [Resuming what `ccc log`
-lists](#resuming-what-ccc-log-lists)); the session keeps its harness, model, effort, working directory and sandbox.
+lists](#resuming-what-ccc-log-lists)); the session keeps its harness, model, effort, prompt-cache TTL, working directory and sandbox
+(`--cache-ttl` replaces the TTL for that turn).
 `ccc resume <session-id> --fork` starts a new session from the recorded
 transcript instead; the original is left untouched and the new id is printed
 in the trailer. `ccc launch --resume <session-id>` opens the same session
@@ -190,6 +191,7 @@ name: explorer
 description: Answers a few related questions about a codebase, with citations.
 model: claude-opus-5-5[1M]        # Claude model, passed to --model verbatim
 effort: low                       # Claude --effort; optional
+cache_ttl: 5m                     # Claude prompt-cache TTL, 5m | 1h; optional
 tools: Read, Grep, Glob, Bash     # Claude tool list; optional
 harness: claude, codex            # allowed harnesses; first is the preference
 # harness: [claude, codex]         # YAML-list form is equivalent
@@ -284,6 +286,7 @@ default_harness = "claude"
 harness = "codex"
 model = "..."              # Claude model
 effort = "..."
+cache_ttl = "5m"           # Claude prompt-cache TTL: 5m | 1h
 codex_model = "..."
 codex_effort = "..."
 goose_model = "..."
@@ -423,6 +426,7 @@ CCC_EFFORT_<AGENT>        CCC_EFFORT_ALL
 CCC_CODEX_MODEL_<AGENT>   CCC_CODEX_MODEL_ALL
 CCC_CODEX_EFFORT_<AGENT>  CCC_CODEX_EFFORT_ALL
 CCC_GOOSE_MODEL_<AGENT>   CCC_GOOSE_MODEL_ALL
+CCC_CACHE_TTL_<AGENT>     CCC_CACHE_TTL_ALL
 ```
 
 `inherit`, `default`, `-` and the empty string mean "no override".
@@ -473,6 +477,37 @@ child then waits for every background task it left running, including a
 background shell or monitor with no deadline of its own (a shell has none
 when Claude Code's background deadlines are turned off), so such a task keeps
 `ccc run` from returning until it ends or `ccc kill` stops the child.
+
+**Prompt-cache TTL.** Claude Code caches a conversation's prefix for 5
+minutes or for 1 hour. A 1-hour cache write costs 2x the input rate and a
+5-minute one 1.25x, so the 1-hour TTL pays only for a session that waits
+between 5 and 60 minutes before its next request; Claude Code's default is
+1h on a subscription within its limits and 5m on an API key account or in
+overage. `cache_ttl` (`5m` or `1h`) sets it for a Claude child through
+`CLAUDE_CODE_PROMPT_CACHE_TTL`. For a one-shot run the first hit wins:
+`--cache-ttl`, `CCC_CACHE_TTL_<AGENT>`, `CCC_CACHE_TTL_ALL`,
+`[agents.<type>] cache_ttl`, `[agents."*"] cache_ttl`, the definition's
+`cache_ttl`; with none of them the child runs on Claude Code's default. The
+result is saved with the session, and `ccc resume` uses the saved value;
+`--cache-ttl` on a resume applies to that turn only. `ccc launch`, in all three
+forms, takes the TTL from `--cache-ttl` alone: a session a human paces waits
+between requests, which is the case the 1-hour TTL pays for, so the
+definition's and the operator's settings, chosen for subagents, do not reach
+it. `ccc which` shows the one-shot value as `cache_ttl=` (`-` for none;
+`cache_ttl`, a string or `null`, with `--json`), not what a launch would use.
+The audit log's `spawn` record carries the TTL the child was built with as
+`cache_ttl`, and the `start` record the flag as `cache_ttl_arg`. A Claude child with no TTL has an inherited
+`CLAUDE_CODE_PROMPT_CACHE_TTL` removed, so it never runs on the TTL of the
+agent or shell above it; set `CCC_CACHE_TTL_ALL` instead of exporting the
+variable. `default` in an override means "no override", not Claude Code's
+default: over a definition's `5m` the way back is `1h`, which also holds
+where Claude Code's own default is 5m. A bad value fails `ccc run`, `ccc
+launch` and `ccc which` for that agent, naming `cache_ttl`, when it resolves
+to Claude; Codex and Goose have no such setting and never read it, and
+`--cache-ttl` given to one is ignored with a note. ccc sets nothing for
+in-process Task subagents (`CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL`), and
+`FORCE_PROMPT_CACHING_5M` in the environment still wins inside Claude Code.
+The variable's behaviour was checked against Claude Code 2.1.332.
 
 A non-empty `profiles` list turns on everything that follows. With a profile,
 under either `auth`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and
@@ -1088,7 +1123,9 @@ types, and this launch has none. The model is looked up once in
 or Claude's own `sonnet`, is passed through verbatim. The account is scored
 against the expanded model, so `--model fable` picks a profile with Fable
 budget. A bad `[launch]` value fails only a roleless launch, naming the key,
-and a `--effort` on the command line bypasses a bad `[launch] effort`.
+and a `--effort` on the command line bypasses a bad `[launch] effort`. The
+prompt-cache TTL is `--cache-ttl` or Claude Code's default, as for every
+launch; there is no `[launch]` key for it.
 
 The session is recorded like any other launch, with no agent, and
 `ccc resume` and `ccc launch --resume` reopen it with its model, effort and
@@ -1111,7 +1148,10 @@ sandbox and working directory come from the record, so `--cwd` and
 `--harness` are refused; the Claude account is selected as it is for
 `ccc resume`, `--profile` included, and the record is rewritten to the account
 the session ran under. A session whose `ccc` is still running is refused with the same
-message as `ccc resume`; fork it instead.
+message as `ccc resume`; fork it instead. The prompt-cache TTL is the one
+recorded setting it does not take from the record: it is `--cache-ttl` or
+Claude Code's default, and the record keeps its value for a later
+`ccc resume`.
 
 `--fork` (on `resume` and `launch --resume`) starts a new session from the
 recorded transcript. The original's sidecar and lock are never touched, so a

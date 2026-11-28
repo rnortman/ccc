@@ -33,7 +33,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::agents::AgentDef;
-use crate::config::{Config, Effort, Harness, ProcessEnv};
+use crate::config::{CacheTtl, Config, Effort, Harness, ProcessEnv};
 use crate::select::Choice;
 
 /// Exit code for usage, config and agent-definition errors, raised before any
@@ -135,6 +135,10 @@ struct RunArgs {
     /// Force a harness.
     #[arg(long, value_parser = parse_harness)]
     harness: Option<Harness>,
+    /// Claude only: the prompt-cache TTL for this invocation, over every
+    /// other setting.
+    #[arg(long, value_name = "5m|1h", value_parser = parse_cache_ttl)]
+    cache_ttl: Option<CacheTtl>,
     /// Goose only: a directory the agent may also read. Repeatable.
     #[arg(long, value_name = "DIR")]
     allow_read: Vec<PathBuf>,
@@ -174,6 +178,9 @@ struct ResumeArgs {
     /// it the account is selected anew from current usage.
     #[arg(long)]
     profile: Option<String>,
+    /// Claude only: the prompt-cache TTL for this turn, over the recorded one.
+    #[arg(long, value_name = "5m|1h", value_parser = parse_cache_ttl)]
+    cache_ttl: Option<CacheTtl>,
     #[arg(long)]
     json: bool,
     /// The prompt; `-` reads it from stdin, as does omitting it.
@@ -244,6 +251,10 @@ struct LaunchArgs {
     /// Without an agent type: Claude effort.
     #[arg(long, value_parser = parse_claude_effort, conflicts_with_all = ["agent", "resume"])]
     effort: Option<Effort>,
+    /// Claude only: the prompt-cache TTL for this session. A launch takes it
+    /// from this flag alone; without it, Claude Code's own default.
+    #[arg(long, value_name = "5m|1h", value_parser = parse_cache_ttl)]
+    cache_ttl: Option<CacheTtl>,
     /// Goose only: a directory the agent may also read. Repeatable.
     #[arg(
         long,
@@ -309,6 +320,10 @@ fn parse_claude_effort(s: &str) -> Result<Effort, String> {
     Effort::parse_for(s, Harness::Claude).map_err(|e| e.to_string())
 }
 
+fn parse_cache_ttl(s: &str) -> Result<CacheTtl, String> {
+    CacheTtl::parse(s).map_err(|e| e.to_string())
+}
+
 fn parse_grace(s: &str) -> Result<f64, String> {
     let value = s
         .parse::<f64>()
@@ -371,6 +386,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             args.prompt_file.as_deref(),
             args.profile.as_deref(),
             args.harness,
+            args.cache_ttl,
             &exec::GooseFlags {
                 allow_read: args.allow_read,
                 allow_write: args.allow_write,
@@ -383,6 +399,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
             &args.session_id,
             args.fork,
             args.profile.as_deref(),
+            args.cache_ttl,
             args.prompt.as_deref(),
             args.prompt_file.as_deref(),
             args.json,
@@ -393,6 +410,7 @@ fn dispatch(cli: Cli) -> Result<i32> {
                 launch_target(&args),
                 args.profile.as_deref(),
                 args.force_unbudgeted,
+                args.cache_ttl,
                 passthrough,
             )
         }
@@ -617,7 +635,7 @@ fn which_with(
         config_path_text(&ctx.sources.agents)
     )?;
     let def = AgentDef::load(&ctx.cfg.agents_dir_in(ctx.env), agent)?;
-    let (mut r, notes) = resolve::resolve(ctx.cfg, ctx.env, &def, cli_harness)?;
+    let (mut r, notes) = resolve::resolve(ctx.cfg, ctx.env, &def, cli_harness, None)?;
     for note in &notes {
         writeln!(err, "note: {note}")?;
     }
@@ -716,6 +734,7 @@ fn which_output(
             "harness": r.harness.as_str(),
             "model": r.model,
             "effort": r.effort.map(config::Effort::as_str),
+            "cache_ttl": r.cache_ttl.map(CacheTtl::as_str),
             "sandbox": r.sandbox.as_str(),
             "prompt": prompt,
             "tools": r.tools,
@@ -730,7 +749,7 @@ fn which_output(
         Ok(serde_json::to_string_pretty(&out)?)
     } else {
         let mut out = format!(
-            "agent={} harness={} model={} effort={} sandbox={} prompt={} profile={}",
+            "agent={} harness={} model={} effort={} sandbox={} prompt={} profile={} cache_ttl={}",
             r.label(),
             r.harness,
             r.model,
@@ -738,6 +757,7 @@ fn which_output(
             r.sandbox.as_str(),
             prompt,
             choice.map(|c| c.account.profile.as_str()).unwrap_or("-"),
+            r.cache_ttl.map(CacheTtl::as_str).unwrap_or("-"),
         );
         if r.harness == Harness::Claude && choice.is_none() {
             out.push('\n');
@@ -907,6 +927,7 @@ mod tests {
 
     fn resolved() -> resolve::Resolved {
         resolve::Resolved {
+            cache_ttl: None,
             agent: Some("explorer".into()),
             description: "Investigates".into(),
             harness: Harness::Claude,
@@ -986,6 +1007,56 @@ mod tests {
             ["ccc", "launch", "--resume", "ID", "--harness", "codex"].as_slice(),
             ["ccc", "launch", "--resume", "ID", "explorer"].as_slice(),
             ["ccc", "launch", "explorer", "--verbose"].as_slice(),
+        ] {
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "rejected form: {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_ttl_is_accepted_on_run_resume_and_every_launch_shape() {
+        let ttl = |argv: &[&str]| match Cli::try_parse_from(argv).unwrap().command {
+            Command::Run(a) => a.cache_ttl,
+            Command::Resume(a) => a.cache_ttl,
+            Command::Launch(a) => a.cache_ttl,
+            other => panic!("parsed as {other:?}"),
+        };
+        assert_eq!(
+            ttl(&["ccc", "run", "explorer", "--cache-ttl", "5m", "go"]),
+            Some(CacheTtl::FiveMinutes)
+        );
+        assert_eq!(ttl(&["ccc", "run", "explorer", "go"]), None);
+        assert_eq!(
+            ttl(&["ccc", "resume", "ID", "--cache-ttl", "1H", "again"]),
+            Some(CacheTtl::OneHour)
+        );
+        assert_eq!(
+            ttl(&["ccc", "launch", "explorer", "--cache-ttl", "5m"]),
+            Some(CacheTtl::FiveMinutes)
+        );
+        assert_eq!(
+            ttl(&[
+                "ccc",
+                "launch",
+                "--resume",
+                "ID",
+                "--fork",
+                "--cache-ttl",
+                "1h"
+            ]),
+            Some(CacheTtl::OneHour)
+        );
+        assert_eq!(
+            ttl(&["ccc", "launch", "--cache-ttl", "5m"]),
+            Some(CacheTtl::FiveMinutes)
+        );
+        for argv in [
+            ["ccc", "run", "explorer", "--cache-ttl", "10m", "go"].as_slice(),
+            ["ccc", "resume", "ID", "--cache-ttl", "", "again"].as_slice(),
+            ["ccc", "launch", "--cache-ttl", "1hour"].as_slice(),
+            ["ccc", "which", "explorer", "--cache-ttl", "5m"].as_slice(),
         ] {
             assert!(
                 Cli::try_parse_from(argv).is_err(),
@@ -1764,7 +1835,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             text,
-            "agent=explorer harness=claude model=claude-opus-5[1M] effort=low sandbox=read-only prompt=explorer.md profile=-\nambient login ([claude] profiles is empty)"
+            "agent=explorer harness=claude model=claude-opus-5[1M] effort=low sandbox=read-only prompt=explorer.md profile=- cache_ttl=-\nambient login ([claude] profiles is empty)"
         );
 
         let v: serde_json::Value = serde_json::from_str(
@@ -1777,6 +1848,22 @@ mod tests {
         assert_eq!(v["effort"], "low");
         assert_eq!(v["prompt"], "explorer.md");
         assert_eq!(v["sandbox"], "read-only");
+        assert_eq!(v["cache_ttl"], serde_json::Value::Null);
+        let mut five = resolved();
+        five.cache_ttl = Some(CacheTtl::FiveMinutes);
+        let text = which_output(&five, None, &[], "explorer.md", &test_sources(), false).unwrap();
+        assert!(
+            text.lines()
+                .next()
+                .unwrap()
+                .ends_with(" profile=- cache_ttl=5m"),
+            "{text}"
+        );
+        let v: serde_json::Value = serde_json::from_str(
+            &which_output(&five, None, &[], "explorer.md", &test_sources(), true).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v["cache_ttl"], "5m");
         assert_eq!(v["tools"], serde_json::json!(["Read", "Grep"]));
         assert!(v["profile"].is_null());
         assert_eq!(v["candidates"], serde_json::json!([]));
@@ -2356,7 +2443,10 @@ mod tests {
         which_with(&ctx, "explorer", None, false, &mut out, &mut err).unwrap();
         let text = String::from_utf8(out).unwrap();
         let mut lines = text.lines();
-        assert!(lines.next().unwrap().ends_with(" profile=-"), "{text}");
+        assert!(
+            lines.next().unwrap().ends_with(" profile=- cache_ttl=-"),
+            "{text}"
+        );
         assert_eq!(
             lines.next(),
             Some("ambient login ([claude] profiles is empty)"),
